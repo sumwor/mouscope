@@ -8,9 +8,9 @@ from datetime import datetime
 import re
 
 import matlab.engine
-
+eng = matlab.engine.start_matlab()
 # add matlab code into the path
-
+eng.addpath(r'C:\Users\Linda\Documents\GitHub\ASD_RLWM\Behavior', nargout=0)
 
 class BehData:
 

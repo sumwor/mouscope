@@ -1,3 +1,5 @@
+import tqdm
+
 from behavioral_pipeline import BehDataOdor
 import pandas as pd
 import numpy as np
@@ -9,7 +11,12 @@ import matplotlib
 matplotlib.use('QtAgg') 
 import matplotlib.pyplot as plt
 from utils_imaging import *
+from scipy.sparse import csc_matrix
+import h5py
+import pickle
+from scipy.interpolate import interp1d
 
+from tqdm import tqdm
 
 class Imaging:
     """
@@ -76,61 +83,7 @@ class Imaging:
 
             ImgTimeStamp = glob.glob(os.path.join(ImagingFolder, '*_ImgTimeStamp_*.csv'))
 
-            # concatenate file if more than one (preprocess)
-            # if len(behRecording) > 1:
-            #     splited_folder = os.path.join(ImagingFolder, 'splited_session')
-            #     os.makedirs(splited_folder, exist_ok=True)
-
-            #     beh_concat_list = []
-            #     for csv_file in behTimeStamp:
-            #         df = pd.read_csv(csv_file, header=None)
-            #         beh_concat_list.append(df)
-
-            #         # move original file to splited_session
-            #         shutil.move(csv_file, os.path.join(splited_folder, os.path.basename(csv_file)))
-            #         beh_concat = pd.concat(beh_concat_list, ignore_index=True)
-            #         concat_file = os.path.join(ImagingFolder, 'behTimeStamp_concatenated.csv')
-            #         behTimeStamp = [concat_file]
-            #         beh_concat.to_csv(concat_file, index=False)
-
-            #     # imaging time stamp
-            #     img_concat_list = []
-            #     for csv_file in ImgTimeStamp:
-            #         df = pd.read_csv(csv_file, header=None)
-            #         img_concat_list.append(df)
-
-            #         # move original file to splited_session
-            #         shutil.move(csv_file, os.path.join(splited_folder, os.path.basename(csv_file)))
-            #     img_concat = pd.concat(img_concat_list, ignore_index=True)
-            #     concat_file = os.path.join(ImagingFolder, 'xxx_ImgTimeStamp_concatenated.csv')
-            #     ImgTimeStamp = [concat_file]
-            #     img_concat.to_csv(concat_file, index=False)
-
-            #     # AI file
-            #     AI_matrix_list = []
-            #     AI_ts_list = []
-            #     for mfile, tsfile in zip(AIMatrix, AITimsStamp):
-            #         m = np.fromfile(mfile)
-            #         t = pd.read_csv(tsfile, header=None).values.squeeze()
-            #         AI_matrix_list.append(m)
-            #         AI_ts_list.append(t)
-
-            #         # move original files
-            #         shutil.move(mfile, os.path.join(splited_folder, os.path.basename(mfile)))
-            #         shutil.move(tsfile, os.path.join(splited_folder, os.path.basename(tsfile)))
-
-            #     # concatenate
-            #     AI_matrix_concat = np.concatenate(AI_matrix_list)
-            #     AI_ts_concat = np.concatenate(AI_ts_list)
-
-            #     # save concatenated AI files
-            #     AI_matrix_file = os.path.join(ImagingFolder, 'AIMatrix_AITTL_concatenated.bin')
-            #     AI_TS_file = os.path.join(ImagingFolder, 'xxx_AITimeStamp_concatenated.csv')
-            #     AI_matrix_concat.tofile(AI_matrix_file)
-            #     pd.DataFrame(AI_ts_concat).to_csv(AI_TS_file, index=False)
-            #     AIMatrix = [AI_matrix_file]
-            #     AITimsStamp = [AI_TS_file]
-
+            dFFFile = glob.glob(os.path.join(ImagingFolder,'caiman_results', 'updated_cnmf.mat'))
 
             # add these to the data_index
             self.data_index.loc[ii,'ROIFile'] = ROIFile[0] if ROIFile else None
@@ -141,11 +94,13 @@ class Imaging:
             self.data_index.loc[ii,'ImgTimeStamp'] = ImgTimeStamp[0] if ImgTimeStamp else None
             self.data_index.loc[ii,'ifCalImg'] = ifCalImg
             self.data_index.loc[ii,'ifBehRecording'] = ifBehRecording
+            self.data_index.loc[ii,'dFFFile'] = dFFFile[0] if dFFFile else None
 
 
     def align_timeStamps(self):
         # files to align
         # read TTL pulse, TTL timestamp, image timestamp, behTimeStamp and align them with behavior csv file
+        # to do: rotarod time alignment
 
         nFiles = self.data_index.shape[0]
 
@@ -163,7 +118,7 @@ class Imaging:
                         header=None
                     ).values.squeeze()  # unit in ms
                 
-                ## lunghao code for AI timestamp correctio
+                ## lunghao code for AI timestamp correction
                 AI_TS_interp = AI_timeStamp_correction(AI_TimeStamp)
 
                 # rearange AI_matrix to two channels (one is ground)
@@ -228,53 +183,249 @@ class Imaging:
 
 
 
-                plt.figure()
-                plt.scatter(behDF['side_in'][LC_Mask], AI_TS_interp[matched]/1000)
-                # plot the diagonal line
-                plt.plot([behDF['side_in'][LC_trialNum[0]], behDF['side_in'][LC_trialNum[-1]]],
-                        [AI_TS_interp[matched[0]]/1000, AI_TS_interp[matched[-1]]/1000],
-                        'r--')
-                # x label
-                plt.xlabel('Left correct from behavior')
-                plt.ylabel('Left correct from NI DAQ')
-                plt.title('Time stamp alignment behavior vs. AI')
-                savefigpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
-                                            self.data_index['Date'][ii])
-                if not os.path.exists(savefigpath):
-                    os.makedirs(savefigpath)
-                plt.savefig(os.path.join(savefigpath, 'TimeStamp_alignment.png'))
-                plt.close()
                             
-                t_offset = AI_TS_interp[matched]/1000 - behDF['side_in'][LC_trialNum]
-            
+                t_offset = AI_TS_interp[matched]/1000 - behDF['outcome'][LC_trialNum]
+                AI_TS_aligned = np.zeros_like(AI_TS_interp)
+                # based on the offset, evenly distribute the AI_TS_interp between the trials
+                for tt in range(len(behDF['outcome'][LC_trialNum])-1):
+                    t0 = behDF['outcome'][LC_trialNum[tt]]
+                    t1 = behDF['outcome'][LC_trialNum[tt+1]] 
+                    t0_AI = AI_TS_interp[matched[tt]]/1000
+                    t1_AI = AI_TS_interp[matched[tt+1]]/1000
+
+                    if tt==0:
+                        # align the time before the first left reward trial 
+                        AI_tobe_aligned = AI_TS_interp[AI_TS_interp/1000 < t0_AI]/1000
+                        AI_TS_aligned[AI_TS_interp/1000 < t0_AI] = AI_tobe_aligned - (t0_AI - t0)
+                    elif tt == len(behDF['outcome'][LC_trialNum])-2:
+                        # align the time after the last left reward trial
+                        AI_tobe_aligned = AI_TS_interp[AI_TS_interp/1000 >= t1_AI]/1000
+                        AI_TS_aligned[AI_TS_interp/1000 >= t1_AI] = AI_tobe_aligned - (t1_AI - t1)
+                    # then align the time betwee two left reward trials
+                    AI_tobe_aligned = AI_TS_interp[(AI_TS_interp/1000 >= t0_AI) & (AI_TS_interp/1000 < t1_AI)]
+                    timestamps_tobe_aligned = len(AI_tobe_aligned)
+                    
+                    AI_TS_aligned[(AI_TS_interp/1000 >= t0_AI) & (AI_TS_interp/1000 < t1_AI)] = np.linspace(t0, t1, timestamps_tobe_aligned, endpoint=False)
+
+            #%% based on the alignment betweeen AI_TS_interp and AI_TS_aligned, align behTimeStamp and ImgTimeStamp
             # load behavior recording timestamp if exists
             if os.path.exists(self.data_index['behTimeStamp'][ii]):
                 behTimeStamp = pd.read_csv(self.data_index['behTimeStamp'][ii], header=None)
                 header = ['TimeStamp']
                 behTimeStamp.columns = header
-                behTimeStamp['AlignedTimeStamp'] = behTimeStamp['TimeStamp']/1000 - t_offset
+                # for each timestamp in behTimeStamp, find the closest timestamp in AI_TS_interp, 
+                # then replace it with the corresponding timestamp in AI_TS_aligned
+                
+                x = behTimeStamp['TimeStamp'].values
+
+                idx = np.searchsorted(AI_TS_interp, x)
+
+                # clip to valid range
+                idx = np.clip(idx, 1, len(AI_TS_interp) - 1)
+
+                # choose closer neighbor
+                left = AI_TS_interp[idx - 1]
+                right = AI_TS_interp[idx]
+
+                idx -= (x - left) < (right - x)
+
+                behTimeStamp['AlignedTimeStamp'] = AI_TS_aligned[idx]
                 old_path = self.data_index['behTimeStamp'][ii]
                 folder, old_file = os.path.split(old_path)
                 new_file = os.path.join(folder, old_file[:-4] + "_aligned.csv")
                 behTimeStamp.to_csv(new_file, index=False)
-            
+                self.data_index.loc[ii,'behTimeStamp'] = new_file
 
 
             if os.path.exists(self.data_index['ImgTimeStamp'][ii]):
-                ImgTimeStamp = pd.read_csv(self.data_index['ImgTimeStamp'][ii][cc], header=None)
+                ImgTimeStamp = pd.read_csv(self.data_index['ImgTimeStamp'][ii], header=None)
                 # define headers
                 header = ['TimeStamp', 'FrameNumber', 'TTL', 'W', 'X', 'Y', 'Z']
                 ImgTimeStamp.columns = header
                             
                 # convert absolute time stamp (first column) to total minisecond, timeofday
-                ImgTimeStamp['AlignedTimeStamp']= ImgTimeStamp['TimeStamp'].apply(iso_to_timeofday)-t_offset
+                ts_temp = ImgTimeStamp['TimeStamp'].values
+                x = [iso_to_timeofday(ts)*1000 for ts in ts_temp]
+                idx = np.searchsorted(AI_TS_interp, x)
+
+                # clip to valid range
+                idx = np.clip(idx, 1, len(AI_TS_interp) - 1)
+
+                # choose closer neighbor
+                left = AI_TS_interp[idx - 1]
+                right = AI_TS_interp[idx]
+
+                idx -= (x - left) < (right - x)
+
+                ImgTimeStamp['AlignedTimeStamp'] = AI_TS_aligned[idx]
                 old_path = self.data_index['ImgTimeStamp'][ii]
                 folder, old_file = os.path.split(old_path)
                 new_file = os.path.join(folder, old_file[:-4] + "_aligned.csv")
                 ImgTimeStamp.to_csv(new_file, index=False)
+                self.data_index.loc[ii,'ImgTimeStamp'] = new_file
 
+        # make plots for alignment checking
+        # subplot 1: mismatch between AI_TS_interp and behTimeStamp, plus AI_TS_aligned
+            plt.figure(figsize=(8,8))
+            plt.subplot(2,2,1)
+            x=behDF['outcome'][LC_Mask] - behDF['outcome'][LC_trialNum[0]]
+            y=AI_TS_interp[matched]/1000-AI_TS_interp[matched[0]]/1000-x
+            y_corrected = AI_TS_aligned[matched]-x- AI_TS_aligned[matched[0]]
+            plt.plot(y)
+            plt.plot(y_corrected)
+            plt.title('Mismatch between Anolog Input and behavior')
+            plt.xlabel('Trials')
+            plt.ylabel('Time (s)')
+            plt.legend(['Before correction', 'After correction'])
+
+            savefigpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
+                                self.data_index['Date'][ii])
+            if not os.path.exists(savefigpath):
+                os.makedirs(savefigpath)
+            plt.savefig(os.path.join(savefigpath, 'TimeStamp_alignment.png'))
+            plt.close()
+
+    def cal_traces(self):
+        # make some basic plot of calcium traces, aligned with behavior events
+        # PSTH aligned to center_in, center_out (separate odor), side_in, outcome (separate choice/reward)
+        # 
+        nFiles = self.data_index.shape[0]
         
+        for ii in range(nFiles):
+            # load the behavior file and dFF file
+            behDF = pd.read_csv(self.data_index['BehCSV'][ii])
+            dFFFile = self.data_index['dFFFile'][ii]
+            # load the aligned imaging time stamp
+            ImgTimeStamp = pd.read_csv(self.data_index['ImgTimeStamp'][ii], header=None)
+            header = ['TimeStamp', 'FrameNumber', 'TTL', 'W', 'X', 'Y', 'Z', 'AlignedTimeStamp']
+            ImgTimeStamp.columns = header
 
+            # load dFF file in .mat format
+            dffResults = {}
+            with h5py.File(dFFFile, "r") as f:
+                A_grp = f['results']['A']
+                #print(len(A_grp['jc']))
+                #shape = A_grp['shape'][()]
+                A = csc_matrix((
+                    A_grp['data'][()],
+                    A_grp['ir'][()],
+                    A_grp['jc'][()]
+                ), shape = (90000, len(A_grp['jc']) - 1))
+                dffResults['A'] = A  # spatial contours of identified neurons
+
+                dffResults['n'] = A.shape[1]
+                dffResults['dFF'] = f['results']['C'][()]  # dF/F traces of identified neurons
+             # save thses in pickels for later use
+            savedffpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
+                                self.data_index['Date'][ii], 'Result')
+            if not os.path.exists(savedffpath):
+                os.makedirs(savedffpath)
+                with open(os.path.join(savedffpath,'dFF_results.pkl'), 'wb') as f:
+                    pickle.dump(dffResults, f)
+             
+            #%% plot PSTH for each neuron
+            beh_events = ['center_in', 'center_out', 'side_in', 'outcome']
+            trial_types_go = ['left', 'right'] 
+            color_go = ['red', 'blue'] # if aligned to 'center_in' and 'center_out'
+            trial_types_choice = ['left correct', 'right correct', 'left incorrect', 'right incorrect']
+            color_choice = ['green', 'cyan', 'orange', 'purple'] # if aligned to 'side_in' and 'outcome'
+            nCells = dffResults['n']
+            nTrials = behDF.shape[0]
+            t_start = -2
+            t_end = 4
+            interpT = np.arange(t_start, t_end, 0.05)
+            
+            dff_aligned = {}
+            for event in beh_events:
+                # align and interpolate dFF by the time of this event
+                dff_aligned[event] = np.full((len(interpT), nTrials, nCells), np.nan)
+                event_times = behDF[event].to_numpy()
+                t_rel = interpT+event_times[:, np.newaxis]
+                # ntrials x nTimePoints
+                    # Interpolate each cell across all trials
+                for trial_idx in range(nTrials):
+                    # get the time of this event for this trial
+                    event_start = t_rel[trial_idx, 0]
+                    event_end = t_rel[trial_idx, -1]
+                    # find the closest time in ImgTimeStamp to the event time
+                    dff_timeStamp = np.array(ImgTimeStamp['AlignedTimeStamp'][1:].values, dtype=float)
+                    timeMask = np.logical_and((dff_timeStamp >= event_start) ,
+                        (dff_timeStamp <= event_end))
+                    dff_temp =  dffResults['dFF'][timeMask, :]
+                    t_ttemp = dff_timeStamp[timeMask]
+                    # interpolate the dFF trace of this cell at the time points in interpT
+
+                    if not np.sum(timeMask) == 0:
+                        f = interp1d(
+                                t_ttemp,
+                                dff_temp,
+                                axis=0,
+                                bounds_error=False,
+                                fill_value=np.nan
+                            )
+
+                        dff_aligned[event][:,trial_idx, :] = f(t_rel[trial_idx])
+
+
+                #%% PSTH plot
+                for cc in tqdm(range(nCells)):
+                    plt.figure(figsize=(10,8))
+                    # title for the whole figure
+                    plt.suptitle(f'Neuron {cc}')
+                    for i, event in enumerate(beh_events):
+                        plt.subplot(2,2,i+1)
+                        # make subplot
+                        ### plotting PSTH for go/nogo/probe cues--------------------------------------------
+                        if event in ['center_in', 'center_out']:
+                            # look for trial_type_go
+                            for tidx, trial in enumerate(trial_types_go):
+                                trialMask = behDF['schedule']== (1 if trial=='left' else 2)
+                                tempdFF = dff_aligned[event][:, trialMask, cc]
+                                boot = bootstrap(tempdFF, 1, 1000)
+
+                                plt.plot(interpT, boot['bootAve'], color=color_go[tidx], label=trial)
+                                plt.fill_between(interpT, boot['bootLow'], boot['bootHigh'], color = color_go[tidx],label='_nolegend_', alpha=0.2)
+                                
+                                plt.title(event)
+
+                        elif event in ['side_in', 'outcome']:
+                            # look for trial_type_choice
+                            for tidx, trial in enumerate(trial_types_choice):
+                                trialMask = None
+                                if trial == 'left correct':
+                                    trialMask = np.logical_and(behDF['schedule']==1, behDF['reward']>0)
+                                elif trial == 'right correct':
+                                    trialMask = np.logical_and(behDF['schedule']==2, behDF['reward']>0)
+                                elif trial == 'left incorrect':
+                                    trialMask = np.logical_and(behDF['schedule']==1, np.isnan(behDF['reward']))
+                                elif trial == 'right incorrect':
+                                    trialMask = np.logical_and(behDF['schedule']==2, np.isnan(behDF['reward']))
+                                tempdFF = dff_aligned[event][:, trialMask, cc]
+                                boot = bootstrap(tempdFF, 1, 1000)
+
+                                plt.plot(interpT, boot['bootAve'], color=color_choice[tidx], label=trial)
+                                plt.fill_between(interpT, boot['bootLow'], boot['bootHigh'], color = color_choice[tidx],label='_nolegend_', alpha=0.2)
+                            
+                                plt.title(event)
+                        ax = plt.gca()
+
+                        # Remove top and right spines
+                        ax.spines['top'].set_visible(False)
+                        ax.spines['right'].set_visible(False)
+
+                        # Remove legend box
+                        ax.legend(frameon=False)
+                        if i == 0 or i==2:
+                            plt.ylabel('dF/F')
+                        if i == 2 or i==3:
+                            plt.xlabel('Time (s)')
+                    savefigpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
+                                self.data_index['Date'][ii], 'Plot', 'PSTH')
+                    os.makedirs(savefigpath, exist_ok=True)
+                    plt.savefig(os.path.join(savefigpath, f'PSTH_Neuron_{cc}.png'), dpi=300, bbox_inches='tight')
+                    plt.close()
+
+            #%% what else?
 if __name__ == "__main__":
 
     # use interactive matplotlib backend
@@ -286,3 +437,10 @@ if __name__ == "__main__":
     Odor_Beh = BehDataOdor(root_dir)
 
     imaging_data = Imaging(root_dir, Odor_Beh)
+
+    # basic plots of calcium traces aligned to behavior
+    # 1. PSTH
+    imaging_data.cal_traces()
+    #%% analysis to do
+    # 1. go over longitudinal registration
+    # 2. align df/f with behavior events
