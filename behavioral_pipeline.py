@@ -161,8 +161,94 @@ class BehDataRotarod(BehData):
 
     def __init__(self, root_file):
         super().__init__(root_file)
+        self.make_dataIndex()
+
         self.load_data()
         self.behavior = 'Rotarod'
+
+    def make_dataIndex(self):
+        # Create a data index, each row is a session
+        DLC_results = []
+        stage = []
+        Rod_speed = []
+        timeStamp = []
+        video= []
+        animalID = []
+        analysis = []
+        Genotype = []
+        sessionID = []
+        #sexID = []
+        dateList = []
+        timeOnRod = []
+        fallbyTurning = []
+
+        # %% load all files
+        for aidx,aa in enumerate(self.Animals):
+            dataFolder = os.path.join(self.data, aa, 'Rotarod', 'Behavior')
+            dateFolder = sorted([f for f in os.listdir(dataFolder) if os.path.isdir(os.path.join(dataFolder, f))])
+            filePatternSpeed = aa + '*speed*.csv'
+            filePatternDLC = '*ASD' + aa + '*.csv'
+            filePatternVideo = aa + '*.avi'
+            filePatternTimestamp = aa + '*timeStamp*.csv'
+            rr_results_path = os.path.join(self.data,aa, 'Rotarod','Behavior', 'RR_results.csv')
+            rr_results = pd.read_csv(rr_results_path)
+            for date in dateFolder:
+                speedCSV = glob.glob(os.path.join(dataFolder, date, filePatternSpeed))
+                timeStampCSV = glob.glob(os.path.join(dataFolder, date, filePatternTimestamp))
+                videoFiles = glob.glob(os.path.join(dataFolder, date, filePatternVideo))
+                DLCFiles = glob.glob(os.path.join(dataFolder, date, filePatternDLC))
+                num_files = len(videoFiles)
+
+                if num_files>0:
+                    for ff in range(num_files):
+                        # match the sessions
+                        dateExpr = r'\d{6}_trial\d{1,2}'
+                        matches = re.findall(dateExpr,videoFiles[ff][0:-23])
+                        # in tempVideo['back'], find the string that has matches
+                        video.append(videoFiles[ff])
+                        DLC_ID = [ID for ID in range(len(DLCFiles)) if matches[0] in DLCFiles[ID]]
+                        if len(DLC_ID)>0:
+                            DLC_results.append(DLCFiles[DLC_ID[0]])
+                        else:
+                            DLC_results.append(None)
+                        speed_ID = [ID for ID in range(len(speedCSV)) if matches[0] in speedCSV[ID]]
+                        Rod_speed.append(speedCSV[speed_ID[0]])
+                        timeStamp_ID = [ID for ID in range(len(timeStampCSV)) if matches[0] in timeStampCSV[ID]]
+                        timeStamp.append(timeStampCSV[timeStamp_ID[0]])
+
+                        animalID.append(aa)
+
+                        #stage.append(matches[0])
+                        analysis.append(os.path.join(self.analysis, aa,'Rotarod', 'Behavior', matches[0]))
+                        ses = re.search(r'\d{1,2}\s*$', matches[0])
+                        sessionID.append(int(ses.group()))
+                        dateList.append(matches[0][0:6])
+                        Genotype.append(self.Genotypes[aidx])
+                        #sexID.append(self.Sex[aidx])
+
+                        # find the animal and trial in rr_result
+                        result = rr_results[(rr_results['Trial'] == int(ses.group()))]
+                        timeOnRod.append(int(result['Time'].values[0]))
+                        fallbyTurning.append(result['fall by turning'].astype(bool).values[0])
+
+        self.data_index = pd.DataFrame(animalID, columns=['Animal'])
+        self.data_index['DLC'] = DLC_results
+        self.data_index['Video'] = video
+        self.data_index['Rod_speed'] = Rod_speed
+        self.data_index['AnalysisPath'] = analysis
+        self.data_index['Genotype'] = Genotype
+        #self.data['Sex'] = sexID
+        self.data_index['Trial'] = sessionID
+        self.data_index['Date'] = dateList
+        self.data_index['BehTimestamp'] = timeStamp
+        self.data_index['TimeOnRod'] = timeOnRod
+        self.data_index['FallByTurning'] = fallbyTurning
+
+        self.nSubjects = len(self.Animals)
+        #sorted_df = self.dataIndex.sort_values(by=['Animal', 'Trial'])
+        #sorted_df = sorted_df.reset_index(drop=True)
+        #self.data=sorted_df
+        #self.nSessions = len(self.data['Animal'])
 
     def load_data(self):
         # Load rotarod behavior data from file
@@ -176,16 +262,23 @@ class BehDataRotarod(BehData):
 
 if __name__ == "__main__":
     root_dir = r'Y:\HongliWang\Miniscope\ASD'
-    Odor = BehDataOdor(root_dir)
 
-    #%% load matlab code
-    eng = matlab.engine.start_matlab()
+    #%% test code for odor behavior
+    # Odor = BehDataOdor(root_dir)
 
-    code_folder = r'C:\Users\Linda\Documents\GitHub\ASD_RLWM'
-    eng.addpath(eng.genpath(code_folder), nargout=0)
+    # #%% load matlab code
+    # eng = matlab.engine.start_matlab()
 
-    # read the data and save them to csv files
-    Odor.load_data()
+    # code_folder = r'C:\Users\Linda\Documents\GitHub\ASD_RLWM'
+    # eng.addpath(eng.genpath(code_folder), nargout=0)
 
-    Odor.session_behavior()
+    # # read the data and save them to csv files
+    # Odor.load_data()
 
+    # Odor.session_behavior()
+
+
+    #%% test code for rotarod behavior
+    rotarod = BehDataRotarod(root_dir)
+
+    rotarod.load_data()
