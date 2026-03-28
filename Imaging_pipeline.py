@@ -54,14 +54,7 @@ class Imaging:
                 ImagingFolder = os.path.join(self.data,self.data_index['Animal'][ii],
                                             self.behavior,'Imaging', 
                                             self.data_index['Animal'][ii]+'_'+self.data_index['Date'][ii])
-                
-                
-                ROIFile = glob.glob(os.path.join(ImagingFolder,'caiman_result', '*.hdf5'))
-                # check if ROIFile exist
-                if not ROIFile:
-                    ifCalImg = False
-                else:
-                    ifCalImg = True
+
 
                 behRecording = glob.glob(os.path.join(ImagingFolder,'*.mp4'))
 
@@ -89,7 +82,11 @@ class Imaging:
                 ImgTimeStamp = glob.glob(os.path.join(ImagingFolder, '*_ImgTimeStamp_*.csv'))
 
                 dFFFile = glob.glob(os.path.join(ImagingFolder,'caiman_results', 'updated_cnmf.mat'))
-
+                if not dFFFile:
+                    ifCalImg = False
+                else:
+                    ifCalImg = True
+                
                 # add these to the data_index
                 #self.data_index.loc[ii,'ROIFile'] = ROIFile[0] if ROIFile else None
                 self.data_index.loc[ii,'behRecording'] = behRecording[0] if behRecording else None
