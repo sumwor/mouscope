@@ -376,143 +376,171 @@ class Imaging:
         # make some basic plot of calcium traces, aligned with behavior events
         # PSTH aligned to center_in, center_out (separate odor), side_in, outcome (separate choice/reward)
         # for rotarod, align to left/right stride
-        nFiles = self.data_index.shape[0]
-        
-        for ii in range(nFiles):
-            # load the behavior file and dFF file
-            behDF = pd.read_csv(self.data_index['BehCSV'][ii])
-            dFFFile = self.data_index['dFFFile'][ii]
-            # load the aligned imaging time stamp
-            ImgTimeStamp = pd.read_csv(self.data_index['ImgTimeStamp'][ii], header=None)
-            header = ['TimeStamp', 'FrameNumber', 'TTL', 'W', 'X', 'Y', 'Z', 'AlignedTimeStamp']
-            ImgTimeStamp.columns = header
 
-            # load dFF file in .mat format
-            dffResults = {}
-            with h5py.File(dFFFile, "r") as f:
-                A_grp = f['results']['A']
-                #print(len(A_grp['jc']))
-                #shape = A_grp['shape'][()]
-                A = csc_matrix((
-                    A_grp['data'][()],
-                    A_grp['ir'][()],
-                    A_grp['jc'][()]
-                ), shape = (90000, len(A_grp['jc']) - 1))
-                dffResults['A'] = A  # spatial contours of identified neurons
-
-                dffResults['n'] = A.shape[1]
-                dffResults['dFF'] = f['results']['C'][()]  # dF/F traces of identified neurons
-             # save thses in pickels for later use
-            savedffpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
-                                self.data_index['Date'][ii], 'Result')
-            if not os.path.exists(savedffpath):
-                os.makedirs(savedffpath)
-                with open(os.path.join(savedffpath,'dFF_results.pkl'), 'wb') as f:
-                    pickle.dump(dffResults, f)
-             
-            #%% plot PSTH for each neuron
-            beh_events = ['center_in', 'center_out', 'side_in', 'outcome']
-            trial_types_go = ['left', 'right'] 
-            color_go = ['red', 'blue'] # if aligned to 'center_in' and 'center_out'
-            trial_types_choice = ['left correct', 'right correct', 'left incorrect', 'right incorrect']
-            color_choice = ['green', 'cyan', 'orange', 'purple'] # if aligned to 'side_in' and 'outcome'
-            nCells = dffResults['n']
-            nTrials = behDF.shape[0]
-            t_start = -2
-            t_end = 4
-            interpT = np.arange(t_start, t_end, 0.05)
+        #%% for odor behavior
+        if self.behavior == 'Odor':
+            nFiles = self.data_index.shape[0]
             
-            dff_aligned = {}
-            for event in beh_events:
-                # align and interpolate dFF by the time of this event
-                dff_aligned[event] = np.full((len(interpT), nTrials, nCells), np.nan)
-                event_times = behDF[event].to_numpy()
-                t_rel = interpT+event_times[:, np.newaxis]
-                # ntrials x nTimePoints
-                    # Interpolate each cell across all trials
-                for trial_idx in range(nTrials):
-                    # get the time of this event for this trial
-                    event_start = t_rel[trial_idx, 0]
-                    event_end = t_rel[trial_idx, -1]
-                    # find the closest time in ImgTimeStamp to the event time
-                    dff_timeStamp = np.array(ImgTimeStamp['AlignedTimeStamp'][1:].values, dtype=float)
-                    timeMask = np.logical_and((dff_timeStamp >= event_start) ,
-                        (dff_timeStamp <= event_end))
-                    dff_temp =  dffResults['dFF'][timeMask, :]
-                    t_ttemp = dff_timeStamp[timeMask]
-                    # interpolate the dFF trace of this cell at the time points in interpT
+            for ii in range(nFiles):
+                # load the behavior file and dFF file
+                behDF = pd.read_csv(self.data_index['BehCSV'][ii])
+                dFFFile = self.data_index['dFFFile'][ii]
+                # load the aligned imaging time stamp
+                ImgTimeStamp = pd.read_csv(self.data_index['ImgTimeStamp'][ii], header=None)
+                header = ['TimeStamp', 'FrameNumber', 'TTL', 'W', 'X', 'Y', 'Z', 'AlignedTimeStamp']
+                ImgTimeStamp.columns = header
 
-                    if not np.sum(timeMask) == 0:
-                        f = interp1d(
-                                t_ttemp,
-                                dff_temp,
-                                axis=0,
-                                bounds_error=False,
-                                fill_value=np.nan
-                            )
+                # load dFF file in .mat format
+                dffResults = {}
+                with h5py.File(dFFFile, "r") as f:
+                    A_grp = f['results']['A']
+                    #print(len(A_grp['jc']))
+                    #shape = A_grp['shape'][()]
+                    A = csc_matrix((
+                        A_grp['data'][()],
+                        A_grp['ir'][()],
+                        A_grp['jc'][()]
+                    ), shape = (90000, len(A_grp['jc']) - 1))
+                    dffResults['A'] = A  # spatial contours of identified neurons
 
-                        dff_aligned[event][:,trial_idx, :] = f(t_rel[trial_idx])
+                    dffResults['n'] = A.shape[1]
+                    dffResults['dFF'] = f['results']['C'][()]  # dF/F traces of identified neurons
+                # save thses in pickels for later use
+                savedffpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
+                                    self.data_index['Date'][ii], 'Result')
+                if not os.path.exists(savedffpath):
+                    os.makedirs(savedffpath)
+                    with open(os.path.join(savedffpath,'dFF_results.pkl'), 'wb') as f:
+                        pickle.dump(dffResults, f)
+                
+                #%% plot PSTH for each neuron
+                beh_events = ['center_in', 'center_out', 'side_in', 'outcome']
+                trial_types_go = ['left', 'right'] 
+                color_go = ['red', 'blue'] # if aligned to 'center_in' and 'center_out'
+                trial_types_choice = ['left correct', 'right correct', 'left incorrect', 'right incorrect']
+                color_choice = ['green', 'cyan', 'orange', 'purple'] # if aligned to 'side_in' and 'outcome'
+                nCells = dffResults['n']
+                nTrials = behDF.shape[0]
+                t_start = -2
+                t_end = 4
+                interpT = np.arange(t_start, t_end, 0.05)
+                
+                dff_aligned = {}
+                for event in beh_events:
+                    # align and interpolate dFF by the time of this event
+                    dff_aligned[event] = np.full((len(interpT), nTrials, nCells), np.nan)
+                    event_times = behDF[event].to_numpy()
+                    t_rel = interpT+event_times[:, np.newaxis]
+                    # ntrials x nTimePoints
+                        # Interpolate each cell across all trials
+                    for trial_idx in range(nTrials):
+                        # get the time of this event for this trial
+                        event_start = t_rel[trial_idx, 0]
+                        event_end = t_rel[trial_idx, -1]
+                        # find the closest time in ImgTimeStamp to the event time
+                        dff_timeStamp = np.array(ImgTimeStamp['AlignedTimeStamp'][1:].values, dtype=float)
+                        timeMask = np.logical_and((dff_timeStamp >= event_start) ,
+                            (dff_timeStamp <= event_end))
+                        dff_temp =  dffResults['dFF'][timeMask, :]
+                        t_ttemp = dff_timeStamp[timeMask]
+                        # interpolate the dFF trace of this cell at the time points in interpT
+
+                        if not np.sum(timeMask) == 0:
+                            f = interp1d(
+                                    t_ttemp,
+                                    dff_temp,
+                                    axis=0,
+                                    bounds_error=False,
+                                    fill_value=np.nan
+                                )
+
+                            dff_aligned[event][:,trial_idx, :] = f(t_rel[trial_idx])
 
 
-                #%% PSTH plot
-                for cc in tqdm(range(nCells)):
-                    plt.figure(figsize=(10,8))
-                    # title for the whole figure
-                    plt.suptitle(f'Neuron {cc}')
-                    for i, event in enumerate(beh_events):
-                        plt.subplot(2,2,i+1)
-                        # make subplot
-                        ### plotting PSTH for go/nogo/probe cues--------------------------------------------
-                        if event in ['center_in', 'center_out']:
-                            # look for trial_type_go
-                            for tidx, trial in enumerate(trial_types_go):
-                                trialMask = behDF['schedule']== (1 if trial=='left' else 2)
-                                tempdFF = dff_aligned[event][:, trialMask, cc]
-                                boot = bootstrap(tempdFF, 1, 1000)
+                    #%% PSTH plot
+                    for cc in tqdm(range(nCells)):
+                        plt.figure(figsize=(10,8))
+                        # title for the whole figure
+                        plt.suptitle(f'Neuron {cc}')
+                        for i, event in enumerate(beh_events):
+                            plt.subplot(2,2,i+1)
+                            # make subplot
+                            ### plotting PSTH for go/nogo/probe cues--------------------------------------------
+                            if event in ['center_in', 'center_out']:
+                                # look for trial_type_go
+                                for tidx, trial in enumerate(trial_types_go):
+                                    trialMask = behDF['schedule']== (1 if trial=='left' else 2)
+                                    tempdFF = dff_aligned[event][:, trialMask, cc]
+                                    boot = bootstrap(tempdFF, 1, 1000)
 
-                                plt.plot(interpT, boot['bootAve'], color=color_go[tidx], label=trial)
-                                plt.fill_between(interpT, boot['bootLow'], boot['bootHigh'], color = color_go[tidx],label='_nolegend_', alpha=0.2)
+                                    plt.plot(interpT, boot['bootAve'], color=color_go[tidx], label=trial)
+                                    plt.fill_between(interpT, boot['bootLow'], boot['bootHigh'], color = color_go[tidx],label='_nolegend_', alpha=0.2)
+                                    
+                                    plt.title(event)
+
+                            elif event in ['side_in', 'outcome']:
+                                # look for trial_type_choice
+                                for tidx, trial in enumerate(trial_types_choice):
+                                    trialMask = None
+                                    if trial == 'left correct':
+                                        trialMask = np.logical_and(behDF['schedule']==1, behDF['reward']>0)
+                                    elif trial == 'right correct':
+                                        trialMask = np.logical_and(behDF['schedule']==2, behDF['reward']>0)
+                                    elif trial == 'left incorrect':
+                                        trialMask = np.logical_and(behDF['schedule']==1, np.isnan(behDF['reward']))
+                                    elif trial == 'right incorrect':
+                                        trialMask = np.logical_and(behDF['schedule']==2, np.isnan(behDF['reward']))
+                                    tempdFF = dff_aligned[event][:, trialMask, cc]
+                                    boot = bootstrap(tempdFF, 1, 1000)
+
+                                    plt.plot(interpT, boot['bootAve'], color=color_choice[tidx], label=trial)
+                                    plt.fill_between(interpT, boot['bootLow'], boot['bootHigh'], color = color_choice[tidx],label='_nolegend_', alpha=0.2)
                                 
-                                plt.title(event)
+                                    plt.title(event)
+                            ax = plt.gca()
 
-                        elif event in ['side_in', 'outcome']:
-                            # look for trial_type_choice
-                            for tidx, trial in enumerate(trial_types_choice):
-                                trialMask = None
-                                if trial == 'left correct':
-                                    trialMask = np.logical_and(behDF['schedule']==1, behDF['reward']>0)
-                                elif trial == 'right correct':
-                                    trialMask = np.logical_and(behDF['schedule']==2, behDF['reward']>0)
-                                elif trial == 'left incorrect':
-                                    trialMask = np.logical_and(behDF['schedule']==1, np.isnan(behDF['reward']))
-                                elif trial == 'right incorrect':
-                                    trialMask = np.logical_and(behDF['schedule']==2, np.isnan(behDF['reward']))
-                                tempdFF = dff_aligned[event][:, trialMask, cc]
-                                boot = bootstrap(tempdFF, 1, 1000)
+                            # Remove top and right spines
+                            ax.spines['top'].set_visible(False)
+                            ax.spines['right'].set_visible(False)
 
-                                plt.plot(interpT, boot['bootAve'], color=color_choice[tidx], label=trial)
-                                plt.fill_between(interpT, boot['bootLow'], boot['bootHigh'], color = color_choice[tidx],label='_nolegend_', alpha=0.2)
-                            
-                                plt.title(event)
-                        ax = plt.gca()
+                            # Remove legend box
+                            ax.legend(frameon=False)
+                            if i == 0 or i==2:
+                                plt.ylabel('dF/F')
+                            if i == 2 or i==3:
+                                plt.xlabel('Time (s)')
+                        savefigpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
+                                    self.data_index['Date'][ii], 'Plot', 'PSTH')
+                        os.makedirs(savefigpath, exist_ok=True)
+                        plt.savefig(os.path.join(savefigpath, f'PSTH_Neuron_{cc}.png'), dpi=300, bbox_inches='tight')
+                        plt.close()
 
-                        # Remove top and right spines
-                        ax.spines['top'].set_visible(False)
-                        ax.spines['right'].set_visible(False)
+    def auROC(self):
+        # calculate auROC for each neuron to determine the selectivity 
+        # for stimulus/choice/reward
+        pass
+    
+    def GLM_session(self):
+        # generalized linear regression for 
+        # stimulus/choice/latent variables
+        pass
+    
+    def GLM_summary(self):
+        # summarize the GLM result for each session
+        pass
 
-                        # Remove legend box
-                        ax.legend(frameon=False)
-                        if i == 0 or i==2:
-                            plt.ylabel('dF/F')
-                        if i == 2 or i==3:
-                            plt.xlabel('Time (s)')
-                    savefigpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
-                                self.data_index['Date'][ii], 'Plot', 'PSTH')
-                    os.makedirs(savefigpath, exist_ok=True)
-                    plt.savefig(os.path.join(savefigpath, f'PSTH_Neuron_{cc}.png'), dpi=300, bbox_inches='tight')
-                    plt.close()
+    def decoding_session(self):
+        # decode task-relavant variables for each session
+        pass
 
-            
+    def decoding_summary(self):
+        # summarize the decoding result for each session
+        pass
+
+    def demixed_PCA(self):
+        # demixed PCA
+        pass
+
 if __name__ == "__main__":
 
     # use interactive matplotlib backend
