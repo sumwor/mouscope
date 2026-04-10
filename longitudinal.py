@@ -9,7 +9,9 @@ import h5py
 from scipy.io import loadmat
 from scipy.ndimage import center_of_mass
 import matplotlib.pyplot as plt
-from utils_imaging import load_h5_item
+from utils_imaging import load_h5_item, d_prime
+import pickle
+
 
 class Longitudinal:
     def __init__(self, root_dir, Odor, rotarod):
@@ -43,7 +45,8 @@ class Longitudinal:
         self.Animal = self.data_index['Animal'].unique() 
         self.long_reg = {}  # dictionary to save the longitudinal registered data. key : animal names
         self.ses_included = {}
-        
+        self.ses_included_long = {}
+
         self.data_index['long_session'] = None
         self.data_index['FOV'] = None
         for aidx, aa in enumerate(self.Animal):
@@ -119,30 +122,50 @@ class Longitudinal:
             # look for the sessions
             # change this to trial 1 later
             self.ses_keys = ['AB1', 'AB-end', 'CD1', 'CD3', 'trial2', 'trial6', 'trial12']
-            ses_included = {}
+            ses_included_long = {}
+            ses_included = {} # save the index of sessions in data_index
             # find the index that meet this criteria
-            ses_included['AB1'] =self.data_index['long_session'][np.where((self.data_index['Task'] == 'Odor') & 
+            ses_included_long['AB1'] =self.data_index['long_session'][np.where((self.data_index['Task'] == 'Odor') & 
                                           (self.data_index['Protocol'] == 'AB') & 
                                           (self.data_index['ProtocolDay']==1))[0]].values[0]-1
+            ses_included['AB1'] = self.data_index.index[np.where((self.data_index['Task'] == 'Odor') & 
+                                          (self.data_index['Protocol'] == 'AB') & 
+                                          (self.data_index['ProtocolDay']==1))[0]].values[0]
             maxAB = np.max(self.data_index['ProtocolDay'][(self.data_index['Task'] == 'Odor') & 
                                                           (self.data_index['Protocol'] == 'AB')])
-            ses_included['AB-end'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Odor') &
+            ses_included_long['AB-end'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Odor') &
                                               (self.data_index['Protocol'] == 'AB') &
                                               (self.data_index['ProtocolDay'] == maxAB))[0]].values[0]-1
-            ses_included['CD1'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Odor') &
+            ses_included['AB-end'] = self.data_index.index[np.where((self.data_index['Task'] == 'Odor') &
+                                              (self.data_index['Protocol'] == 'AB') &
+                                              (self.data_index['ProtocolDay'] == maxAB))[0]].values[0]
+            ses_included_long['CD1'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Odor') &
                                             (self.data_index['Protocol'] == 'AB-CD') &
                                             (self.data_index['ProtocolDay'] == 1))[0]].values[0]-1
-            ses_included['CD3'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Odor') &
+            ses_included['CD1'] = self.data_index.index[np.where((self.data_index['Task'] == 'Odor') &
+                                            (self.data_index['Protocol'] == 'AB-CD') &
+                                            (self.data_index['ProtocolDay'] == 1))[0]].values[0]
+            ses_included_long['CD3'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Odor') &
                                             (self.data_index['Protocol'] == 'AB-CD') &
                                             (self.data_index['ProtocolDay'] == 3))[0]].values[0]-1
-            ses_included['trial2'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Rotarod') &
+            ses_included['CD3'] = self.data_index.index[np.where((self.data_index['Task'] == 'Odor') &
+                                            (self.data_index['Protocol'] == 'AB-CD') &
+                                            (self.data_index['ProtocolDay'] == 3))[0]].values[0]
+            ses_included_long['trial2'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Rotarod') &
                                                 (self.data_index['Trial'] == 2))[0]].values[0]-1
-            ses_included['trial6'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Rotarod') &
+            ses_included['trial2'] = self.data_index.index[np.where((self.data_index['Task'] == 'Rotarod') &
+                                                (self.data_index['Trial'] == 2))[0]].values[0]
+            ses_included_long['trial6'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Rotarod') &
                                                 (self.data_index['Trial'] == 6))[0]].values[0]-1
-            ses_included['trial12'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Rotarod') &
+            ses_included['trial6'] = self.data_index.index[np.where((self.data_index['Task'] == 'Rotarod') &
+                                                (self.data_index['Trial'] == 6))[0]].values[0]
+            ses_included_long['trial12'] = self.data_index['long_session'][np.where((self.data_index['Task'] == 'Rotarod') &
                                                 (self.data_index['Trial'] == 12))[0]].values[0]-1
-            self.ses_included[aa] = ses_included
-
+            ses_included['trial12'] = self.data_index.index[np.where((self.data_index['Task'] == 'Rotarod') &
+                                                (self.data_index['Trial'] == 12))[0]].values[0]
+            self.ses_included_long[aa] = ses_included_long # save the index of sessions (in long_data
+            # since there might be missing trials, so index in the long_data might be differ from the data_index)
+            self.ses_included[aa] = ses_included # save the index of sessions in data_index
             # convert dict to list
             ses_included_list = [ses_included[sk] for sk in self.ses_keys]
             # look for co-registerd neurons in these sessions
@@ -273,13 +296,17 @@ class Longitudinal:
         # look for fraction of auROC neurons in the coregistered neurons, and neurons not coresigered
             for aidx, aa in enumerate(self.Animal):
                 long_data = self.long_reg[aa]
-            
+                ses_included_long = self.ses_included_long[aa]
+                ses_included = self.ses_included[aa]
                 # shape: (nSess, nNeurons), value: neuron index in each session, 0 if not exist
-                nFiles = len(self.ses_keys)
+                odor_ses = self.ses_keys[0:4]
+                nFiles = len(odor_ses)
 
-            # temp varible for plot
-                n_sig_AB = np.full((1, nFiles), np.nan)
-                n_sig_CD = np.full((1, nFiles), np.nan)
+
+                # temp varible for plot
+                # track the percentage of neurons in coregisterd pop and non-coregistered pop that are significant in auROC
+                n_sig_AB = np.full((2, nFiles), np.nan)
+                n_sig_CD = np.full((2, nFiles), np.nan)
                 perf_AB = np.full((1, nFiles), np.nan)
                 perf_CD = np.full((1, nFiles), np.nan)
                 d_AB = np.full((1, nFiles), np.nan)
@@ -288,13 +315,10 @@ class Longitudinal:
                 crit_CD = np.full((1, nFiles), np.nan) # criterion for d prime (bias)
 
                 for ii in range(nFiles):
-                    dff_aligned_path = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
-                                        self.data_index['Date'][ii], 'Result', 'dff_aligned.pkl')
-                    with open(dff_aligned_path, "rb") as f:
-                        dff_aligned = pickle.load(f)
-                    savedatapath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
-                            self.data_index['Date'][ii], 'Result')
-                    behDF = pd.read_csv(self.data_index['BehCSV'][ii])
+                    ses_idx= ses_included[odor_ses[ii]]
+                    savedatapath = os.path.join(self.analysis, self.data_index['Animal'][ses_idx], 'Odor', 'Imaging',
+                            self.data_index['Date'][ses_idx], 'Result')
+                    behDF = pd.read_csv(self.data_index['BehCSV'][ses_idx])
                     perf_AB[0,ii] = np.nanmean(behDF['reward'][(behDF['schedule']==1) | (behDF['schedule']==2)]>0)
                     perf_CD[0,ii] = np.nanmean(behDF['reward'][(behDF['schedule']==3) | (behDF['schedule']==4)]>0)
                     
@@ -303,7 +327,7 @@ class Longitudinal:
                     d_data_AB['stimulus'] = np.array(behDF['schedule'][(behDF['schedule']==1) | (behDF['schedule']==2)]).astype(int)
                     d_data_AB['actions'] = np.array(behDF['actions'][(behDF['schedule']==1) | (behDF['schedule']==2)]).astype(int)+1
                     [d_AB[0,ii], crit_AB[0,ii]] = d_prime(d_data_AB)
-                    if self.data_index['Protocol'][ii] == 'AB-CD':
+                    if self.data_index['Protocol'][ses_idx] == 'AB-CD':
                         d_data_CD = {}
                         d_data_CD['stimulus'] = np.array(behDF['schedule'][(behDF['schedule']==3) | (behDF['schedule']==4)]).astype(int)-2
                         d_data_CD['actions'] = np.array(behDF['actions'][(behDF['schedule']==3) | (behDF['schedule']==4)]).astype(int)+1
