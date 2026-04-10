@@ -10,7 +10,7 @@ import re
 import matlab.engine
 eng = matlab.engine.start_matlab()
 # add matlab code into the path
-eng.addpath(r'C:\Users\Linda\Documents\GitHub\ASD_RLWM\Behavior', nargout=0)
+#eng.addpath(r'C:\Users\Linda\Documents\GitHub\ASD_RLWM\Behavior', nargout=0)
 
 class BehData:
 
@@ -101,8 +101,6 @@ class BehDataOdor(BehData):
 
         self.data_index = pd.DataFrame(rows)
 
-
-
     def load_data(self):
         # Load behavior data from file
         # need to call matlab functions
@@ -133,13 +131,16 @@ class BehDataOdor(BehData):
             
             self.data_index.loc[bIdx, 'BehCSV'] = csvPath
 
-
     def session_behavior(self):
+        """ it is probably way easier to do it just in Matlab"""
         # plot behavior of each individual session
         nSessions = self.data_index.shape[0]
         for ss in range(nSessions):
-            resultdf = pd.read_csv(self.data_index['BehCSV'][ss])
-            eng.ASD_session(resultdf,self.data_index['Protocol'][ss],self.data_index['Animal'][ss], 
+            resultdf_path = self.data_index['BehCSV'][ss]
+            #resultdf = resultdf.drop(columns=['Unnamed: 0'], errors='ignore')
+            #data_dict = resultdf.to_dict(orient='list')
+            
+            eng.ASD_session(resultdf_path,self.data_index['Protocol'][ss],self.data_index['Animal'][ss], 
                             self.data_index['Date'][ss],self.data_index['AnalysisPath'][ss],nargout=0)
 
     def odor_summary(self):
@@ -264,18 +265,18 @@ if __name__ == "__main__":
     root_dir = r'Y:\HongliWang\Miniscope\ASD'
 
     #%% test code for odor behavior
-    # Odor = BehDataOdor(root_dir)
+    Odor = BehDataOdor(root_dir)
 
     # #%% load matlab code
-    # eng = matlab.engine.start_matlab()
+    #eng = matlab.engine.start_matlab()
 
     # code_folder = r'C:\Users\Linda\Documents\GitHub\ASD_RLWM'
-    # eng.addpath(eng.genpath(code_folder), nargout=0)
+    #eng.addpath(eng.genpath(code_folder), nargout=0)
 
     # # read the data and save them to csv files
-    # Odor.load_data()
+    Odor.load_data()
 
-    # Odor.session_behavior()
+    Odor.session_behavior()
 
 
     #%% test code for rotarod behavior
