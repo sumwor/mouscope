@@ -167,17 +167,26 @@ class Longitudinal:
             # since there might be missing trials, so index in the long_data might be differ from the data_index)
             self.ses_included[aa] = ses_included # save the index of sessions in data_index
             # convert dict to list
-            ses_included_list = [ses_included[sk] for sk in self.ses_keys]
+            ses_included_list = [ses_included_long[sk] for sk in self.ses_keys]
             # look for co-registerd neurons in these sessions
             coregistered_cells = long_data['cell_to_index_map'] 
             # shape: (nSess, nNeurons), value: neuron index in each session, 0 if not exist
 
+            # find the neuron index coregistered in included sessions
+            self.neuron_coreg_all= np.where(np.all(coregistered_cells[ses_included_list,:]>0, axis=0))[0]
+            self.neuron_coreg_odor = np.where(np.all(coregistered_cells[ses_included_list[0:4],:]>0, axis=0))[0]
+            self.neuron_coreg_rotarod = np.where(np.all(coregistered_cells[ses_included_list[4:],:]>0, axis=0))[0]
+
+            # separate in AB/CD sessions
+            self.neuron_coreg_AB= np.where(np.all(coregistered_cells[[10,13],:]>0, axis=0))[0]
+            self.neuron_coreg_CD= np.where(np.all(coregistered_cells[[14,16],:]>0, axis=0))[0]
             #%% make three plot:
             # put it here for now, will become an average with more animals
             # 1. coregistered cells across odor and rotarod
             # 2. coregistered cells in odor
             # 3. coregistered cells i rotarod
             savefigname = os.path.join(savefigpath, 'Register_overview.png')
+            neuron_all = self.neuron_coreg_all
             if not os.path.exists(savefigname): 
             
                 plt.figure()
@@ -186,7 +195,7 @@ class Longitudinal:
                 plt.subplot(2,2,1)
                 plt.imshow(Cn)
                 plt.title('Coregistered neurons all')
-                neuron_all= np.where(np.all(coregistered_cells[ses_included_list,:]>0, axis=0))[0]
+                
                 # find the index of these neurons in session 1
                 shared_session1 = coregistered_cells[0, neuron_all].astype(int)-1
                 shared_contour_s1 = long_data['spatial_footprints_corrected'][0][:,:,shared_session1]
@@ -302,11 +311,11 @@ class Longitudinal:
                 odor_ses = self.ses_keys[0:4]
                 nFiles = len(odor_ses)
 
-
                 # temp varible for plot
                 # track the percentage of neurons in coregisterd pop and non-coregistered pop that are significant in auROC
-                n_sig_AB = np.full((2, nFiles), np.nan)
-                n_sig_CD = np.full((2, nFiles), np.nan)
+                frac_sig_coreg = np.full((1, nFiles), np.nan)
+                frac_sig_noncoreg = np.full((2, nFiles), np.nan)
+                #n_sig_CD = np.full((2, nFiles), np.nan)
                 perf_AB = np.full((1, nFiles), np.nan)
                 perf_CD = np.full((1, nFiles), np.nan)
                 d_AB = np.full((1, nFiles), np.nan)
@@ -314,8 +323,10 @@ class Longitudinal:
                 crit_AB = np.full((1, nFiles), np.nan)
                 crit_CD = np.full((1, nFiles), np.nan) # criterion for d prime (bias)
 
+                # get the behavior
                 for ii in range(nFiles):
                     ses_idx= ses_included[odor_ses[ii]]
+                    ses_idx_long = ses_included_long[odor_ses[ii]]
                     savedatapath = os.path.join(self.analysis, self.data_index['Animal'][ses_idx], 'Odor', 'Imaging',
                             self.data_index['Date'][ses_idx], 'Result')
                     behDF = pd.read_csv(self.data_index['BehCSV'][ses_idx])
@@ -334,4 +345,20 @@ class Longitudinal:
                         [d_CD[0,ii], crit_CD[0,ii]] = d_prime(d_data_CD)
 
                     savedataname = os.path.join(savedatapath, 
-                                                f"auROC_results_stimulus_{self.data_index['Protocol'][ii]}.pkl")
+                                                f"auROC_results_stimulus_{self.data_index['Protocol'][ses_idx]}.pkl")
+                    
+                    with open(savedataname, 'rb') as f:
+                        auROC_results = pickle.load(f)
+                    
+                    sig_Idx = np.where(auROC_results['p_auc_s_adjusted']<0.05)[0]
+                    coregistered_cells = long_data['cell_to_index_map'][ses_idx_long][self.neuron_coreg_odor]
+                    # find neurons in both sig_Idx and coregistered_cells
+                    frac_sig_coreg[0,ii] = np.sum(np.isin(sig_Idx, coregistered_cells))/len(coregistered_cells)
+
+                    # if ii==1 or ii==2:
+                    #     coregistered = long_data['cell_to_index_map'][ses_idx_long][self.neuron_coreg_AB]
+                    # else:
+                    #     coregistered = long_data['cell_to_index_map'][ses_idx_long][self.neuron_coreg_CD]
+                    # frac_sig_coreg[0,ii] = np.sum(np.isin(sig_Idx, coregistered))/len(coregistered)
+                     # total number of coregistered neurons in this session
+                    # get the auROC result

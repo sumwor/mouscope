@@ -174,27 +174,98 @@ def load_dataset(f, obj):
     
     return data
 
+# @njit
+# def auROC_supT(data, labels):
+#     # auROC function designed for supT test
+#     # every function passed to supT_stats need to take the same data
+#     # data: a vector of dFF of cell c, at time t for all trials
+#     # label: dependent variables
+#     # use numba to speed it up
+#     mask = ~np.isnan(data)
+    
+#     y = labels[mask]
+#     x= data[mask]
+#     #  skip if not enough data
+#     if np.sum(mask) < 2 or len(np.unique(y)) < 2:
+#         return np.nan
+#     ranks = rankdata(x)
+
+#     n1 = np.sum(y==1)
+#     n0 = np.sum(y==0)
+#     rank_sum = np.sum(ranks[y==1])  # ranks start at 1
+#     auc = (rank_sum - n1*(n1+1)/2) / (n1*n0)
+#     return auc
+
+@njit
+def rankdata_argsort(x):
+    n = len(x)
+    order = np.argsort(x)
+
+    ranks = np.empty(n)
+    i = 0
+
+    while i < n:
+        j = i
+
+        # find tie block
+        while j + 1 < n and x[order[j + 1]] == x[order[i]]:
+            j += 1
+
+        # average rank for ties
+        rank = (i + j) / 2.0 + 1.0
+
+        for k in range(i, j + 1):
+            ranks[order[k]] = rank
+
+        i = j + 1
+
+    return ranks
+
+
 @njit
 def auROC_supT(data, labels):
-    # auROC function designed for supT test
-    # every function passed to supT_stats need to take the same data
-    # data: a vector of dFF of cell c, at time t for all trials
-    # label: dependent variables
-    # use numba to speed it up
-    mask = ~np.isnan(data)
-    
-    y = labels[mask]
-    x= data[mask]
-    #  skip if not enough data
-    if np.sum(mask) < 2 or len(np.unique(y)) < 2:
-        return np.nan
-    ranks = rankdata(x)
 
-    n1 = np.sum(y==1)
-    n0 = np.sum(y==0)
-    rank_sum = np.sum(ranks[y==1])  # ranks start at 1
-    auc = (rank_sum - n1*(n1+1)/2) / (n1*n0)
+    # count valid
+    n = 0
+    for i in range(len(data)):
+        if not np.isnan(data[i]):
+            n += 1
+
+    if n < 2:
+        return np.nan
+
+    x = np.empty(n)
+    y = np.empty(n)
+
+    k = 0
+    for i in range(len(data)):
+        if not np.isnan(data[i]):
+            x[k] = data[i]
+            y[k] = labels[i]
+            k += 1
+
+    n1 = 0
+    n0 = 0
+    for i in range(n):
+        if y[i] == 1:
+            n1 += 1
+        else:
+            n0 += 1
+
+    if n1 == 0 or n0 == 0:
+        return np.nan
+
+    ranks = rankdata_argsort(x)
+
+    rank_sum = 0.0
+    for i in range(n):
+        if y[i] == 1:
+            rank_sum += ranks[i]
+
+    auc = (rank_sum - n1 * (n1 + 1) / 2.0) / (n1 * n0)
+
     return auc
+
 
 def linear_regr_supT(data, labels):
     """
@@ -310,16 +381,13 @@ def supT_stats(data,labels, metric_func, nShuffles = 1000):
 
         min_trials = min(len(idx1), len(idx2), len(idx3), len(idx4))
 
-        maxRepeats = 500
-        check_window = 20
-        tol = 0.005  # convergence threshold
-
+        maxRepeats = 100
         metric_obs = np.full((nTime, nCells), np.nan)
-        converge_iter = np.full((nTime, nCells), np.nan)
+        #converge_iter = np.full((nTime, nCells), np.nan)
 
         rng = np.random.default_rng(42)
 
-        for cell in range(nCells):
+        for cell in tqdm(range(nCells)):
             for t in range(nTime):
                 auc_list = []
 
@@ -336,29 +404,20 @@ def supT_stats(data,labels, metric_func, nShuffles = 1000):
                     auc_list.append(auc)
 
                     # Check convergence after enough repeats
-                    if r >= 2 * check_window:
-                        prev_mean = np.mean(auc_list[-2*check_window:-check_window])
-                        curr_mean = np.mean(auc_list[-check_window:])
-                        if np.abs(curr_mean - prev_mean) < tol:
-                            metric_obs[t, cell] = np.mean(auc_list)
-                            converge_iter[t, cell] = r
-                            #print(f'converged for cell {cell}, time {t} at iteration {r}')
-                            break
+ 
 
-                # If never converged
-                if np.isnan(metric_obs[t, cell]):
-                    print(f'not converged for cell {cell}, time {t}')
-                    metric_obs[t, cell] = np.mean(auc_list)
-                    converge_iter[t, cell] = maxRepeats
+                metric_obs[t, cell] = np.mean(auc_list)
+                #converge_iter[t, cell] = maxRepeats
 
         # show the maximum convergence iteration for all cells and time points
-        print(f'Maximum convergence iteration: {np.nanmax(converge_iter)}')
+        #print(f'Maximum convergence iteration: {np.nanmax(converge_iter)}')
         supT_obs = np.nanmax(np.abs(metric_obs - 0.5), axis=0)
 
         print('Running supT test...')
 
         # permutation null distribution, paralleled  
-        results = Parallel(n_jobs=-1)(
+        with Parallel(n_jobs=12, backend="loky") as parallel:
+            results = parallel(
                 delayed(metric_parallel)(data, labels, metric_func)
                 for _ in tqdm(range(nShuffles))
             )

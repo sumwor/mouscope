@@ -703,9 +703,9 @@ class Imaging:
                     schedule_A = 3
                     schedule_B = 4  # look for C, D trials
                 #%% auROC calculation for stimulus
-                # 0-1 s only
-                dff_included = dff_aligned['center_in'][(dff_aligned['time']<2) & (dff_aligned['time']>0), :,:]
-                nTime, nTrials, nCells = dff_included .shape
+                # 0-2 s only
+                dff_included_02 = dff_aligned['center_in'][(dff_aligned['time']<2) & (dff_aligned['time']>0), :,:]
+                nTime, nTrials, nCells = dff_included_02.shape
 
                 # supT test to determine neurons that encode stimulus (aligned to center_in)
                 # for contral trials
@@ -717,19 +717,44 @@ class Imaging:
                 # calculate auROC for stimulus, but use choice for stratify
                 labels['target'] = np.array(behDF['schedule'][trial_include_mask]==schedule_A).astype(int)
                 labels['stratify'] = np.array(behDF['actions'][trial_include_mask]==1).astype(int)  # B = 1, else = 0
-                dff_included=dff_included[:, trial_include_mask, :]
-                [auc_s, p_auc_s_adjusted, auc_s_null] = supT_stats(dff_included, labels, auROC_supT, 1000)
+                dff_included_02=dff_included_02[:, trial_include_mask, :]
+                [auc_s_02, p_auc_s_adjusted_02, auc_s_null_02] = supT_stats(dff_included_02, labels, auROC_supT, 1000)
                 
+                # 2-4
+                dff_included_24 = dff_aligned['center_in'][(dff_aligned['time']<4) & (dff_aligned['time']>2), :,:]
+                [auc_s_24, p_auc_s_adjusted_24, auc_s_null_24] = supT_stats(dff_included_24, labels, auROC_supT, 1000)
+
+                # for choice
+                labels['target'] = np.array(behDF['actions'][trial_include_mask]==1).astype(int)
+                labels['stratify'] = np.array(behDF['schedule'][trial_include_mask]==schedule_A).astype(int)  # B = 1, else = 0
+                [auc_c_02, p_auc_c_adjusted_02, auc_c_null_02] = supT_stats(dff_included_02, labels, auROC_supT, 1000)
+                
+                # 2-4
+                [auc_c_24, p_auc_c_adjusted_24, auc_c_null_24] = supT_stats(dff_included_24, labels, auROC_supT, 1000)
+
                 # for AB-CD sessions, also look at AB trials
                 if self.data_index['Protocol'][ii] == 'AB-CD':
                     # include the AB trials
                     trial_include_mask_AB = np.logical_or(behDF['schedule']==1, behDF['schedule']==2)
-                    dff_tmp = dff_aligned['center_in'][(dff_aligned['time']<2) & (dff_aligned['time']>0), :, :]
-                    dff_included_AB = dff_tmp[:, trial_include_mask_AB, :]
+                    dff_tmp_02 = dff_aligned['center_in'][(dff_aligned['time']<2) & (dff_aligned['time']>0), :, :]
+                    dff_included_AB_02 = dff_tmp_02[:, trial_include_mask_AB, :]
                     labels_AB = {}
                     labels_AB['target'] = np.array(behDF['schedule'][trial_include_mask_AB]==1).astype(int)
                     labels_AB['stratify'] = np.array(behDF['actions'][trial_include_mask_AB]==1).astype(int)  # B = 1, else = 0
-                    [auc_s_AB, p_auc_s_adjusted_AB, auc_s_null_AB] = supT_stats(dff_included_AB, labels_AB, auROC_supT, 1000)
+                    [auc_s_AB_02, p_auc_s_adjusted_AB_02, auc_s_null_AB_02] = supT_stats(dff_included_AB_02, labels_AB, auROC_supT, 1000)
+                    # 2-4
+                    dff_tmp_24 = dff_aligned['center_in'][(dff_aligned['time']<4) & (dff_aligned['time']>2), :, :]
+                    dff_included_AB_24 = dff_tmp_24[:, trial_include_mask_AB, :]
+                    [auc_s_AB_24, p_auc_s_adjusted_AB_24, auc_s_null_AB_24] = supT_stats(dff_included_AB_24, labels_AB, auROC_supT, 1000)
+
+                    # for choice
+                    
+                    labels_AB['target'] = np.array(behDF['actions'][trial_include_mask_AB]==1).astype(int)
+                    labels_AB['stratify'] = np.array(behDF['schedule'][trial_include_mask_AB]==1).astype(int)  # B = 1, else = 0
+                    [auc_c_AB_02, p_auc_c_adjusted_AB_02, auc_c_null_AB_02] = supT_stats(dff_included_AB_02, labels_AB, auROC_supT, 1000)
+                    # 2-4
+                    [auc_c_AB_24, p_auc_c_adjusted_AB_24, auc_c_null_AB_24] = supT_stats(dff_included_AB_24, labels_AB, auROC_supT, 1000)
+
                 # save the file
                 if self.data_index['Protocol'][ii] == 'AB':
                     n_sig_AB[0, ii] = np.sum(p_auc_s_adjusted<0.05)/ nCells
@@ -785,9 +810,7 @@ class Imaging:
         ax1.set_xticks(x_positions)
         ax1.set_xticklabels(x_labels)
         
-        #%% look for coregistered neurons acrss sessions if long_data is provided
-        if long_data is not None:
-            pass
+
 
     def MLR_session(self):
         # generalized linear regression for 
@@ -1409,7 +1432,7 @@ if __name__ == "__main__":
     # basic plots of calcium traces aligned to behavior
     # 1. PSTH
     #imaging_Odor.cal_traces()
-    #imaging_Odor.auROC()
+    imaging_Odor.auROC()
     #imaging_Odor.MLR_session()
     #imaging_Odor.decoding_session()
     #imaging_Odor.MLR_orthogonal()
