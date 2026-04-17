@@ -1,4 +1,5 @@
 # code to process behavior files and align calcium data with behavior timestamps
+from behavior_mat_parser import extract_behavior_df_py
 import os
 import numpy as np
 import pandas as pd
@@ -7,10 +8,14 @@ from collections import defaultdict
 from datetime import datetime
 import re
 
-import matlab.engine
-eng = matlab.engine.start_matlab()
-# add matlab code into the path
-#eng.addpath(r'C:\Users\Linda\Documents\GitHub\ASD_RLWM\Behavior', nargout=0)
+
+def _get_matlab_engine():
+    global eng
+    if eng is None:
+        if matlab is None:
+            raise RuntimeError("MATLAB engine is not available.")
+        eng = matlab.start_matlab()
+    return eng
 
 class BehData:
 
@@ -101,6 +106,8 @@ class BehDataOdor(BehData):
 
         self.data_index = pd.DataFrame(rows)
 
+
+
     def load_data(self):
         # Load behavior data from file
         # need to call matlab functions
@@ -113,7 +120,7 @@ class BehDataOdor(BehData):
 
                 results = []
                 for beh in behFiles:
-                    resultdf = eng.extract_behavior_df(beh)
+                    resultdf = extract_behavior_df_py(beh)
 
                     # deal with float precision problem
                     resultdf['reward'] = resultdf['reward'].round(0)
@@ -127,21 +134,13 @@ class BehDataOdor(BehData):
                 if not os.path.exists(self.data_index['AnalysisPath'][bIdx]):
                     os.makedirs(self.data_index['AnalysisPath'][bIdx], exist_ok = True)
 
-                final_df.to_csv(csvPath)
+                final_df.to_csv(csvPath, index=False)
             
             self.data_index.loc[bIdx, 'BehCSV'] = csvPath
 
-    def session_behavior(self):
-        """ it is probably way easier to do it just in Matlab"""
-        # plot behavior of each individual session
-        nSessions = self.data_index.shape[0]
-        for ss in range(nSessions):
-            resultdf_path = self.data_index['BehCSV'][ss]
-            #resultdf = resultdf.drop(columns=['Unnamed: 0'], errors='ignore')
-            #data_dict = resultdf.to_dict(orient='list')
-            
-            eng.ASD_session(resultdf_path,self.data_index['Protocol'][ss],self.data_index['Animal'][ss], 
-                            self.data_index['Date'][ss],self.data_index['AnalysisPath'][ss],nargout=0)
+
+    def session_behavior(self, overwrite=False):
+        raise NotImplementedError("session_behavior has not yet been ported from MATLAB to Python.")
 
     def odor_summary(self):
         pass
@@ -265,18 +264,18 @@ if __name__ == "__main__":
     root_dir = r'Y:\HongliWang\Miniscope\ASD'
 
     #%% test code for odor behavior
-    Odor = BehDataOdor(root_dir)
+    # Odor = BehDataOdor(root_dir)
 
     # #%% load matlab code
-    #eng = matlab.engine.start_matlab()
+    # eng = matlab.engine.start_matlab()
 
     # code_folder = r'C:\Users\Linda\Documents\GitHub\ASD_RLWM'
-    #eng.addpath(eng.genpath(code_folder), nargout=0)
+    # eng.addpath(eng.genpath(code_folder), nargout=0)
 
     # # read the data and save them to csv files
-    Odor.load_data()
+    # Odor.load_data()
 
-    Odor.session_behavior()
+    # Odor.session_behavior()
 
 
     #%% test code for rotarod behavior
