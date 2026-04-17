@@ -1,4 +1,17 @@
 # code to process behavior files and align calcium data with behavior timestamps
+"""
+This file currently provides:
+1. A base behavior class (BehData) for shared project paths and animal metadata.
+2. An odor behavior pipeline (BehDataOdor) that:
+   - scans raw odor behavior .mat files
+   - builds a session index
+   - parses each raw MATLAB exper file with the Python parser
+   - saves trial-level behavior CSV files into the Analysis folder
+3. A rotarod behavior pipeline (BehDataRotarod) that:
+   - scans rotarod behavior/video/DLC/timestamp files
+   - builds a session index for later use
+"""
+
 from behavior_mat_parser import extract_behavior_df_py
 import os
 import numpy as np
@@ -8,15 +21,7 @@ from collections import defaultdict
 from datetime import datetime
 import re
 
-
-def _get_matlab_engine():
-    global eng
-    if eng is None:
-        if matlab is None:
-            raise RuntimeError("MATLAB engine is not available.")
-        eng = matlab.start_matlab()
-    return eng
-
+#Shared base class for behaviors
 class BehData:
 
     def __init__(self, root_path):
@@ -30,7 +35,7 @@ class BehData:
         self.ImageCell = self.AnimalInfo['Cells']
         self.Hemisphere = self.AnimalInfo['hemisphere']
 
-
+#Odor behavior indexing + parsing
 class BehDataOdor(BehData):
 
     def __init__(self, root_file):
@@ -110,7 +115,9 @@ class BehDataOdor(BehData):
 
     def load_data(self):
         # Load behavior data from file
-        # need to call matlab functions
+        # Python replacement for the old MATLAB behavior parser:
+        # parse raw odor .mat exper files into trial-level BehCSV outputs
+
         for bIdx, behFiles in enumerate(self.data_index['BehaviorPath']):
             csvPath = os.path.join(self.data_index['AnalysisPath'][bIdx], 
                                 self.data_index['Date'][bIdx] + 
@@ -140,7 +147,10 @@ class BehDataOdor(BehData):
 
 
     def session_behavior(self, overwrite=False):
-        raise NotImplementedError("session_behavior has not yet been ported from MATLAB to Python.")
+        raise NotImplementedError(
+            "session_behavior is intentionally left unported because ASD_session.m "
+            "source is not available, so exact MATLAB-equivalent behavior cannot be guaranteed."
+        )
 
     def odor_summary(self):
         pass
@@ -157,6 +167,7 @@ class BehDataOdor(BehData):
         # call matlab function to fit the computational model
         pass
 
+#Rotarod behavior indexing structure
 class BehDataRotarod(BehData):
 
     def __init__(self, root_file):
@@ -261,7 +272,7 @@ class BehDataRotarod(BehData):
 
 
 if __name__ == "__main__":
-    root_dir = r'Y:\HongliWang\Miniscope\ASD'
+    root_dir = r"\\filenest.dyn.berkeley.edu\Wilbrecht_file_server\HongliWang\Miniscope\ASD"
 
     #%% test code for odor behavior
     # Odor = BehDataOdor(root_dir)

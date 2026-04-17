@@ -1,3 +1,25 @@
+"""
+behavior_mat_parser.py
+
+Purpose
+-------
+Parse raw odor behavior MATLAB exper files into a trial-level pandas DataFrame.
+1. Load the raw MATLAB .mat exper file.
+2. Convert MATLAB structs / object arrays into Python-friendly nested dicts/lists.
+3. Detect whether the session uses:
+   - odor_rlwm
+   - odor_rlwm_automatic
+4. Extract per-trial metadata that are easy to read directly from the protocol param block:
+   - schedule
+   - port_side
+   - odor_name
+   - odor_channel
+   - odor_dur
+   - result_raw
+5. Reconstruct the exact trial event table using the already-validated event parsing logic.
+6. Merge trial event columns with protocol metadata and return the final DataFrame.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +29,7 @@ import numpy as np
 import pandas as pd
 from scipy.io import loadmat
 
-
+#Container for parsed RLWM session outputs.
 @dataclass
 class RLWMParsed:
     rlwm_event_times: np.ndarray
@@ -18,12 +40,10 @@ class RLWMParsed:
     result: np.ndarray
     protocol_name: str
 
+# Clean Matlab-loaded object
+# convert scipy loadmat mat_struct-like objects into Python dict/list/scalars.
 
-def _mat_struct_to_dict(obj: Any) -> Any:
-    """
-    Recursively convert scipy loadmat mat_struct-like objects into Python dict/list/scalars.
-    Preserve nested shape for MATLAB cell arrays instead of flattening them.
-    """
+def _mat_struct_to_dict(obj: Any):
     if hasattr(obj, "_fieldnames"):
         out = {}
         for name in obj._fieldnames:
@@ -47,11 +67,8 @@ def _mat_struct_to_dict(obj: Any) -> Any:
 
     return obj
 
-
-def load_exper_file(filename: str) -> Dict[str, Any]:
-    """
-    Load a MATLAB exper file and convert it to nested Python dicts/arrays.
-    """
+#Load a MATLAB exper file and convert it to nested Python dicts/arrays.
+def load_exper_file(filename: str):
     data = loadmat(filename, struct_as_record=False, squeeze_me=True)
     clean = {}
     for k, v in data.items():
@@ -61,10 +78,9 @@ def load_exper_file(filename: str) -> Dict[str, Any]:
     return clean
 
 
-def detect_rlwm_protocol(exper_data: Dict[str, Any]) -> str:
-    """
-    Return 'odor_rlwm' or 'odor_rlwm_automatic'.
-    """
+#Protocol and param block access:
+#Detect whether the exper file contains 'odor_rlwm' or 'odor_rlwm_automatic'
+def detect_rlwm_protocol(exper_data: Dict[str, Any]):
     exper = exper_data.get("exper", {})
     if "odor_rlwm" in exper:
         return "odor_rlwm"
@@ -73,7 +89,7 @@ def detect_rlwm_protocol(exper_data: Dict[str, Any]) -> str:
     raise ValueError("No odor_rlwm or odor_rlwm_automatic session found in exper file.")
 
 
-def _to_1d_numeric(x: Any, dtype=float) -> np.ndarray:
+def _to_1d_numeric(x: Any, dtype=float):
     arr = np.array(x)
     arr = np.squeeze(arr)
     if arr.ndim == 0:
@@ -81,12 +97,12 @@ def _to_1d_numeric(x: Any, dtype=float) -> np.ndarray:
     return arr.astype(dtype)
 
 
-def _extract_protocol_block(exper_data: Dict[str, Any], protocol_name: str) -> Dict[str, Any]:
+def _extract_protocol_block(exper_data: Dict[str, Any], protocol_name: str):
     exper = exper_data["exper"]
     return exper[protocol_name]["param"]
 
-
-def _ensure_2d_numeric(x: Any) -> np.ndarray:
+#Convert input into a 2D numeric numpy array
+def _ensure_2d_numeric(x: Any):
     arr = np.array(x, dtype=float)
     arr = np.squeeze(arr)
 
@@ -99,7 +115,10 @@ def _ensure_2d_numeric(x: Any) -> np.ndarray:
     return arr
 
 
-def _looks_like_trial_event_matrix(x: Any) -> bool:
+
+#Trial event matrix normalization:
+#Check whether an object can be interpreted as one trial event matrix
+def _looks_like_trial_event_matrix(x: Any):
     try:
         arr = np.array(x, dtype=float)
         arr = np.squeeze(arr)
@@ -111,11 +130,8 @@ def _looks_like_trial_event_matrix(x: Any) -> bool:
     except Exception:
         return False
 
-
-def _collect_trial_event_matrices(obj: Any) -> List[np.ndarray]:
-    """
-    Normalize MATLAB cell arrays of per-trial event matrices into a Python list of (n, 3) arrays.
-    """
+#Normalize MATLAB cell arrays of per-trial event matrices into a Python list of (N, 3) numeric arrays.
+def _collect_trial_event_matrices(obj: Any):
     mats: List[np.ndarray] = []
 
     if _looks_like_trial_event_matrix(obj):
@@ -134,8 +150,8 @@ def _collect_trial_event_matrices(obj: Any) -> List[np.ndarray]:
 
     return mats
 
-
-def _flatten_strings(x: Any) -> List[str]:
+#Flatten nested lists / objects into a simple list of strings
+def _flatten_strings(x: Any):
     if isinstance(x, list):
         out: List[str] = []
         for item in x:
@@ -144,7 +160,10 @@ def _flatten_strings(x: Any) -> List[str]:
     return [str(x)]
 
 
-def _backward_times(dmat: np.ndarray, outcome_inds: np.ndarray, event_selector) -> np.ndarray:
+
+#Event lookup helpers used in final DataFrame:
+#For each trial, scan backward from outcome to find the last event matching event_selector
+def _backward_times(dmat: np.ndarray, outcome_inds: np.ndarray, event_selector):
     result = np.full(len(outcome_inds), np.nan, dtype=float)
     for i in range(len(outcome_inds)):
         start_ind = 0 if i == 0 else outcome_inds[i - 1]
@@ -157,10 +176,12 @@ def _backward_times(dmat: np.ndarray, outcome_inds: np.ndarray, event_selector) 
     return result
 
 
-def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
-    """
-    Python port of get_RLWM_EventTimes / get_RLWM_automatic_EventTimes.
-    """
+
+
+#Core RLWM event reconstruction
+#Python port of get_RLWM_EventTimes / get_RLWM_automatic_EventTimes
+def get_rlwm_event_times_py(filename: str):
+
     data = load_exper_file(filename)
     protocol_name = detect_rlwm_protocol(data)
     param = _extract_protocol_block(data, protocol_name)
@@ -175,8 +196,10 @@ def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
     stimparam = param["stimparam"]["value"]
     stimparam_user = _flatten_strings(param["stimparam"]["user"])
 
+# In the current validated logic, odor duration is taken from column 6 of stimparam using the schedule index.
     odor_dur = np.array([float(stimparam[int(s) - 1][5]) for s in schedule], dtype=float)
 
+# Reward-ratio columns are looked up by label in stimparam['user']
     left_idx = stimparam_user.index("left reward ratio")
     right_idx = stimparam_user.index("right reward ratio")
 
@@ -186,7 +209,7 @@ def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
     left_reward_p = left_all[schedule.astype(int) - 1]
     right_reward_p = right_all[schedule.astype(int) - 1]
 
-    # MATLAB global rpbox trial_events: columns ~ [trial, time, state, chan, next_state]
+# MATLAB global rpbox trial_events: columns ~ [trial, time, state, chan, next_state]
     global_trial_events = _ensure_2d_numeric(data["exper"]["rpbox"]["param"]["trial_events"]["value"])
     trial_cells = _collect_trial_event_matrices(param["trial_events"]["trial"])
 
@@ -195,12 +218,15 @@ def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
     rlwm_rows: List[List[float]] = []
     valid_trials = np.zeros(counted_trial, dtype=bool)
 
+# kk is the current valid-trial counter used in the reconstructed RLWM matrix
+# tt is the trial time, and tt1 is beginning time, tt2 is outcome time
     kk = 0
     tt2 = 0.0
 
     for k in range(counted_trial):
         trial_k = trial_cells[k] if k < len(trial_cells) else np.empty((0, 3), dtype=float)
-
+        
+        #determine trial boundaries tt1 and tt2
         if k == 0:
             tt1 = 0.0
             if trial_k.size > 0:
@@ -248,6 +274,7 @@ def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
             (global_trial_events[:, 1] > tt1) & (global_trial_events[:, 1] <= tt2), 1:4
         ]  # [time, state, chan]
 
+#find odor-on events in the current trial window
         if delay_odor == 1:
             odor_on_mask = np.isin(current_te[:, 1], [2, 12, 22]) & (current_te[:, 2] == 8)
         else:
@@ -269,6 +296,7 @@ def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
 
             valid_trials[k] = True
 
+#add ITI events between previous trial end and odor on
             iti_te = global_trial_events[
                 (global_trial_events[:, 1] > tt1)
                 & (global_trial_events[:, 1] < new_trial_odor_on_time)
@@ -285,9 +313,11 @@ def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
                 for row in iti_te:
                     rlwm_rows.append([row[2], row[0], kk - 0.5])
 
+            #add odor-on code
             odor_id = odor_channel[k] / 100.0
             rlwm_rows.append([7.0 + odor_id, new_trial_odor_on_time, kk])
 
+	    #add within-trial poke/water events after odor on
             tk_te = global_trial_events[
                 (global_trial_events[:, 1] > new_trial_odor_on_time)
                 & (global_trial_events[:, 1] <= tt2)
@@ -297,6 +327,7 @@ def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
 
             tk_extra = []
 
+	    # Water / reward related extra event codes
             tk_te1 = global_trial_events[
                 (global_trial_events[:, 1] > new_trial_odor_on_time)
                 & (global_trial_events[:, 1] <= tt2)
@@ -338,6 +369,7 @@ def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
                 for row in tk_all:
                     rlwm_rows.append([row[2], row[0], kk])
 
+	    #add outcome code
             rlwm_rows.append([80.0 + result[k], tt2, kk])
 
         elif tt1 == tt2:
@@ -346,11 +378,13 @@ def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
         else:
             raise ValueError(f"no odor on time for trial {k+1} in file: {filename}")
 
+    # Convert reconstructed rows into final (3, N) event matrix
     if len(rlwm_rows) > 0:
         rlwm_event_times = np.array(rlwm_rows, dtype=float).T
     else:
         rlwm_event_times = np.empty((3, 0), dtype=float)
 
+    # Keep current validated rule for no-go / no-reward cases
     portside = portside.copy()
     portside[(left_reward_p == -1) & (right_reward_p == -1)] = -1
 
@@ -365,13 +399,15 @@ def get_rlwm_event_times_py(filename: str) -> RLWMParsed:
     )
 
 
-def extract_behavior_df_py(filename: str) -> pd.DataFrame:
-    """
-    Python port of extract_behavior_df.m.
-    """
+
+#Final public DataFrame output
+#Python port of extract_behavior_df.m
+def extract_behavior_df_py(filename: str):
+
     parsed = get_rlwm_event_times_py(filename)
     dmat = parsed.rlwm_event_times.T
 
+    # If no events were reconstructed, return an empty DataFrame with the expected output columns preserved.
     if dmat.shape[0] == 0:
         return pd.DataFrame(
             columns=[
@@ -412,15 +448,16 @@ def extract_behavior_df_py(filename: str) -> pd.DataFrame:
         dmat, outcome_inds, lambda region: (region[:, 0] == 3) | (region[:, 0] == 5)
     )
 
-    # Filter out impossible side_in values:
-    # valid side choice should occur after center_out within the same trial.
+    # Filter out impossible side_in values: valid side choice should occur after center_out within the same trial.
     invalid_side_in = (
         ~np.isnan(out["side_in"])
         & ~np.isnan(out["center_out"])
         & (out["side_in"] < out["center_out"])
     )
     out["side_in"][invalid_side_in] = np.nan
-
+    
+    #"so" aka side_out
+    #last_side_out is searched forward from outcome until the next odor-on event
     so_times = np.full(len(outcome_inds), np.nan, dtype=float)
     for i in range(len(outcome_inds)):
         start_ind = outcome_inds[i]
@@ -431,6 +468,7 @@ def extract_behavior_df_py(filename: str) -> pd.DataFrame:
             so_times[i] = so_time[-1]
     out["last_side_out"] = so_times
 
+    # Map side_in time back to the corresponding within-trial event code
     trial_sel = np.isin(dmat[:, 1], out["side_in"]) & (dmat[:, 0] < 80)
 
     choice_trials_raw = dmat[trial_sel, 2]
@@ -448,6 +486,7 @@ def extract_behavior_df_py(filename: str) -> pd.DataFrame:
 
     out["actions"] = actions
 
+    # Water/reward events are encoded through event IDs starting with 9.xx
     waters = np.full(len(outcome_inds), np.nan, dtype=float)
     water_sel = np.floor(dmat[:, 0]) == 9
     water_given = dmat[water_sel, 2].astype(np.uint16)

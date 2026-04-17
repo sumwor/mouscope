@@ -1,16 +1,41 @@
-# multiple session registration
-# longitudinal_registration.py
-import os
+"""
+longitudinal_registration.py
+
+Purpose
+-------
+Perform cross-session longitudinal registration for one animal by:
+1. Collecting CNMF result files and corresponding template mmap files
+   from both Rotarod and Odor imaging sessions.
+2. Loading spatial footprints (A matrices) from each CNMF result file.
+3. Loading mean template images from each mmap file.
+4. Running CaImAn's register_multisession across sessions.
+5. Saving intermediate outputs and returning registration results.
+
+Important notes
+---------------
+- Now, this script is not designed for interactive GUI display.
+  Therefore it uses the non-interactive matplotlib backend "Agg".
+- The current code assumes each spatial footprint can be reshaped into
+  (n_neurons, 300, 300), matching our current dataset.
+
+"""
+
 import glob
+import os
+from typing import Dict, List, Optional, Tuple
+
 import h5py
+import matplotlib
+
+# Use a non-interactive backend so this script can run in batch mode
+# without requiring a Qt windowing environment.
+matplotlib.use("Agg")
+from matplotlib import pyplot as plt
+
 import numpy as np
 import scipy.io as sio
 from scipy.io import loadmat
 from scipy.sparse import csc_matrix
-
-import matplotlib
-matplotlib.use("Agg")
-from matplotlib import pyplot as plt
 
 import caiman as cm
 from caiman.base.rois import register_multisession
@@ -65,7 +90,7 @@ def run_longitudinal_registration(
         [f for f in os.listdir(odor_folder) if os.path.isdir(os.path.join(odor_folder, f))]
     )
 
-    # Collect rotarod sessions
+    # Collect rotarod sessions files
     for date in date_folders_rotarod:
         caiman_folder = os.path.join(rotarod_folder, date, "caiman_results")
         template_folder = os.path.join(rotarod_folder, date, "temp")
@@ -76,14 +101,12 @@ def run_longitudinal_registration(
         if os.path.exists(caiman_folder):
             cnmfe_file = glob.glob(os.path.join(caiman_folder, "*_updated_cnmf.mat"))
         if os.path.exists(template_folder):
-            template_file = glob.glob(
-                os.path.join(template_folder, "*_0000_d1_300_d2_300_d3_1*.mmap")
-            )
+            template_file = glob.glob(os.path.join(template_folder, "*_0000_d1_300_d2_300_d3_1*.mmap"))
 
         cnmfe_results.extend(cnmfe_file)
         template_files.extend(template_file)
 
-    # Collect odor sessions
+    # Collect odor sessions files
     for date in date_folders_odor:
         caiman_folder = os.path.join(odor_folder, date, "caiman_results")
         template_folder = os.path.join(odor_folder, date, "temp")
@@ -94,9 +117,7 @@ def run_longitudinal_registration(
         if os.path.exists(caiman_folder):
             cnmfe_file = glob.glob(os.path.join(caiman_folder, "*updated_cnmf.mat"))
         if os.path.exists(template_folder):
-            template_file = glob.glob(
-                os.path.join(template_folder, "*_0000_d1_300_d2_300_d3_1*.mmap")
-            )
+            template_file = glob.glob(os.path.join(template_folder, "*_0000_d1_300_d2_300_d3_1*.mmap"))
 
         cnmfe_results.extend(cnmfe_file)
         template_files.extend(template_file)
@@ -104,6 +125,7 @@ def run_longitudinal_registration(
     print("n cnmfe files before cutoff:", len(cnmfe_results))
     print("n template files before cutoff:", len(template_files))
 
+# Apply cutoff early so downstream loading only touches the first N sessions.
     if max_sessions is not None:
         cnmfe_results = cnmfe_results[:max_sessions]
         template_files = template_files[:max_sessions]
@@ -176,6 +198,7 @@ def run_longitudinal_registration(
 
     sio.savemat(os.path.join(root_dir, "spatial_reshaped.mat"), mat_dict)
 
+    #Run multisession registration
     dims = templates[0].shape
 
     print("starting register_multisession")
@@ -188,6 +211,7 @@ def run_longitudinal_registration(
     )
     print("finished register_multisession")
 
+    # Keep only components that appear in at least n_reg sessions
     assignments_filtered = np.array(
         np.nan_to_num(assignments[np.sum(~np.isnan(assignments), axis=1) >= n_reg]),
         dtype=int,
