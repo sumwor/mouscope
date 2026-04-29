@@ -6,6 +6,13 @@ import glob
 from collections import defaultdict
 from datetime import datetime
 import re
+from utils_imaging import *
+from utils_beh import *
+import matplotlib
+matplotlib.use('QtAgg') 
+import matplotlib.pyplot as plt
+
+import imageio.v3 as iio
 
 import matlab.engine
 eng = matlab.engine.start_matlab()
@@ -20,16 +27,25 @@ class BehData:
         self.analysis = os.path.join(self.root_path, 'Analysis')
         self.summary = os.path.join(self.analysis, 'Summary')
         self.AnimalInfo = pd.read_csv(os.path.join(self.data, 'AnimalList.csv'))
-        self.Animals = self.AnimalInfo['AnimalID']
+        self.Animals = [str(x) for x in self.AnimalInfo['AnimalID']]
         self.Genotypes = self.AnimalInfo['Genotype']
-        self.ImageCell = self.AnimalInfo['Cells']
-        self.Hemisphere = self.AnimalInfo['hemisphere']
+        if 'Cells' in self.AnimalInfo.columns:
+            self.ImageCell = self.AnimalInfo['Cells']
+        else:
+            self.ImageCell = [None] * len(self.Animals)
+        if 'hemisphere' in self.AnimalInfo.columns:
+            self.Hemisphere = self.AnimalInfo['hemisphere']
+        else:   
+            self.Hemisphere = [None] * len(self.Animals)
 
 
 class BehDataOdor(BehData):
 
     def __init__(self, root_file):
         super().__init__(root_file)
+        self.bodyparts = ['nose', 'head', 'left ear', 'right ear', 'left hand', 'right hand',
+                          'spine 1', 'spine 2', 'spine 3', 'left foot', 'right foot', 'tail 1',
+                          'tail 2', 'tail 3']
         self.make_dataIndex()
         self.behavior = 'Odor'
 
@@ -71,15 +87,40 @@ class BehDataOdor(BehData):
                 protocol_day_counter[protocol] += 1
                 pDay = protocol_day_counter[protocol]
 
+                # check if imaging folder exist
+                behRecordFolder = os.path.join(self.data, a, 'Odor', 'Imaging', date)
+                if not os.path.exists(behRecordFolder):
+                    ifRec = False
+                    behRecordFolder = None
+                else:
+                    ifRec = True
+                    
+                    files = os.listdir(behRecordFolder)
+
+                    csv_files = [
+                        f for f in files
+                        if f.endswith(".csv") and "DLC_" not in f and 'AITimeStamp' not in f
+                    ]
+                    raw_videos = [f for f in files 
+                                  if f.endswith(".mp4") and "DLC_"  not in f]
+                    DLC_files = [f for f in files
+                                 if f.endswith(".csv") and 'DLC_' in f]
+                    DLC_file = os.path.join(behRecordFolder, DLC_files[0])
+                    behRecording = os.path.join(behRecordFolder, raw_videos[0])
+                    behTimeStampPath = os.path.join(behRecordFolder, csv_files[0])
+                    AIMatrixPath = glob.glob(os.path.join(behRecordFolder, '*_AITTL_*'))
+                    AITimeStampPath = glob.glob(os.path.join(behRecordFolder, '*_AITimeStamp_*.csv'))
+
                 extra_columns = {
                     'ROIFile': '',         # store as JSON
-                    'behRecording': '',                # list of .mp4 files
-                    'behTimeStamp': '',                # list of timestamps
-                    'AIMatrix': '',                    # list or array
-                    'AITimsStamp': '',                 # list or array
+                    'behRecording': behRecording if ifRec else None,   # list of .mp4 files
+                    'behTimeStamp': behTimeStampPath if ifRec else None,                # list of timestamps
+                    'AIMatrix': AIMatrixPath[0] if ifRec else None,                    # list or array
+                    'AITimsStamp': AITimeStampPath[0] if ifRec else None,                 # list or array
+                    'DLC': DLC_file if ifRec else None,
                     'ImgTimeStamp': '',                # list or array
                     'ifCalImg': False,                 # boolean
-                    'ifBehRecording': False,            # boolean
+                    'ifBehRecording': ifRec,            # boolean
                     'BehCSV': []
                 }
                 
@@ -131,6 +172,206 @@ class BehDataOdor(BehData):
             
             self.data_index.loc[bIdx, 'BehCSV'] = csvPath
 
+
+    def align_timeStamps(self):
+        # align timestamps between behavior log and recording
+        # similar from the align_timeStamps method in Imaging_pipeline
+        # but without calcium time stamp
+        # the AI timestamp tracks box 8-1 only - so when align sessions in box8-2
+        # sessions in 8-1 on the same day need to be aligned first
+        nFiles = self.data_index.shape[0]
+
+        if self.behavior == 'Odor':
+            for ii in range(nFiles):
+                # check if figure has been generated
+                savefigpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
+                    self.data_index['Date'][ii])
+                savefigname = os.path.join(savefigpath, 'TimeStamp_alignment.png')
+                if not os.path.exists(savefigname):
+                    # if not exist, do the alignment
+                    if not os.path.exists(savefigpath):
+                        os.makedirs(savefigpath)
+                    # first check AI matrix and TTL pulse # in case there are breaks within a session
+                    AI_channels = 2
+                    AI_freq = 1000  # 1000 Hz frequency
+
+
+                    #%% align AI matrix with TTL pulse
+
+                    if os.path.exists(self.data_index['AIMatrix'][ii]):
+                        # find the reference behavioral first (the one in box8-1)
+                        id_box1 = re.search(r'ASD(\d+)_1_', self.data_index['AIMatrix'][ii]).group(1)
+                        id_box2 = re.search(r'ASD(\d+)_2_', self.data_index['AIMatrix'][ii]).group(1)
+
+                        # find the right AI channel
+                        if id_box1 == self.data_index['Animal'][ii]:
+                            AI_channel = 0
+                        else:
+                            AI_channel = 1
+                        
+                        AI_matrix = np.fromfile(self.data_index['AIMatrix'][ii])
+                        AI_TimeStamp = pd.read_csv(
+                                self.data_index['AITimsStamp'][ii],
+                                header=None
+                            ).values.squeeze()  # unit in ms
+                        
+                        ## lunghao code for AI timestamp correction
+                        AI_TS_interp = AI_timeStamp_correction(AI_TimeStamp)
+
+                        # rearange AI_matrix to two channels (one is ground)
+                        AI_matrix = AI_matrix.reshape(-1, AI_channels)
+                        # look for rising edges of high voltage and get the time every 3 events
+                        is_high = AI_matrix[:,AI_channel] > 4
+                        edges = np.diff(is_high.astype(int))
+                        rising = np.where(edges == 1)[0] + 1
+                        falling = np.where(edges == -1)[0] + 1
+                        durations = (falling - rising) / AI_freq
+                        # exclude durations longer than 0.2 seconds (manual valve opening)
+                        valid_pulses = durations < 0.5
+                        n_valid_events = np.sum(valid_pulses)
+
+                        behDF = pd.read_csv(self.data_index['BehCSV'][ii])
+
+                        # look for left correct trials
+                        nLeftCorrect = np.sum(np.logical_and(behDF['schedule'] == 1, behDF['reward'] > 0))
+                        
+                        # make a plot, go over behDF, if a left choice reward = 3, count 3 high voltage event
+                        # if a left choice reward = 2, count 2 high voltage event
+
+                        # need to check if the first trial is reward size 2 in a rewardsize 3 trials
+                        nR2 = np.sum(behDF['reward']==2)
+                        nR3 = np.sum(behDF['reward']==3)
+                        nPulses = np.sum(behDF['reward'][np.logical_or(behDF['schedule']==1, behDF['schedule']==3)])
+
+                        if nR2 == 1 and nR3 > 1 and n_valid_events + 2 == nPulses: 
+                            # if the first 2 openings was not logged
+                            # some weird first trial bug (not sure what is the cause)
+                            behDF_tt = behDF.iloc[1:,:].reset_index(drop=True)
+                            # reset trial
+                            behDF_tt['trial'] = np.arange(behDF_tt.shape[0])+1
+                            behDF = behDF_tt
+                            
+                        nPulses = np.sum(behDF['reward'][np.logical_or(behDF['schedule']==1, behDF['schedule']==3)])
+
+                        if not nPulses == n_valid_events:
+                            print(f"Session file {self.data_index['Animal'][ii]}_{self.data_index['Date'][ii]}")
+                            print("Mismatching between AI pulses and left correct trials, check!!!")
+
+                        # if match, align behDF timestamp with AI timestamp
+                        # make a scatter plot to show time stamp of every left correct trial aligns with each other
+
+                        LC_Mask = np.logical_and(behDF['schedule'] == 1, behDF['reward'] > 0)
+                        trialNumber = np.arange(behDF.shape[0])
+                        LC_trialNum = trialNumber[LC_Mask]
+
+                        # 
+                        indices = (np.concatenate(([0], np.cumsum(behDF['reward'][LC_Mask][:-1])))).astype(int)
+                        matched = rising[indices]
+
+                        # correct for multiple clips of the same session
+                        nClips = np.sum(behDF['trial']==1)
+                        clip_start = np.where(behDF['trial']==1)[0]
+
+                        # if nClips > 1, correct the trial time for each clip based on AI timeStamp
+                        LectCorrect_trialIdx = np.where((behDF['schedule'] == 1) & (behDF['reward'] > 0))[0]
+                        behTimeList = ['outcome','center_in', 'center_out', 'side_in', 'last_side_out']
+                    
+                        if nClips > 1:
+                            t_offset_0 = AI_TS_interp[matched[0]]/1000 - behDF['side_in'][LC_trialNum[0]]
+                            for cc in range(nClips-1):
+                                # start from the second clip
+                                clip_s = clip_start[cc+1]
+                                if cc == nClips-2:
+                                    clip_e = behDF.shape[0]
+                                else:
+                                    clip_e = clip_start[cc+2]-1
+
+                                first_trial_Idx = np.where((LectCorrect_trialIdx > clip_s) & (LectCorrect_trialIdx < clip_e))[0][0]
+                                AI_time = AI_TS_interp[matched[first_trial_Idx]]/1000 - t_offset_0
+                                for key in behTimeList:
+                                    behDF.loc[clip_s:clip_e, key] += AI_time
+                                  
+                        t_offset = AI_TS_interp[matched]/1000 - behDF['outcome'][LC_trialNum]
+                        AI_TS_aligned = np.zeros_like(AI_TS_interp)
+                        # based on the offset, evenly distribute the AI_TS_interp between the trials
+                        for tt in range(len(behDF['outcome'][LC_trialNum])-1):
+                            t0 = behDF['outcome'][LC_trialNum[tt]]
+                            t1 = behDF['outcome'][LC_trialNum[tt+1]] 
+                            t0_AI = AI_TS_interp[matched[tt]]/1000
+                            t1_AI = AI_TS_interp[matched[tt+1]]/1000
+
+                            if tt==0:
+                                # align the time before the first left reward trial 
+                                AI_tobe_aligned = AI_TS_interp[AI_TS_interp/1000 < t0_AI]/1000
+                                AI_TS_aligned[AI_TS_interp/1000 < t0_AI] = AI_tobe_aligned - (t0_AI - t0)
+                            elif tt == len(behDF['outcome'][LC_trialNum])-2:
+                                # align the time after the last left reward trial
+                                AI_tobe_aligned = AI_TS_interp[AI_TS_interp/1000 >= t1_AI]/1000
+                                AI_TS_aligned[AI_TS_interp/1000 >= t1_AI] = AI_tobe_aligned - (t1_AI - t1)
+                            # then align the time between two left reward trials
+                            AI_tobe_aligned = AI_TS_interp[(AI_TS_interp/1000 >= t0_AI) & (AI_TS_interp/1000 < t1_AI)]
+                            timestamps_tobe_aligned = len(AI_tobe_aligned)
+                            
+                            AI_TS_aligned[(AI_TS_interp/1000 >= t0_AI) & (AI_TS_interp/1000 < t1_AI)] = np.linspace(t0, t1, timestamps_tobe_aligned, endpoint=False)
+
+                    #%% based on the alignment betweeen AI_TS_interp and AI_TS_aligned, align behTimeStamp and ImgTimeStamp
+                    # load behavior recording timestamp if exists
+                    # check if it is aligned
+                    old_path = self.data_index['behTimeStamp'][ii]
+                    folder, old_file = os.path.split(old_path)
+                    new_file = os.path.join(folder, old_file[:-4] + "_aligned.csv")
+                    if not os.path.exists(new_file):
+                        behTimeStamp = pd.read_csv(self.data_index['behTimeStamp'][ii], header=None)
+                        header = ['TimeStamp']
+                        behTimeStamp.columns = header
+                        # for each timestamp in behTimeStamp, find the closest timestamp in AI_TS_interp, 
+                        # then replace it with the corresponding timestamp in AI_TS_aligned
+                        
+                        x = behTimeStamp['TimeStamp'].values
+
+                        idx = np.searchsorted(AI_TS_interp, x)
+
+                        # clip to valid range
+                        idx = np.clip(idx, 1, len(AI_TS_interp) - 1)
+
+                        # choose closer neighbor
+                        left = AI_TS_interp[idx - 1]
+                        right = AI_TS_interp[idx]
+
+                        idx -= (x - left) < (right - x)
+
+                        behTimeStamp['AlignedTimeStamp'] = AI_TS_aligned[idx]
+
+                        self.data_index.loc[ii,'behTimeStamp_aligned'] = new_file
+                        behTimeStamp.to_csv(new_file, index=False)
+     
+
+                # make plots for alignment checking
+                # subplot 1: mismatch between AI_TS_interp and behTimeStamp, plus AI_TS_aligned
+                    plt.figure(figsize=(8,8))
+                    plt.subplot(2,2,1)
+                    x=behDF['outcome'][LC_Mask] - behDF['outcome'][LC_trialNum[0]]
+                    y=AI_TS_interp[matched]/1000-AI_TS_interp[matched[0]]/1000-x
+                    y_corrected = AI_TS_aligned[matched]-x- AI_TS_aligned[matched[0]]
+                    plt.plot(y)
+                    plt.plot(y_corrected)
+                    plt.title('Mismatch between Anolog Input and behavior')
+                    plt.xlabel('Trials')
+                    plt.ylabel('Time (s)')
+                    plt.legend(['Before correction', 'After correction'])
+
+                    plt.savefig(savefigname)
+                    plt.close()
+                    
+                else:
+                    # if already aligned, reset the timestamp files
+                    # behavior
+                    old_path = self.data_index['behTimeStamp'][ii]
+                    folder, old_file = os.path.split(old_path)
+                    new_file = os.path.join(folder, old_file[:-4] + "_aligned.csv")
+                    self.data_index.loc[ii,'behTimeStamp_aligned'] = new_file 
+
+
     def session_behavior(self):
         """ it is probably way easier to do it just in Matlab"""
         # plot behavior of each individual session
@@ -145,10 +386,6 @@ class BehDataOdor(BehData):
 
     def odor_summary(self):
         pass
-    
-    def align_with_calcium(self, calcium_timestamps):
-        # Align behavior timestamps with calcium imaging timestamps
-        pass
 
     def performance(self):
         # call matlab function to plot the performance
@@ -157,6 +394,57 @@ class BehDataOdor(BehData):
     def model_fit(self):
         # call matlab function to fit the computational model
         pass
+
+    def DLC_analysis(self):
+        # analyze DLC result per session
+        # speed, position, head direction, average trajectory aligned to center_in
+
+        # load DLC result, make some plot
+        nFiles = self.data_index.shape[0]
+
+        if self.behavior == 'Odor':
+            for ii in range(nFiles):
+                # check if figure has been generated
+                savefigpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
+                    self.data_index['Date'][ii])
+                DLCPath = self.data_index['DLC'][ii]
+                DLCdata = load_DLC(DLCPath)
+
+                x_smooth = moving_average(DLCdata['head']['x'], window=10)
+                y_smooth = moving_average(DLCdata['head']['y'], window=10)
+
+                # video timestamp
+                videoTS = pd.read_csv(self.data_index['behTimeStamp_aligned'][ii], header=0)
+                header = ['TimeStamp', 'AlignedTimeStamp']
+                videoTS.columns = header
+
+                behDF = pd.read_csv(self.data_index['BehCSV'][ii])
+
+                # plot head position near the center_in time
+                nTrials = behDF.shape[0]
+                center_head_x = []
+                center_head_y = []
+                for tt in range(nTrials):
+                    center_in = behDF['center_in'][tt]
+                    center_out = behDF['center_out'][tt]
+                    timeMask = np.logical_and(videoTS['AlignedTimeStamp']<center_out, 
+                                              videoTS['AlignedTimeStamp']>center_in)
+                    center_head_x.append(np.array(DLCdata['head']['x'])[timeMask])
+                    center_head_y.append(np.array(DLCdata['head']['y'])[timeMask])
+
+                center_x = np.concatenate(center_head_x)
+                center_y = np.concatenate(center_head_y)
+
+                videopath = r'Y:\HongliWang\Juvi_ASD Deterministic\TSC2_withRec\Data\578\Odor\Imaging\20251216\ASD578__2025-12-16T11_56_01.mp4'
+                ts = videoTS['AlignedTimeStamp'].to_numpy()
+                target = behDF['center_in'][0]
+
+                idx = np.argmin(np.abs(ts - target))
+                frame = iio.imread(videopath, index=idx)
+
+                # frame is a numpy array (H x W x 3)
+                print(frame.shape)
+
 
 class BehDataRotarod(BehData):
 
@@ -276,7 +564,10 @@ if __name__ == "__main__":
     # # read the data and save them to csv files
     Odor.load_data()
 
-    Odor.session_behavior()
+    #Odor.session_behavior()
+
+    #%% for behavior recordings
+    # run it separately, if calcium imaging exist, then run the align_timeStamps in Imaging_pipeline
 
 
     #%% test code for rotarod behavior
