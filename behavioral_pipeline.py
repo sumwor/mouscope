@@ -250,6 +250,8 @@ class BehDataOdor(BehData):
                             # reset trial
                             behDF_tt['trial'] = np.arange(behDF_tt.shape[0])+1
                             behDF = behDF_tt
+                            # save the new behDF
+                            behDF.to_csv(self.data_index['BehCSV'][ii])
                             
                         nPulses = np.sum(behDF['reward'][np.logical_or(behDF['schedule']==1, behDF['schedule']==3)])
 
@@ -399,6 +401,9 @@ class BehDataOdor(BehData):
         # analyze DLC result per session
         # speed, position, head direction, average trajectory aligned to center_in
 
+        # plot the trajectory around center_in and side_in
+        # plot the speed around center_in and side_in
+
         # load DLC result, make some plot
         nFiles = self.data_index.shape[0]
 
@@ -410,20 +415,61 @@ class BehDataOdor(BehData):
                 DLCPath = self.data_index['DLC'][ii]
                 DLCdata = load_DLC(DLCPath)
 
-                x_smooth = moving_average(DLCdata['head']['x'], window=10)
-                y_smooth = moving_average(DLCdata['head']['y'], window=10)
+                behDF = pd.read_csv(self.data_index['BehCSV'][ii])
+
+                # align body parts to center_in and side_in\
+                # smooth it to remove jumping parts
+                nTrials = behDF.shape[0]
+                bodyparts = DLCdata['bodyparts']
+                aligned_keypoints = {}
+                startTime = -1.99
+                endTime = 4.99
+                aligned_t = np.arange(startTime, endTime,0.02)
 
                 # video timestamp
                 videoTS = pd.read_csv(self.data_index['behTimeStamp_aligned'][ii], header=0)
                 header = ['TimeStamp', 'AlignedTimeStamp']
                 videoTS.columns = header
 
-                behDF = pd.read_csv(self.data_index['BehCSV'][ii])
+                align_events = ['center_in', 'side_in']
+                for event in align_events:
+                    aligned_keypoints[event] = {}
+                    for bp in bodyparts:
+                        aligned_keypoints[event][bp] = {}
+                        aligned_keypoints[bp]['x'] = np.full(len(aligned_t, nTrials), np.nan)
+                        aligned_keypoints[bp]['y'] = np.full(len(aligned_t, nTrials), np.nan)
+                        smoothed_x = moving_average(DLCdata[bp]['x'], window=10)
+                        smoothed_y = moving_average(DLCdata[bp]['y'], window=10)
+                        for tt in range(nTrials):
+                            
+                        # look for the time, interpolate it
+                            t_middle = behDF[event][tt]
+
+                            t_start = t_middle - startTime
+                            t_end = t_middle + endTime
+                            timeMask = np.logical_and(videoTS['AlignedTimeStamp']<t_end, 
+                                                videoTS['AlignedTimeStamp']>t_start)
+                            center_kp_x = smoothed_x[timeMask]
+                            center_kp_y = smoothed_y[timeMask]
+                            sig_t = videoTS['AlignedTimeStamp'][timeMask]
+
+                            aligned_keypoints[event][bp]['x'] = np.interp(aligned_t, sig_t, center_kp_x)
+                            aligned_keypoints[event][bp]['y'] = np.interp(aligned_t, sig_t, center_kp_y)
+
+
+                
+
+
+                x_smooth = moving_average(DLCdata['head']['x'], window=10)
+                y_smooth = moving_average(DLCdata['head']['y'], window=10)
 
                 # plot head position near the center_in time
                 nTrials = behDF.shape[0]
                 center_head_x = []
                 center_head_y = []
+
+                center_head_x_smoothed = []
+                center_head_y_smoothed = []
                 for tt in range(nTrials):
                     center_in = behDF['center_in'][tt]
                     center_out = behDF['center_out'][tt]
@@ -431,9 +477,15 @@ class BehDataOdor(BehData):
                                               videoTS['AlignedTimeStamp']>center_in)
                     center_head_x.append(np.array(DLCdata['head']['x'])[timeMask])
                     center_head_y.append(np.array(DLCdata['head']['y'])[timeMask])
+                    center_head_x_smoothed.append(x_smooth[timeMask])
+                    center_head_y_smoothed.append(y_smooth[timeMask])
+
 
                 center_x = np.concatenate(center_head_x)
                 center_y = np.concatenate(center_head_y)
+                center_x_smoothed = np.concatenate(center_head_x_smoothed)
+                center_y_smoothed = np.concatenate(center_head_y_smoothed)
+
 
                 videopath = r'Y:\HongliWang\Juvi_ASD Deterministic\TSC2_withRec\Data\578\Odor\Imaging\20251216\ASD578__2025-12-16T11_56_01.mp4'
                 ts = videoTS['AlignedTimeStamp'].to_numpy()

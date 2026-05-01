@@ -5,6 +5,7 @@ import numpy as np
 # Deeplabcut related, and MotionSequence related functions
 
 def load_DLC(filepath):
+
     # load DLC results
     data = {}
     nFrames = 0
@@ -55,3 +56,7 @@ def load_DLC(filepath):
             print(f'Processed {line_count} lines.')
     
     return data
+
+
+def moving_average(x, window=5):
+    return np.convolve(x, np.ones(window)/window, mode='same')
