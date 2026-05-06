@@ -423,7 +423,7 @@ class BehDataOdor(BehData):
                 bodyparts = DLCdata['bodyparts']
                 aligned_keypoints = {}
                 startTime = -1.99
-                endTime = 4.99
+                endTime = 1.99
                 aligned_t = np.arange(startTime, endTime,0.02)
 
                 # video timestamp
@@ -436,30 +436,90 @@ class BehDataOdor(BehData):
                     aligned_keypoints[event] = {}
                     for bp in bodyparts:
                         aligned_keypoints[event][bp] = {}
-                        aligned_keypoints[bp]['x'] = np.full(len(aligned_t, nTrials), np.nan)
-                        aligned_keypoints[bp]['y'] = np.full(len(aligned_t, nTrials), np.nan)
+                        aligned_keypoints[event][bp]['x'] = np.full((len(aligned_t), nTrials), np.nan)
+                        aligned_keypoints[event][bp]['y'] = np.full((len(aligned_t), nTrials), np.nan)
                         smoothed_x = moving_average(DLCdata[bp]['x'], window=10)
                         smoothed_y = moving_average(DLCdata[bp]['y'], window=10)
                         for tt in range(nTrials):
                             
                         # look for the time, interpolate it
                             t_middle = behDF[event][tt]
+                            if not np.isnan(t_middle): # could be nan for missed trials in side_in   
+                                t_start = t_middle + startTime
+                                t_end = t_middle + endTime
+                                timeMask = np.logical_and(videoTS['AlignedTimeStamp']<t_end, 
+                                                    videoTS['AlignedTimeStamp']>t_start)
+                                center_kp_x = smoothed_x[timeMask]
+                                center_kp_y = smoothed_y[timeMask]
+                                sig_t = videoTS['AlignedTimeStamp'][timeMask]-t_middle
 
-                            t_start = t_middle - startTime
-                            t_end = t_middle + endTime
-                            timeMask = np.logical_and(videoTS['AlignedTimeStamp']<t_end, 
-                                                videoTS['AlignedTimeStamp']>t_start)
-                            center_kp_x = smoothed_x[timeMask]
-                            center_kp_y = smoothed_y[timeMask]
-                            sig_t = videoTS['AlignedTimeStamp'][timeMask]
+                                aligned_keypoints[event][bp]['x'][:,tt] = np.interp(aligned_t, sig_t, center_kp_x)
+                                aligned_keypoints[event][bp]['y'][:,tt] = np.interp(aligned_t, sig_t, center_kp_y)
 
-                            aligned_keypoints[event][bp]['x'] = np.interp(aligned_t, sig_t, center_kp_x)
-                            aligned_keypoints[event][bp]['y'] = np.interp(aligned_t, sig_t, center_kp_y)
+                choice = np.array(behDF['actions'])
+                prev_choice = np.concatenate([[np.nan], choice[0:-1]])
+                plt.figure()
+                plt.imshow(frame)
+                left_choice_trials = choice==0
+                left_choice_prev = prev_choice==0
+                right_choice_prev = prev_choice==1
+                right_choice_trials = choice == 1
+                X= aligned_keypoints['center_in']['head']['x'][:,(left_choice_trials & left_choice_prev)]
+                Y= aligned_keypoints['center_in']['head']['y'][:,(left_choice_trials & left_choice_prev)]
+                # --- plot single trials ---
+                # for tt in range(nTrials):
+                #     plt.plot(X[:, tt], Y[:, tt],
+                #             color='gray', linewidth=1, alpha=0.5)
 
+                # --- compute average trajectory ---
+                x_mean = np.nanmean(X, axis=1)
+                y_mean = np.nanmean(Y, axis=1)
+                x_std = np.nanstd(X, axis=1)
+                y_std = np.nanstd(Y, axis=1)
+
+                # --- plot average ---
+                plt.plot(x_mean, y_mean,
+                        color='red', linewidth=3, label='mean')
+                for k in range(-1, 2):
+                    plt.plot(x_mean + k * x_std,
+                            y_mean + k * y_std,
+                            color='red',
+                            alpha=0.2)
+                # plot right-left trials
+                X= aligned_keypoints['center_in']['head']['x'][:,(left_choice_trials & right_choice_prev)]
+                Y= aligned_keypoints['center_in']['head']['y'][:,(left_choice_trials & right_choice_prev)]
+
+                x_mean = np.nanmean(X, axis=1)
+                y_mean = np.nanmean(Y, axis=1)
+
+                # --- plot average ---
+                plt.plot(x_mean, y_mean,
+                        color='blue', linewidth=3, label='mean')
+
+                plt.plot(np.nanmean(aligned_keypoints['center_in']['head']['x'][:,(right_choice_trials & left_choice_prev)], axis=1), 
+                         np.nanmean(aligned_keypoints['center_in']['head']['y'][:,(right_choice_trials & left_choice_prev)], axis=1),
+                        color='yellow', linewidth=3, label='mean')
+                
+                plt.plot(np.nanmean(aligned_keypoints['center_in']['head']['x'][:,(right_choice_trials & right_choice_prev)], axis=1), 
+                         np.nanmean(aligned_keypoints['center_in']['head']['y'][:,(right_choice_trials & right_choice_prev)], axis=1),
+                        color='green', linewidth=3, label='mean')
+                
+                plt.xlabel('X')
+                plt.ylabel('Y')
+                plt.title('Trajectory (single trials + mean)')
+                plt.axis('equal')
+                plt.legend()
+
+                plt.show()
 
                 
+                plt.figure()
+                plt.imshow(frame)
+                sc = plt.scatter(aligned_keypoints['center_in']['head']['x'][:,0], aligned_keypoints['center_in']['head']['y'][:,0],
+                                  c=aligned_t, cmap='viridis', s=10)
 
-
+                plt.colorbar(sc, label='Time (s)')
+                plt.scatter(aligned_keypoints['center_in']['head']['x'][100,0], aligned_keypoints['center_in']['head']['y'][100,0], s=40)
                 x_smooth = moving_average(DLCdata['head']['x'], window=10)
                 y_smooth = moving_average(DLCdata['head']['y'], window=10)
 
@@ -492,7 +552,27 @@ class BehDataOdor(BehData):
                 target = behDF['center_in'][0]
 
                 idx = np.argmin(np.abs(ts - target))
-                frame = iio.imread(videopath, index=idx)
+                frame = iio.imread(videoPath, index=339000)
+                tsFile = r'Y:\HongliWang\Juvi_ASD Deterministic\TSC2_withRec\599\Odor\Imaging\20260202\ASD599__2026-02-02T13_22_50.csv'
+                ts = pd.read_csv(tsFile)
+                header = ['TimeStamp']
+                ts.columns = header
+                
+                import subprocess
+
+                def trim_by_time(input_file, output_file, start_sec, end_sec):
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-ss", str(start_sec),
+                        "-to", str(end_sec),
+                        "-i", input_file,
+                        "-c:v", "libx264",   # re-encode for accuracy (important for VFR)
+                        "-c:a", "aac"
+                    ]
+                    subprocess.run(cmd, check=True)
+                output = r'Y:\HongliWang\Juvi_ASD Deterministic\TSC2_withRec\599\Odor\Imaging\20260202\ASD599__2026-02-02T13_22_50_trimmed.mp4'
+                trim_by_time(videoPath, output, 0, 11832.6)
 
                 # frame is a numpy array (H x W x 3)
                 print(frame.shape)
