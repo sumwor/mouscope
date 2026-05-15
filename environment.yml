@@ -120,6 +120,7 @@ dependencies:
   - python-dateutil=2.9.0.post0=pyhe01879c_2
   - python-tzdata=2025.3=pyhd8ed1ab_0
   - python_abi=3.11=2_cp311
+  - pygam
   - qhull=2020.2=hc790b64_5
   - qt6-main=6.8.3=h72a539a_1
   - rav1e=0.6.6=h975169c_2
