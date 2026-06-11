@@ -6,6 +6,8 @@ from pygam import LinearGAM, s, f
 from scipy.stats import chi2
 import os
 import shutil
+import imageio
+from skimage import color
 
 import matplotlib
 matplotlib.use('QtAgg') 
@@ -14,6 +16,7 @@ import matplotlib.pyplot as plt
 plt.ion()
 import matplotlib.pyplot as plt
 # Deeplabcut related, and MotionSequence related functions
+from scipy.signal import butter, filtfilt
 
 def load_DLC(filepath):
 
@@ -954,26 +957,27 @@ def plot_learning_curve(
 
         if show_raw:
             raw = clean_df[clean_df['genotype'] == genotype]
-            raw_x = raw['trial'].map(trial_codes).astype(float).to_numpy()
-            jitter = (
-                genotype_order.index(genotype) -
-                (len(genotype_order) - 1) / 2
-            ) * 0.08
-            ax.scatter(
-                raw_x + jitter,
-                raw['performance'],
-                s=18,
-                alpha=0.35,
-                color=color,
-                edgecolors='none'
-            )
+            for subject, subject_df in raw.groupby('subject', observed=True):
+                subject_x = subject_df['trial'].map(trial_codes).astype(float).to_numpy()
+                subject_y = subject_df['performance'].to_numpy(dtype=float)
+                if subject_x.size == 0:
+                    continue
+                sort_idx = np.argsort(subject_x)
+                ax.plot(
+                    subject_x[sort_idx],
+                    subject_y[sort_idx],
+                    color=color,
+                    linestyle='--',
+                    linewidth=0.5,
+                    alpha=0.35
+                )
 
     if not stats_df.empty and 'p_value' in stats_df.columns:
         p_values = stats_df.set_index('term')['p_value']
         stats_text = (
-            f"GAM p genotype = {p_values.get('genotype', np.nan):.3g}\n"
-            f"GAM p learning = {p_values.get('learning', np.nan):.3g}\n"
-            f"GAM p interaction = {p_values.get('genotype:learning', np.nan):.3g}"
+            f"FDA p genotype = {p_values.get('genotype', np.nan):.3g}\n"
+            f"FDA p learning = {p_values.get('learning', np.nan):.3g}\n"
+            f"FDA p interaction = {p_values.get('genotype:learning', np.nan):.3g}"
         )
         ax.text(
             0.02, 0.98, stats_text,
@@ -1000,6 +1004,55 @@ def plot_learning_curve(
 
     #return fig, ax, stats_df, clean_df
 
+def read_video(videoPath, frame, ifgray):
+    # ifgray: if convert the image to grayscale
+    vid = imageio.get_reader(videoPath)
+
+        #for ii in tqdm(range(self.nFrames)):
+    if ifgray:
+        image = color.rgb2gray(vid.get_data(frame))
+    else:
+        image = vid.get_data(frame)
+        #   [xdim, ydim] = image.shape
+        #    if ii == 0:
+        #        # get video dimensions
+                #imageStack = np.zeros((xdim, ydim, self.nFrames))
+        #        imageStack = []
+        #    imageStack.append(image)
+    return image
+
+def distance_points_to_line(x_coords, y_coords, line_point1, line_point2):
+    """
+    Calculate the perpendicular distances from multiple points to a line defined by two points.
+
+    Parameters:
+    x_coords (array-like): Array of x-coordinates for the points.
+    y_coords (array-like): Array of y-coordinates for the points.
+    line_point1 (tuple): The first point on the line (x1, y1).
+    line_point2 (tuple): The second point on the line (x2, y2).
+
+    Returns:
+    np.ndarray: An array of distances from each point to the line.
+    """
+    x0 = np.array(x_coords)
+    y0 = np.array(y_coords)
+    x1, y1 = line_point1
+    x2, y2 = line_point2
+
+    # Calculate the components of the distance formula
+    numerator = (y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1
+    denominator = np.sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2)
+
+    # Distance from each point to the line
+    distances = numerator / denominator
+    return distances
+
+def butter_lowpass_filter(data, cutoff_freq, fs, order=5):
+    nyquist_freq = 0.5 * fs
+    normal_cutoff = cutoff_freq / nyquist_freq
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    y = filtfilt(b, a, data)
+    return y
 
 #%%
 if __name__ == '__main__':

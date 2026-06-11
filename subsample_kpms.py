@@ -15,7 +15,7 @@ video_files = glob.glob(os.path.join(video_dir, '*.mp4'))
 dlc_files = glob.glob(os.path.join(video_dir, '*.csv'))
 video_by_stem = {os.path.splitext(os.path.basename(v))[0]: v for v in video_files}
 
-kpms_dir = os.path.join(root_dir, 'video_kpms')
+kpms_dir = os.path.join(root_dir, 'video_kpms_anlysis')
 if not os.path.exists(kpms_dir):
     os.makedirs(kpms_dir)
 
@@ -106,9 +106,10 @@ for dlc in tqdm(dlc_files):
 
     video_stem = os.path.splitext(os.path.basename(video))[0]
 
-    for label, start_pct, end_pct in [('05-15', 0.05, 0.15),
-                                      ('50-60', 0.50, 0.60),
-                                      ('85-95', 0.85, 0.95)]:
+    for label, start_pct, end_pct in [('0-25', 0.05, 0.25),
+                                      ('25-50', 0.25, 0.50),
+                                      ('50-75', 0.5, 0.75),
+                                      ('75-100', 0.75, 1)]:
         start_frame = int(nFrames * start_pct)
         end_frame = int(nFrames * end_pct)
 

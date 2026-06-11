@@ -11,9 +11,18 @@ from utils_beh import *
 import matplotlib
 matplotlib.use('QtAgg') 
 import matplotlib.pyplot as plt
-
+from matplotlib.collections import LineCollection
+import pickle
+import copy
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+from matplotlib.patches import Patch
 import imageio.v3 as iio
-
+import ruptures as rpt
+import statsmodels.stats.api as smf
+from scipy.signal import spectrogram,hilbert,correlate, find_peaks
+from scipy.stats import pearsonr
+from scipy.optimize import minimize
 import matlab.engine
 eng = matlab.engine.start_matlab()
 
@@ -23,14 +32,19 @@ eng = matlab.engine.start_matlab()
 
 class BehData:
 
-    def __init__(self, root_path):
+    def __init__(self, root_path, strain):
         self.root_path = root_path
+        self.strain = strain
         self.data = os.path.join(self.root_path, 'Data')
         self.analysis = os.path.join(self.root_path, 'Analysis')
         self.summary = os.path.join(self.root_path, 'Summary')
         self.AnimalInfo = pd.read_csv(os.path.join(self.data, 'AnimalList.csv'))
         self.Animals = [str(x) for x in self.AnimalInfo['AnimalID']]
         self.Genotypes = self.AnimalInfo['Genotype']
+        if 'Gender' in self.AnimalInfo.columns:
+            self.gender = self.AnimalInfo['Gender']
+        else:
+            self.gender = ['M']*len(self.Animals)
         if 'Cells' in self.AnimalInfo.columns:
             self.ImageCell = self.AnimalInfo['Cells']
         else:
@@ -43,8 +57,8 @@ class BehData:
 
 class BehDataOdor(BehData):
 
-    def __init__(self, root_file):
-        super().__init__(root_file)
+    def __init__(self, root_file, strain):
+        super().__init__(root_file, strain)
         self.bodyparts = ['nose', 'head', 'left ear', 'right ear', 'left hand', 'right hand',
                           'spine 1', 'spine 2', 'spine 3', 'left foot', 'right foot', 'tail 1',
                           'tail 2', 'tail 3']
@@ -132,6 +146,7 @@ class BehDataOdor(BehData):
                 row_dict = {
                     'Animal': a,
                     'Genotype': self.Genotypes[aIdx],
+                    'Gender': self.gender[aIdx],
                     'Date': date,
                     'Protocol': protocol,
                     'ProtocolDay': pDay,
@@ -390,14 +405,136 @@ class BehDataOdor(BehData):
             
             eng.ASD_session(resultdf_path,self.data_index['Protocol'][ss],self.data_index['Animal'][ss], 
                             self.data_index['Date'][ss],self.data_index['AnalysisPath'][ss],nargout=0)
+    def session_analysis(self):
+        # session-wise anlaysis
+        # plot single session performance
+        # model fitting
+        # use the policy-gradient model for learnind window estimation (take the derivative)
+        
+        pass
 
     def odor_summary(self):
         pass
+    
+    def find_eureka(self):
+        """Fit a two-parameter logistic learning curve to session reward outcomes."""
+        if self.data_index.shape[0] == 0:
+            raise ValueError('No sessions available in data_index.')
+
+        resultdf = pd.read_csv(self.data_index['BehCSV'][0]) 
+        t = pd.Series(np.arange(len(resultdf), dtype=float) + 1) 
+        # set missing values to 0, 3 or 2 to 1 
+        y = resultdf['reward'].fillna(0) 
+        y = y.replace([2, 3], 1) 
+        t_vals = t.to_numpy(dtype=float) 
+        y_vals = y.to_numpy(dtype=float) 
+
+        def logistic_prob(params, x):
+            p_low, p_delta, k, tau = params
+            return p_low + p_delta/(1+np.exp(-k*(x-tau)))
+        
+        def neg_log_likelihood(params): 
+            
+            p = logistic_prob(params, t_vals) 
+            p = np.clip(p, 1e-8, 1.0 - 1e-8) 
+            return -np.sum(y_vals * np.log(p) + (1.0 - y_vals) * np.log(1.0 - p)) 
+        
+        initial = [0.5, 0.5, 0.1, np.median(t_vals)] 
+        bounds = [
+            (0.4,0.6),     # p_low
+            (0.5,1.0),     # p_high
+            (1e-6,None),   # k
+            (1,len(t_vals))
+        ]
+        result = minimize( 
+            neg_log_likelihood, 
+            x0=initial, 
+            bounds=bounds, 
+            method='L-BFGS-B' ) 
+        
+        if not result.success: 
+            raise RuntimeError(f'Logistic fit failed: {result.message}') 
+        k_fit, tau_fit = result.x 
+        fitted = logistic_prob(result.x, t_vals) 
+
+        output = { 'k': float(k_fit), 
+                  'tau': float(tau_fit), 
+                  'trial': t_vals, 
+                  'outcome': y_vals, 
+                  'fitted_probability': fitted, 
+                  'nll': float(result.fun), }
+
+        tt = np.arange(1, len(t_vals)+1)
+
+        p_right = model_prob(
+            result.x,
+            tt,
+            np.zeros_like(tt)
+        )
+
+        p_left = model_prob(
+            result.x,
+            tt,
+            np.ones_like(tt)
+        )
+
+        plt.figure()
+
+        plt.plot(tt, p_right, label='Right')
+        plt.plot(tt, p_left, label='Left')
+
+        plt.xlabel('Trial')
+        plt.ylabel('P(correct)')
+        plt.legend()
+
+        window_size = 60
+        trial = np.arange(1, len(resultdf)+1)
+        reward = resultdf['reward'].fillna(0)
+        reward = reward.replace([2, 3], 1)
+        choice = resultdf['actions']
+        schedule = resultdf['schedule'].values
+        # bin edges
+
+        left_rate = []
+        right_rate = []
+        bin_center = []
+        window_centers = np.arange(window_size//2, len(resultdf) - window_size//2)
+        for tt in window_centers:
+
+            start = tt - window_size//2
+            end = tt + window_size//2
+
+            idx = (trial >= start) & (trial < end)
+
+            left_idx = idx & (schedule == 1)
+            right_idx = idx & (schedule== 2)
+
+            if left_idx.sum() > 0:
+                left_rate.append(reward[left_idx].mean())
+            else:
+                left_rate.append(np.nan)
+
+            if right_idx.sum() > 0:
+                right_rate.append(reward[right_idx].mean())
+            else:
+                right_rate.append(np.nan)
+
+
+
+        plt.figure(figsize=(8,4))
+        plt.plot(window_centers, left_rate, 'o-', label='Left')
+        plt.plot(window_centers, right_rate, '-', label='Right')
+
+        plt.xlabel('Trial')
+        plt.ylabel('Reward rate')
+        plt.ylim(0,1)
+        plt.legend()
+        plt.show()
 
     def plot_performance(self):
         # call matlab function to plot the performance
 
-        perf_df = pd.DataFrame(columns=['Animal', 'Genotype', 'Date', 'Protocol', 'ProtocolDay', 'RewardRate', 'd'])
+        perf_df = pd.DataFrame(columns=['Animal','Gender', 'Genotype', 'Date', 'Protocol', 'ProtocolDay', 'RewardRate', 'd'])
         for bIdx, behFiles in enumerate(self.data_index['BehCSV']):
             # load the files, calculate performance in 100-trial blocks
             resultdf = pd.read_csv(behFiles)
@@ -408,6 +545,7 @@ class BehDataOdor(BehData):
             perf_df.loc[bIdx, 'ProtocolDay'] = self.data_index['ProtocolDay'][bIdx]
             perf_df.loc[bIdx, 'RewardRate'] = np.full((25,1), np.nan)
             perf_df.loc[bIdx, 'd'] = np.full((25,1), np.nan)
+            perf_df.loc[bIdx, 'Gender'] = self.data_index['Gender'][bIdx]
 
             nTrials = resultdf.shape[0]
             tBlocks = 100
@@ -459,47 +597,59 @@ class BehDataOdor(BehData):
         # plot average performance for AB1, AB2, AB3
         # CD1, CD2, and CD3. and run stats
         # rebuild performance dataframe for plotting
-        perf_plot_AB1 = pd.DataFrame(columns=['Animal', 'Genotype', 'Block', 'RewardRate', 'd'])
-        perf_plot_AB2 = pd.DataFrame(columns=['Animal', 'Genotype', 'Block', 'RewardRate', 'd'])
-        perf_plot_AB3 = pd.DataFrame(columns=['Animal', 'Genotype', 'Block', 'RewardRate', 'd'])
-        perf_plot_CD1 = pd.DataFrame(columns=['Animal', 'Genotype', 'Block', 'RewardRate', 'd'])
-        perf_plot_CD2 = pd.DataFrame(columns=['Animal', 'Genotype', 'Block', 'RewardRate', 'd'])
-        perf_plot_CD3 = pd.DataFrame(columns=['Animal', 'Genotype', 'Block', 'RewardRate', 'd'])
+        #%% determine sex
+        Sexes = perf_df['Gender'].unique()
+
+        perf_plot_AB1 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_AB2 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_AB3 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_CD1 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_CD2 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_CD3 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
         for idx, row in perf_df.iterrows():
             for bb in range(10):
                 if not np.isnan(row['RewardRate'][bb]):
                     if row['Protocol'] == 'AB':
                         if row['ProtocolDay'] == 1:   
-                            perf_plot_AB1 = pd.concat([perf_plot_AB1, pd.DataFrame([{'Animal': row['Animal'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            perf_plot_AB1 = pd.concat([perf_plot_AB1, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
                         elif row['ProtocolDay'] == 2:
-                            perf_plot_AB2 = pd.concat([perf_plot_AB2, pd.DataFrame([{'Animal': row['Animal'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            perf_plot_AB2 = pd.concat([perf_plot_AB2, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
                         elif row['ProtocolDay'] == 3:
-                            perf_plot_AB3 = pd.concat([perf_plot_AB3, pd.DataFrame([{'Animal': row['Animal'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            perf_plot_AB3 = pd.concat([perf_plot_AB3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
                     elif row['Protocol'] == 'AB-CD':
                         if row['ProtocolDay'] == 1:   
-                            perf_plot_CD1 = pd.concat([perf_plot_CD1, pd.DataFrame([{'Animal': row['Animal'], 'Genotype': row['Genotype'], 'Block': bb-12, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            perf_plot_CD1 = pd.concat([perf_plot_CD1, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
                         elif row['ProtocolDay'] == 2:
-                            perf_plot_CD2 = pd.concat([perf_plot_CD2, pd.DataFrame([{'Animal': row['Animal'], 'Genotype': row['Genotype'], 'Block': bb-12, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            perf_plot_CD2 = pd.concat([perf_plot_CD2, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
                         elif row['ProtocolDay'] == 3:
-                            perf_plot_CD3 = pd.concat([perf_plot_CD3, pd.DataFrame([{'Animal': row['Animal'], 'Genotype': row['Genotype'], 'Block': bb-12, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
-        plot_learning_curve(perf_plot_AB1, save_name = 'AB1_rewardrate', 
-                            value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary)
-        plot_learning_curve(perf_plot_AB2, save_name = 'AB2_rewardrate', 
-                    value_col = 'RewardRate', trial_col = 'Block')
-        plot_learning_curve(perf_plot_AB3, save_name = 'AB3_rewardrate',
-                    value_col = 'RewardRate', trial_col = 'Block')
-        plot_learning_curve(perf_plot_CD1, save_name = 'CD1_rewardrate',
-                    value_col = 'RewardRate', trial_col = 'Block')
-        plot_learning_curve(perf_plot_CD2, save_name = 'CD2_rewardrate',
-                    value_col = 'RewardRate', trial_col = 'Block')
-        plot_learning_curve(perf_plot_CD3, save_name = 'CD3_rewardrate',
-                    value_col = 'RewardRate', trial_col = 'Block')
-        
+                            perf_plot_CD3 = pd.concat([perf_plot_CD3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+            
+        for sex in Sexes:
+            plot_learning_curve(perf_plot_AB1[perf_plot_AB1['Gender'] == sex], save_name = 'AB1_rewardrate_' + sex, 
+                                value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = 'AB1 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_AB2[perf_plot_AB2['Gender'] == sex], save_name = 'AB2_rewardrate_' + sex, 
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = 'AB2 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_AB3[perf_plot_AB3['Gender'] == sex], save_name = 'AB3_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = 'AB3 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_CD1[perf_plot_CD1['Gender'] == sex], save_name = 'CD1_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = 'CD1 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_CD2[perf_plot_CD2['Gender'] == sex], save_name = 'CD2_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = 'CD2 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_CD3[perf_plot_CD3['Gender'] == sex], save_name = 'CD3_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = 'CD3 Reward Rate '+ sex + ' ' + self.strain)
+
         # plot_learning_curve(perf_plot_AB1, save_name = 'AB1_dprime', 
         #     value_col = 'd', trial_col = 'Block')
         # plot_learning_curve(perf_plot_AB2, save_name = 'AB2_dprime', 
-        #     value_col = 'd', trial_col = 'Block')
-        
+        #     value_col =   'd', trial_col = 'Block')
+        plt.close('all')
+
     def model_fit(self):
         # call matlab function to fit the computational model
         pass
@@ -529,26 +679,28 @@ class BehDataOdor(BehData):
                 nTrials = behDF.shape[0]
                 bodyparts = DLCdata['bodyparts']
                 aligned_keypoints = {}
-                startTime = -1.99
-                endTime = 1.99
-                aligned_t = np.arange(startTime, endTime,0.02)
+                startTime = -4.99
+                endTime = 4.99
+                aligned_t = np.arange(startTime, endTime,0.01)
 
                 # video timestamp
                 videoTS = pd.read_csv(self.data_index['behTimeStamp_aligned'][ii], header=0)
                 header = ['TimeStamp', 'AlignedTimeStamp']
                 videoTS.columns = header
-
+                nFrames = videoTS.shape[0]
+                FrameIdx = np.arange(nFrames)
                 align_events = ['center_in', 'side_in']
                 for event in align_events:
                     aligned_keypoints[event] = {}
+                    aligned_keypoints[event]['frameID'] = np.full((len(aligned_t), nTrials), np.nan)
                     for bp in bodyparts:
                         aligned_keypoints[event][bp] = {}
                         aligned_keypoints[event][bp]['x'] = np.full((len(aligned_t), nTrials), np.nan)
                         aligned_keypoints[event][bp]['y'] = np.full((len(aligned_t), nTrials), np.nan)
+                        
                         smoothed_x = moving_average(DLCdata[bp]['x'], window=10)
                         smoothed_y = moving_average(DLCdata[bp]['y'], window=10)
                         for tt in range(nTrials):
-                            
                         # look for the time, interpolate it
                             t_middle = behDF[event][tt]
                             if not np.isnan(t_middle): # could be nan for missed trials in side_in   
@@ -556,6 +708,7 @@ class BehDataOdor(BehData):
                                 t_end = t_middle + endTime
                                 timeMask = np.logical_and(videoTS['AlignedTimeStamp']<t_end, 
                                                     videoTS['AlignedTimeStamp']>t_start)
+
                                 center_kp_x = smoothed_x[timeMask]
                                 center_kp_y = smoothed_y[timeMask]
                                 sig_t = videoTS['AlignedTimeStamp'][timeMask]-t_middle
@@ -563,95 +716,285 @@ class BehDataOdor(BehData):
                                 aligned_keypoints[event][bp]['x'][:,tt] = np.interp(aligned_t, sig_t, center_kp_x)
                                 aligned_keypoints[event][bp]['y'][:,tt] = np.interp(aligned_t, sig_t, center_kp_y)
 
+
+                                # save once (e.g. for nose only, since frame IDs are shared)
+                                if bp == 'nose':
+                                    sig_t = (videoTS['AlignedTimeStamp'][timeMask] - t_middle).to_numpy()
+                                    frameIDTmp = FrameIdx[timeMask]
+                                    nearest_idx = np.abs(sig_t[:, None] - aligned_t[None, :]).argmin(axis=0)
+                                    nearest_frameID = frameIDTmp[nearest_idx]
+                                    aligned_keypoints[event]['frameID'][:, tt] = nearest_frameID
+
                 choice = np.array(behDF['actions'])
                 prev_choice = np.concatenate([[np.nan], choice[0:-1]])
+
+                # load one frome of the video for background
+                videoPath = self.data_index['behRecording'][ii]
+                frame = iio.imread(videoPath, index=0)
+
+                # look for trial length, plot the trajectory (focus on short trials)
+
+                # from last trial side_out to next trial side_in
+
                 plt.figure()
                 plt.imshow(frame)
-                left_choice_trials = choice==0
-                left_choice_prev = prev_choice==0
-                right_choice_prev = prev_choice==1
-                right_choice_trials = choice == 1
-                X= aligned_keypoints['center_in']['head']['x'][:,(left_choice_trials & left_choice_prev)]
-                Y= aligned_keypoints['center_in']['head']['y'][:,(left_choice_trials & left_choice_prev)]
-                # --- plot single trials ---
+                trialNum = 5
+                x_trial = aligned_keypoints['center_in']['head']['x'][:, trialNum]
+                y_trial = aligned_keypoints['center_in']['head']['y'][:, trialNum]
+                valid = np.isfinite(x_trial) & np.isfinite(y_trial) & np.isfinite(aligned_t)
+                points = np.column_stack((x_trial[valid], y_trial[valid]))
+                if points.shape[0] > 1:
+                    segments = np.stack((points[:-1], points[1:]), axis=1)
+                    lc = LineCollection(segments, cmap='viridis', linewidth=5)
+                    lc.set_array(aligned_t[valid][:-1])
+                    plt.gca().add_collection(lc)
+                
+                # plot a given frame
+                plt.figure()
+                timePoint = 800
+                trialNum = 0
+                
+                
+                plt.scatter(aligned_keypoints['center_in']['left foot']['x'][timePoint,trialNum], 
+                            aligned_keypoints['center_in']['left foot']['y'][timePoint,trialNum], color='red')
+                plt.scatter(aligned_keypoints['center_in']['right foot']['x'][timePoint,trialNum], 
+                            aligned_keypoints['center_in']['right foot']['y'][timePoint,trialNum], color='blue')
+                # load the frame
+                # fine the frameIdx
+                frameIdx = aligned_keypoints['center_in']['frameID'][timePoint,trialNum]
+                frame = iio.imread(videoPath, index=frameIdx)
+                plt.imshow(frame)   
+
+                import numpy as np
+                import matplotlib.pyplot as plt
+                from scipy.stats import gaussian_kde
+                from scipy.ndimage import gaussian_filter1d
+                from matplotlib.animation import FuncAnimation
+                from matplotlib.colors import Normalize
+
+                # X,Y: nTrials × nTime
+                # t: time vector
+
+                # ---- density from all trials ----
+                X = aligned_keypoints['center_in']['head']['x']
+                Y = aligned_keypoints['center_in']['head']['y']
+                X = gaussian_filter1d(X, sigma=1, axis=1)
+                Y = gaussian_filter1d(Y, sigma=1, axis=1)
+                t = aligned_t
+                # ---------------------------------
+                # fixed plot limits
+                # ---------------------------------
+
+                xmin = np.nanmin(X)
+                xmax = np.nanmax(X)
+
+                ymin = np.nanmin(Y)
+                ymax = np.nanmax(Y)
+
+                xx, yy = np.mgrid[
+                    xmin:xmax:100j,
+                    ymin:ymax:100j
+                ]
+
+                grid = np.vstack([xx.ravel(), yy.ravel()])
+
+                # ---------------------------------
+                # setup figure
+                # ---------------------------------
+
+                fig, ax = plt.subplots(figsize=(8,8))
+                ax.imshow(frame)
+                density_im = ax.imshow(
+                    np.zeros(xx.shape),
+                    extent=[xmin,xmax,ymin,ymax],
+                    origin='lower',
+                    aspect='auto',
+                    animated=True
+                )
+
+                trajectory_line, = ax.plot(
+                    [],
+                    [],
+                    lw=3,
+                    color='white'
+                )
+
+                time_text = ax.text(
+                    0.05,
+                    0.95,
+                    '',
+                    transform=ax.transAxes,
+                    color='white',
+                    fontsize=14
+                )
+
+                ax.set_xlim(xmin,xmax)
+                ax.set_ylim(ymin,ymax)
+
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+
+                # average trajectory
+                x_mean = np.nanmean(X,axis=1)
+                y_mean = np.nanmean(Y,axis=1)
+
+                # ---------------------------------
+                # animation function
+                # ---------------------------------
+
+                window = 5   # temporal smoothing window
+
+                def update(frame):
+
+                    start = max(0, frame-window)
+                    end = min(len(t), frame+window)
+
+                    x_now = X[start:end,:].flatten()
+                    y_now = Y[start:end,:].flatten()
+
+                    valid = (
+                        ~np.isnan(x_now)
+                        &
+                        ~np.isnan(y_now)
+                    )
+
+                    x_now = x_now[valid]
+                    y_now = y_now[valid]
+
+                    if len(x_now) > 10:
+
+                        kde = gaussian_kde(
+                            np.vstack([x_now,y_now])
+                        )
+
+                        density = kde(grid).reshape(xx.shape)
+
+                        density_im.set_array(
+                            density.T
+                        )
+
+                        density_im.set_norm(
+                            Normalize(
+                                vmin=0,
+                                vmax=np.percentile(
+                                    density,
+                                    99
+                                )
+                            )
+                        )
+
+                    trajectory_line.set_data(
+                        x_mean[:frame],
+                        y_mean[:frame]
+                    )
+
+                    time_text.set_text(
+                        f'Time: {t[frame]:.2f} s'
+                    )
+
+                    return density_im,trajectory_line,time_text
+
+
+                anim = FuncAnimation(
+                    fig,
+                    update,
+                    frames=len(t),
+                    interval=30,
+                    blit=True
+                )
+
+                anim.save(
+                    'trajectory_density.mp4',
+                    writer='ffmpeg',
+                    fps=30,
+                    dpi=200
+                )
+
+                # left_choice_trials = choice==0
+                # left_choice_prev = prev_choice==0
+                # right_choice_prev = prev_choice==1
+                # right_choice_trials = choice == 1
+                # X= aligned_keypoints['center_in']['head']['x'][:,(left_choice_trials & left_choice_prev)]
+                # Y= aligned_keypoints['center_in']['head']['y'][:,(left_choice_trials & left_choice_prev)]
+                # # --- plot single trials ---
+                # # for tt in range(nTrials):
+                # #     plt.plot(X[:, tt], Y[:, tt],
+                # #             color='gray', linewidth=1, alpha=0.5)
+
+                # # --- compute average trajectory ---
+                # x_mean = np.nanmean(X, axis=1)
+                # y_mean = np.nanmean(Y, axis=1)
+                # x_std = np.nanstd(X, axis=1)
+                # y_std = np.nanstd(Y, axis=1)
+
+                # # --- plot average ---
+                # plt.plot(x_mean, y_mean,
+                #         color='red', linewidth=3, label='mean')
+                # for k in range(-1, 2):
+                #     plt.plot(x_mean + k * x_std,
+                #             y_mean + k * y_std,
+                #             color='red',
+                #             alpha=0.2)
+                # # plot right-left trials
+                # X= aligned_keypoints['center_in']['head']['x'][:,(left_choice_trials & right_choice_prev)]
+                # Y= aligned_keypoints['center_in']['head']['y'][:,(left_choice_trials & right_choice_prev)]
+
+                # x_mean = np.nanmean(X, axis=1)
+                # y_mean = np.nanmean(Y, axis=1)
+
+                # # --- plot average ---
+                # plt.plot(x_mean, y_mean,
+                #         color='blue', linewidth=3, label='mean')
+
+                # plt.plot(np.nanmean(aligned_keypoints['center_in']['head']['x'][:,(right_choice_trials & left_choice_prev)], axis=1), 
+                #          np.nanmean(aligned_keypoints['center_in']['head']['y'][:,(right_choice_trials & left_choice_prev)], axis=1),
+                #         color='yellow', linewidth=3, label='mean')
+                
+                # plt.plot(np.nanmean(aligned_keypoints['center_in']['head']['x'][:,(right_choice_trials & right_choice_prev)], axis=1), 
+                #          np.nanmean(aligned_keypoints['center_in']['head']['y'][:,(right_choice_trials & right_choice_prev)], axis=1),
+                #         color='green', linewidth=3, label='mean')
+                
+                # plt.xlabel('X')
+                # plt.ylabel('Y')
+                # plt.title('Trajectory (single trials + mean)')
+                # plt.axis('equal')
+                # plt.legend()
+
+                # plt.show()
+
+                
+                # plt.figure()
+                # plt.imshow(frame)
+                # sc = plt.scatter(aligned_keypoints['center_in']['head']['x'][:,0], aligned_keypoints['center_in']['head']['y'][:,0],
+                #                   c=aligned_t, cmap='viridis', s=10)
+
+                # plt.colorbar(sc, label='Time (s)')
+                # plt.scatter(aligned_keypoints['center_in']['head']['x'][100,0], aligned_keypoints['center_in']['head']['y'][100,0], s=40)
+                # x_smooth = moving_average(DLCdata['head']['x'], window=10)
+                # y_smooth = moving_average(DLCdata['head']['y'], window=10)
+
+                # # plot head position near the center_in time
+                # nTrials = behDF.shape[0]
+                # center_head_x = []
+                # center_head_y = []
+
+                # center_head_x_smoothed = []
+                # center_head_y_smoothed = []
                 # for tt in range(nTrials):
-                #     plt.plot(X[:, tt], Y[:, tt],
-                #             color='gray', linewidth=1, alpha=0.5)
-
-                # --- compute average trajectory ---
-                x_mean = np.nanmean(X, axis=1)
-                y_mean = np.nanmean(Y, axis=1)
-                x_std = np.nanstd(X, axis=1)
-                y_std = np.nanstd(Y, axis=1)
-
-                # --- plot average ---
-                plt.plot(x_mean, y_mean,
-                        color='red', linewidth=3, label='mean')
-                for k in range(-1, 2):
-                    plt.plot(x_mean + k * x_std,
-                            y_mean + k * y_std,
-                            color='red',
-                            alpha=0.2)
-                # plot right-left trials
-                X= aligned_keypoints['center_in']['head']['x'][:,(left_choice_trials & right_choice_prev)]
-                Y= aligned_keypoints['center_in']['head']['y'][:,(left_choice_trials & right_choice_prev)]
-
-                x_mean = np.nanmean(X, axis=1)
-                y_mean = np.nanmean(Y, axis=1)
-
-                # --- plot average ---
-                plt.plot(x_mean, y_mean,
-                        color='blue', linewidth=3, label='mean')
-
-                plt.plot(np.nanmean(aligned_keypoints['center_in']['head']['x'][:,(right_choice_trials & left_choice_prev)], axis=1), 
-                         np.nanmean(aligned_keypoints['center_in']['head']['y'][:,(right_choice_trials & left_choice_prev)], axis=1),
-                        color='yellow', linewidth=3, label='mean')
-                
-                plt.plot(np.nanmean(aligned_keypoints['center_in']['head']['x'][:,(right_choice_trials & right_choice_prev)], axis=1), 
-                         np.nanmean(aligned_keypoints['center_in']['head']['y'][:,(right_choice_trials & right_choice_prev)], axis=1),
-                        color='green', linewidth=3, label='mean')
-                
-                plt.xlabel('X')
-                plt.ylabel('Y')
-                plt.title('Trajectory (single trials + mean)')
-                plt.axis('equal')
-                plt.legend()
-
-                plt.show()
-
-                
-                plt.figure()
-                plt.imshow(frame)
-                sc = plt.scatter(aligned_keypoints['center_in']['head']['x'][:,0], aligned_keypoints['center_in']['head']['y'][:,0],
-                                  c=aligned_t, cmap='viridis', s=10)
-
-                plt.colorbar(sc, label='Time (s)')
-                plt.scatter(aligned_keypoints['center_in']['head']['x'][100,0], aligned_keypoints['center_in']['head']['y'][100,0], s=40)
-                x_smooth = moving_average(DLCdata['head']['x'], window=10)
-                y_smooth = moving_average(DLCdata['head']['y'], window=10)
-
-                # plot head position near the center_in time
-                nTrials = behDF.shape[0]
-                center_head_x = []
-                center_head_y = []
-
-                center_head_x_smoothed = []
-                center_head_y_smoothed = []
-                for tt in range(nTrials):
-                    center_in = behDF['center_in'][tt]
-                    center_out = behDF['center_out'][tt]
-                    timeMask = np.logical_and(videoTS['AlignedTimeStamp']<center_out, 
-                                              videoTS['AlignedTimeStamp']>center_in)
-                    center_head_x.append(np.array(DLCdata['head']['x'])[timeMask])
-                    center_head_y.append(np.array(DLCdata['head']['y'])[timeMask])
-                    center_head_x_smoothed.append(x_smooth[timeMask])
-                    center_head_y_smoothed.append(y_smooth[timeMask])
+                #     center_in = behDF['center_in'][tt]
+                #     center_out = behDF['center_out'][tt]
+                #     timeMask = np.logical_and(videoTS['AlignedTimeStamp']<center_out, 
+                #                               videoTS['AlignedTimeStamp']>center_in)
+                #     center_head_x.append(np.array(DLCdata['head']['x'])[timeMask])
+                #     center_head_y.append(np.array(DLCdata['head']['y'])[timeMask])
+                #     center_head_x_smoothed.append(x_smooth[timeMask])
+                #     center_head_y_smoothed.append(y_smooth[timeMask])
 
 
-                center_x = np.concatenate(center_head_x)
-                center_y = np.concatenate(center_head_y)
-                center_x_smoothed = np.concatenate(center_head_x_smoothed)
-                center_y_smoothed = np.concatenate(center_head_y_smoothed)
+                # center_x = np.concatenate(center_head_x)
+                # center_y = np.concatenate(center_head_y)
+                # center_x_smoothed = np.concatenate(center_head_x_smoothed)
+                # center_y_smoothed = np.concatenate(center_head_y_smoothed)
 
 
                 # videopath = r'Y:\HongliWang\Juvi_ASD Deterministic\TSC2_withRec\Data\578\Odor\Imaging\20251216\ASD578__2025-12-16T11_56_01.mp4'
@@ -687,8 +1030,8 @@ class BehDataOdor(BehData):
 
 class BehDataRotarod(BehData):
 
-    def __init__(self, root_file):
-        super().__init__(root_file)
+    def __init__(self, root_file, strain):
+        super().__init__(root_file, strain)
         self.make_dataIndex()
 
         self.behavior = 'Rotarod'
@@ -706,6 +1049,13 @@ class BehDataRotarod(BehData):
         self.data_index['Performance'] = rr_results['Performance']
         self.data_index['FallByTurning'] = rr_results['FBT']
         self.data_index['Genotype'] = rr_results['Genotype']
+        self.data_index['Sex'] = rr_results['Sex']
+
+        if 'HET' in self.data_index['Genotype'].values:
+            self.Mut = 'HET'
+        elif 'KO' in self.data_index['Genotype'].values:
+            self.Mut = 'KO'
+        self.WT = 'WT' 
 
         # make a list of DLC result, rod speed, timestamp, video path, and analysis path for each session
         # length should be the same as the number of rows in data_index
@@ -720,46 +1070,50 @@ class BehDataRotarod(BehData):
         # %% load all files
         for aidx in range(self.data_index.shape[0]):
             aa = self.data_index['Animal'][aidx]
-            dataFolder = os.path.join(self.data, aa, 'Rotarod', 'Behavior')
+            date = self.data_index['Date'][aidx]
+            dataFolder = os.path.join(self.data, aa, 'Rotarod', 'Behavior',aa+'_'+str(date)[2:])
+            trialNum = self.data_index['Trial'][aidx]
             if os.path.exists(dataFolder):
-                dateFolder = sorted([f for f in os.listdir(dataFolder) if os.path.isdir(os.path.join(dataFolder, f))])
                 filePatternSpeed = aa + '*speed*.csv'
                 filePatternDLC = aa + '*DLC_resnet*.csv'
                 filePatternVideo = aa + '*.avi'
                 filePatternTimestamp = aa + '*timeStamp*.csv'
 
-                for date in dateFolder:
-                    speedCSV = glob.glob(os.path.join(dataFolder, date, filePatternSpeed))
-                    timeStampCSV = glob.glob(os.path.join(dataFolder, date, filePatternTimestamp))
-                    videoFiles = glob.glob(os.path.join(dataFolder, date, filePatternVideo))
-                    DLCFiles = glob.glob(os.path.join(dataFolder, date, filePatternDLC))
-                    num_files = len(videoFiles)
+                speedCSV = glob.glob(os.path.join(dataFolder, filePatternSpeed))
+                timeStampCSV = glob.glob(os.path.join(dataFolder, filePatternTimestamp))
+                videoFiles = glob.glob(os.path.join(dataFolder, filePatternVideo))
+                DLCFiles = glob.glob(os.path.join(dataFolder, filePatternDLC))
+                num_files = len(videoFiles)
 
-                    if num_files>0:
-                        for ff in range(num_files):
-                            # match the sessions: ASDxxx followed by optional middle part, then trialx(x), optional underscore, and date YYYY-MM-DDTHH...
-                            dateExpr = r'ASD\d+.*?_trial\d{1,2}(?=_?\d{4}-\d{2}-\d{2}T)'
-                            matches = re.findall(dateExpr,videoFiles[ff])
-                            # in tempVideo['back'], find the string that has matches
-                            video[aidx] = videoFiles[ff]
-                            DLC_ID = [ID for ID in range(len(DLCFiles)) if matches[0] in DLCFiles[ID]]
-                            if len(DLC_ID)>0:
-                                DLC_results[aidx] = DLCFiles[DLC_ID[0]]
-                            else:
-                                DLC_results[aidx] = None
-                            speed_ID = [ID for ID in range(len(speedCSV)) if matches[0] in speedCSV[ID]]
+                if num_files>0:
+                    # match the sessions: ASDxxx followed by optional middle part, 
+                    # then trial(trialNum), optional underscore, and date YYYY-MM-DDTHH...
+                    DLC_ID = [ID for ID in range(len(DLCFiles)) if aa in DLCFiles[ID] and 'trial'+str(trialNum) in DLCFiles[ID]]
+                    if len(DLC_ID)>0:
+                        DLC_results[aidx] = DLCFiles[DLC_ID[0]]
+                    else:
+                        DLC_results[aidx] = None
+                    speed_ID = [ID for ID in range(len(speedCSV)) if aa in speedCSV[ID] and 'trial'+str(trialNum) in speedCSV[ID]]
 
-                            if len(speed_ID)>0:
-                                Rod_speed[aidx] = speedCSV[speed_ID[0]]
-                            else:
-                                Rod_speed[aidx] = None
+                    if len(speed_ID)>0:
+                        Rod_speed[aidx] = speedCSV[speed_ID[0]]
+                    else:
+                        Rod_speed[aidx] = None
 
-                            timeStamp_ID = [ID for ID in range(len(timeStampCSV)) if matches[0] in timeStampCSV[ID]]
-                            timeStamp[aidx] = timeStampCSV[timeStamp_ID[0]]
+                    timeStamp_ID = [ID for ID in range(len(timeStampCSV)) if aa in timeStampCSV[ID] and 'trial'+str(trialNum) in timeStampCSV[ID]]
+                    if len(timeStamp_ID)>0:
+                        timeStamp[aidx] = timeStampCSV[timeStamp_ID[0]]
+                    else:
+                        timeStamp[aidx] = None
 
+                    video_ID = [ID for ID in range(len(videoFiles)) if aa in videoFiles[ID] and 'trial'+str(trialNum) in videoFiles[ID]]
+                    if len(video_ID)>0:
+                        video[aidx] = videoFiles[video_ID[0]]                    
+                    else:      
+                        video[aidx] = None
 
-                            #stage.append(matches[0])
-                            analysis[aidx] = os.path.join(self.analysis, aa,'Rotarod', 'Behavior', matches[0])
+                    #stage.append(matches[0])
+                    analysis[aidx] = os.path.join(self.analysis, aa,'Rotarod', 'Behavior', aa+'_'+str(date)[2:], 'trial'+str(trialNum))
 
 
 
@@ -774,718 +1128,472 @@ class BehDataRotarod(BehData):
         #sorted_df = self.dataIndex.sort_values(by=['Animal', 'Trial'])
         #sorted_df = sorted_df.reset_index(drop=True)
         #self.data=sorted_df
-        #self.nSessions = len(self.data['Animal'])
+        self.nSessions = len(self.data_index['Animal'])
 
     def plot_performance(self):
-        perf_df = self.data_index[['Animal', 'Genotype', 'Trial', 'Performance', 'FallByTurning']].copy()
-        perf_df['Performance'] = pd.to_numeric(perf_df['Performance'], errors='coerce')
-        if perf_df['FallByTurning'].dtype == bool:
-            fbt_mask = perf_df['FallByTurning'].fillna(False)
-        else:
-            fbt_numeric = pd.to_numeric(perf_df['FallByTurning'], errors='coerce') == 1
-            fbt_text = perf_df['FallByTurning'].astype(str).str.lower().isin(['true', '1', 'yes'])
-            fbt_mask = fbt_numeric | fbt_text
-        perf_df.loc[fbt_mask, 'Performance'] = np.nan
-        perf_df = perf_df.rename(columns={
-            'Animal': 'subject',
-            'Genotype': 'genotype',
-            'Trial': 'trial',
-            'Performance': 'time_on_rod'
-        })
-        perf_df['trial'] = pd.Categorical(perf_df['trial'], categories=np.sort(perf_df['trial'].dropna().unique()), ordered=True)
-        genotype_order = [g for g in ['WT', 'HET', 'KO'] if g in set(perf_df['genotype'].dropna())]
-        genotype_order += [g for g in perf_df['genotype'].dropna().unique() if g not in genotype_order]
-        perf_df['genotype'] = pd.Categorical(perf_df['genotype'], categories=genotype_order)
-        genotype_counts = perf_df.dropna(subset=['subject', 'genotype']).groupby('genotype', observed=True)['subject'].nunique()
+        # looks for gender groups
+        sexes = self.data_index['Sex'].unique()
 
-        os.makedirs(self.summary, exist_ok=True)
-        perf_df.to_csv(os.path.join(self.summary, 'Rotarod performance.csv'), index=False)
+          
+        for sex in sexes:
+            perf_df = self.data_index[['Animal', 'Genotype', 'Sex','Trial', 'Performance', 'FallByTurning']].copy()
+            if 'Cntnap' in self.strain:
+                perf_df = perf_df[np.logical_or(perf_df['Genotype'] == 'KO', perf_df['Genotype'] == 'WT')]
+            # only consider KO for now
+            perf_df = perf_df[perf_df['Sex'] == sex]
+            perf_df['Performance'] = pd.to_numeric(perf_df['Performance'], errors='coerce')
+            if perf_df['FallByTurning'].dtype == bool:
+                fbt_mask = perf_df['FallByTurning'].fillna(False)
+            else:
+                fbt_numeric = pd.to_numeric(perf_df['FallByTurning'], errors='coerce') == 1
+                fbt_text = perf_df['FallByTurning'].astype(str).str.lower().isin(['true', '1', 'yes'])
+                fbt_mask = fbt_numeric | fbt_text
+            perf_df.loc[fbt_mask, 'Performance'] = np.nan
+            perf_df = perf_df.rename(columns={
+                'Animal': 'subject',
+                'Genotype': 'genotype',
+                'Trial': 'trial',
+                'Sex': 'sex',
+                'Performance': 'performance'
+            })
+            perf_df['trial'] = pd.Categorical(perf_df['trial'], categories=np.sort(perf_df['trial'].dropna().unique()), ordered=True)
+            genotype_order = [g for g in ['WT', 'HET', 'KO'] if g in set(perf_df['genotype'].dropna())]
+            genotype_order += [g for g in perf_df['genotype'].dropna().unique() if g not in genotype_order]
+            perf_df['genotype'] = pd.Categorical(perf_df['genotype'], categories=genotype_order)
+            genotype_counts = perf_df.dropna(subset=['subject', 'genotype']).groupby('genotype', observed=True)['subject'].nunique()
 
-        stats_df,_,_ = run_learning_gam(perf_df, summary_path = self.summary)
+            os.makedirs(self.summary, exist_ok=True)
 
-        # ------------------------------------------------------------
-        # Robustly mark failed trials (FallByTurning)
-        # ------------------------------------------------------------
-        exclude_numeric = pd.to_numeric(perf_df['FallByTurning'], errors='coerce') == 1
-        exclude_text = perf_df['FallByTurning'].astype(str).str.lower().isin(
-            ['true', '1', 'yes']
-        )
+            figure_label = 'Rotarod ' + self.strain + ' ' + sex
+            perf_df.to_csv(os.path.join(self.summary, f'{figure_label}_performance.csv'), index=False)
 
-        perf_df.loc[exclude_numeric | exclude_text, 'time_on_rod'] = np.nan
+            #stats_df,_,_ = run_learning_FDA(perf_df, summary_path = self.summary,save_name = f'{figure_label}_FDA_stats.csv' )
 
-        # ------------------------------------------------------------
-        # Clean data
-        # ------------------------------------------------------------
-        clean_df = perf_df.dropna(
-            subset=['subject', 'genotype', 'trial', 'time_on_rod']
-        ).copy()
-
-        summary_df = clean_df.groupby(['genotype', 'trial'], observed=True)['time_on_rod'].agg(['mean', 'std', 'count']).reset_index()
-        summary_df['sem'] = summary_df['std'] / np.sqrt(summary_df['count'])
-        trial_codes = {trial: idx for idx, trial in enumerate(perf_df['trial'].cat.categories)}
-        colors = {'WT': 'black', 'HET': 'red', 'KO': 'red'}
-        stats_text = None
-        if not stats_df.empty and 'p_value' in stats_df.columns:
-            p_values = stats_df.set_index('term')['p_value']
-            stats_text = (
-                f"GAM p genotype = {p_values.get('genotype', np.nan):.3g}\n"
-                f"GAM p learning = {p_values.get('learning', np.nan):.3g}\n"
-                f"GAM p interaction = {p_values.get('genotype:learning', np.nan):.3g}"
+            # ------------------------------------------------------------
+            # Robustly mark failed trials (FallByTurning)
+            # ------------------------------------------------------------
+            exclude_numeric = pd.to_numeric(perf_df['FallByTurning'], errors='coerce') == 1
+            exclude_text = perf_df['FallByTurning'].astype(str).str.lower().isin(
+                ['true', '1', 'yes']
             )
 
-        fig, ax = plt.subplots(figsize=(7, 5))
-        for genotype in genotype_order:
-            genotype_data = summary_df[summary_df['genotype'] == genotype]
-            if genotype_data.empty:
-                continue
-            x = genotype_data['trial'].map(trial_codes).astype(float).to_numpy()
-            y = genotype_data['mean'].to_numpy(dtype=float)
-            sem = genotype_data['sem'].to_numpy(dtype=float)
-            color = colors.get(genotype, None)
-            label = f'{genotype} (n={genotype_counts.get(genotype, 0)})'
-            ax.errorbar(x, y, yerr=sem, marker='o', linewidth=2, capsize=3, color=color, label=label)
+            perf_df.loc[exclude_numeric | exclude_text, 'performance'] = np.nan
 
-            raw = clean_df[clean_df['genotype'] == genotype]
-            raw_x = raw['trial'].map(trial_codes).astype(float).to_numpy()
-            jitter = (genotype_order.index(genotype) - (len(genotype_order) - 1) / 2) * 0.08
-            ax.scatter(raw_x + jitter, raw['time_on_rod'], s=18, alpha=0.35, color=color, edgecolors='none')
+            plot_learning_curve(perf_df, save_name = figure_label, 
+                        value_col = 'performance', trial_col = 'trial', summary_path = self.summary,
+                                title = figure_label)
 
-        ax.set_xticks(np.arange(len(trial_codes)))
-        ax.set_xticklabels([str(t) for t in trial_codes.keys()])
-        ax.set_xlabel('Trial')
-        ax.set_ylabel('Time on rod (s)')
-        ax.set_title('Rotarod Performance')
-        ax.legend(frameon=False)
-        if stats_text is not None:
-            ax.text(
-                0.02, 0.98, stats_text,
-                transform=ax.transAxes,
-                va='top',
-                ha='left',
-                fontsize=9
-            )
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.summary, 'Rotarod performance.png'), dpi=300)
-        plt.savefig(os.path.join(self.summary, 'Rotarod performance.svg'), format='svg')
-        plt.close(fig)
-
-        return perf_df, stats_df
+            return perf_df, stats_df
+    
     def load_data(self):
         # Load rotarod behavior data from file
         DLC_obj= []
 
         for s in range(self.nSessions):
-            analysisPath = self.data['AnalysisPath'][s]
+            analysisPath = self.data_index['AnalysisPath'][s]
 
-            filePath = self.data['DLC'][s]
-            videoPath = self.data['Video'][s]
-            rodPath = self.data['Rod_speed'][s]
-            fps = self.data['Timestamp'][s]
-            dlc = DLCSession(filePath, videoPath, rodPath, analysisPath, fps)
+            filePath = self.data_index['DLC'][s]
+            videoPath = self.data_index['Video'][s]
+            rodPath = self.data_index['Rod_speed'][s]
+            fps = self.data_index['BehTimestamp'][s]
+            #fps = 50
+            if fps is None or len(fps)==0:
+               dlc = None
+            else:
+                dlc = DLCSession(filePath, videoPath, rodPath, analysisPath, fps)  
             DLC_obj.append(dlc)
 
-        self.data['DLC_obj'] = DLC_obj
+        self.data_index['DLC_obj'] = DLC_obj
         #self.plotT = np.arange(0, minFrames-1)/fps
         animalIdx = np.arange(self.nSessions)
-        self.WTIdx = animalIdx[self.data['GeneBG'] == groups[0]]
-        self.MutIdx = animalIdx[self.data['GeneBG'] == groups[1]]
+        self.WTIdx = animalIdx[self.data_index['Genotype'] == self.WT]
+        self.MutIdx = animalIdx[self.data_index['Genotype'] == self.Mut]
         # grouping the animals
 
-        if self.Sex[0]==np.nan: # if no sex info
-            nGroups = 1
-        else:
-            nGroups = 2
+        # if self.Sex[0]==np.nan: # if no sex info
+        #     nGroups = 1
+        # else:
+        #     nGroups = 2
 
-        if nGroups==2:
-            self.maleIdx = np.where(self.data['Sex']=='M')[0]
-            self.femaleIdx = np.where(self.data['Sex']=='F')[0]
+        # if nGroups==2:
+        #     self.maleIdx = np.where(self.data['Sex']=='M')[0]
+        #     self.femaleIdx = np.where(self.data['Sex']=='F')[0]
 
         self.startVoltage = [4.45, 40] # 5 rpm = 0.273 V
         self.endVoltage = [8.90, 80]
         self.rod_a = (self.endVoltage[1] - self.startVoltage[1]) / (self.endVoltage[0] - self.startVoltage[0])
         self.rod_b = self.endVoltage[1] - self.endVoltage[0] * self.rod_a
+ 
+    def align_timeStamps(self):
+        # preprocess data, align the video with rod speed.
+        # we will need to manually label the number of frame when rod start to turn
+        # smooth the DLC labelling and save the corrected DLC
 
-    
+        #stampCSV = os.path.join(self.dataFolder,'Videos', 'timeStamp.csv')
+        #timeStamp = pd.read_csv(stampCSV)
+        #self.data['rodData'] = [[] for x in range(self.nSessions)]
+
+        # check if DLC data exists
+
+        savefigpath = os.path.join(self.analysis, 'StartPoint_rodSpeed')
+        if not os.path.exists(savefigpath):
+            os.makedirs(savefigpath)
+
+        for ss in range(self.nSessions):
+            savefigname = os.path.join(savefigpath, 'Start point for ' + str(self.data_index['Animal'][ss]) + ' trial' + str(self.data_index['Trial'][ss])+'.png')
+            # check if fig exist
+            DLC_obj = self.data_index['DLC_obj'][ss]
+            if DLC_obj is not None:
+                savedataname = os.path.join(DLC_obj.analysis, 'smoothed_rodSpeed.csv')
+                if not os.path.exists(savedataname):
+
+                    DLC_obj = self.data_index['DLC_obj'][ss]
+
+                    # Generate a sample signal with change points
+                    if DLC_obj.data['rodSpeed'] is not None:
+                        # Create a change point detection object using a specific algorithm (e.g., 'Pelt' or 'Binseg')
+                        signal = DLC_obj.data['rodSpeed']/100
+
+                        # downsample it
+
+                        algo = rpt.Pelt(model="l2").fit(signal)
+                        # Predict the change points
+                        predicted_bkps = algo.predict(pen=3)
+
+                        # Display results
+                        # change the signal to rod speed
+
+                        rodSpeed = signal*self.rod_a+self.rod_b
+
+                        max_jump = (80-5)/(60*5*4)
+                        # Smooth the signal
+                        smoothed_signal = np.copy(rodSpeed)
+                        #running average first
+                        tempSpeed = rodSpeed
+                        #plt.figure()
+                        #plt.plot(rodSpeed)
+                        if rodSpeed[0] == 0 and rodSpeed[-1] == 0:
+                            # steady state has been recorded
+                            startRange = predicted_bkps[0]
+                            endRange = predicted_bkps[-2]
+                        elif rodSpeed[0] == 0 and rodSpeed[-1] > 0:
+                            startRange = predicted_bkps[0]
+                            endRange = len(rodSpeed)
+                        elif  rodSpeed[0] > 0 and rodSpeed[-1] == 0:
+                            # steady state hasn't been recorded
+                            startRange = 0
+                            endRange = predicted_bkps[-2]
+                        else:
+                            startRange = 0
+                            endRange = len(rodSpeed)
+
+                        for sss in range(0,60,10):
+                            windowSize = 4+sss*1
+
+                            for i in range(startRange, endRange):
+                                if i > startRange + windowSize/2 and i < endRange - windowSize/2:
+                                    smoothed_signal[i] = np.mean(tempSpeed[i-windowSize//2 : i+windowSize//2])
+                                elif i <= startRange + windowSize/2:
+                                    smoothed_signal[i] = np.mean(tempSpeed[startRange+1: i + windowSize // 2])
+                                elif i >= endRange - windowSize/2:
+                                    smoothed_signal[i] = np.mean(tempSpeed[i - windowSize // 2: endRange-1])
+                            tempSpeed = smoothed_signal
+                            #plt.plot(tempSpeed)
+                            # jump = smoothed_signal[i] - smoothed_signal[i - 1]
+                            # if abs(jump) > max_jump:
+                            #     smoothed_signal[i] = smoothed_signal[i - 1] + max_jump
+                                #smoothed_signal[i] = (rodSpeed[i-1]+rodSpeed[i+1])/2
+
+                        algo = rpt.Pelt(model="l2").fit(smoothed_signal)
+                        # Predict the change points
+                        new_predicted_bkps = algo.predict(pen=1)
+
+                        # smooth one more round with the new predicted change point
+                        #plt.figure()
+                        #plt.plot(smoothed_signal)
+                        for sss in range(0,60,10):
+                            windowSize = 4+sss*1
+                            for i in range(startRange, endRange):
+                                if i > startRange + windowSize/2 and i < endRange - windowSize/2:
+                                    smoothed_signal[i] = np.mean(tempSpeed[i-windowSize//2 : i+windowSize//2])
+                                elif i <= startRange + windowSize/2:
+                                    smoothed_signal[i] = np.mean(tempSpeed[startRange+1: i + windowSize // 2])
+                                elif i >= endRange - windowSize/2:
+                                    smoothed_signal[i] = np.mean(tempSpeed[i - windowSize // 2: endRange-1])
+
+                            # jump = smoothed_signal[i] - smoothed_signal[i - 1]
+                            # if abs(jump) > max_jump:
+                            #     smoothed_signal[i] = smoothed_signal[i - 1] + max_jump
+                                #smoothed_signal[i] = (rodSpeed[i-1]+rodSpeed[i+1])/2
+                        rodTime = DLC_obj.data['rodT']
+
+                        # algo = rpt.Pelt(model="l2").fit(smoothed_signal)
+                        # # Predict the change points
+                        # new_predicted_bkps = algo.predict(pen=170)
+
+                        # find the point when rod speed start to increase with first derivative
+                        dx = np.diff(smoothed_signal)/np.diff(rodTime)
+                        k=200
+                        runIdx = np.where(np.convolve((dx > 0.1).astype(int), np.ones(k, dtype=int), 'valid') == k)[0][0]
+
+                        startIdx = np.where(smoothed_signal>0.5)[0][0]
+                        endIdx = np.where(smoothed_signal>0.5)[0][-1]
+                        # save the running speed and voltage
+                        # save the smoothed_signal somewhere
+                        saveData={}
+                        saveData['raw'] = signal
+                        saveData['smoothed'] = smoothed_signal
+                        saveData['time'] = rodTime
+                        if rodSpeed[0] ==0:
+                            saveData['Start'] = np.zeros((len(rodTime)))+rodTime[startIdx]
+                            saveData['Run'] = np.zeros((len(rodTime)))+rodTime[runIdx]
+                        else:
+                            saveData['Start'] = np.full((len(rodTime)),np.nan)
+                            saveData['Run'] = np.zeros((len(rodTime)))+rodTime[runIdx]
+                        savedf= pd.DataFrame(saveData)
+                        savedf.to_csv(savedataname)
+
+                        plt.figure()
+                        plt.plot(rodTime,rodSpeed)
+                        plt.plot(rodTime,smoothed_signal)
+                        plt.scatter(rodTime[startIdx], 0, s=200)
+                        plt.scatter(rodTime[runIdx], 0, s=200)
+                        plt.scatter(rodTime[endIdx],0, s=200)
+                        plt.title('Start point for ' + str(self.data_index['Animal'][ss]) + ' trial' + str(self.data_index['Trial'][ss]))
+                        #plt.show()
+                        plt.savefig(savefigname)
+                        plt.close()
+                    # else:
+                    #     saveData = pd.read_csv(savedataname)
+
+
+                
+                        # if t0 and saveData['Run'][0] is close enough (1s), use t0
+                        #if t0 and abs(t0 - saveData['Run'][0]) < 1:
+                        #saveData['Run'] = np.zeros((len(saveData['time']))) + t0
+
+                        self.data_index['DLC_obj'][ss].data['rodSpeed_smoothed'] = saveData['smoothed']
+                        self.data_index['DLC_obj'][ss].data['rodStart'] = saveData['Start']
+                        self.data_index['DLC_obj'][ss].data['rodRun'] = saveData['Run']
+                    # load it somewhere?
+
+                        #%% find the point when animal turn around
+
+                        # clean the data up:
+                        # 1. identify jumps in the DLC data, then infer the correct estimation based on previous and next frame
+                        # 2. add a mask on over turning frames
+                        # if DLC file exists:
+
+                        #%% for every keypoint find the jumps
+                        # orig_DLC = self.data_index['DLC'][ss]
+                        # corr_DLC = os.path.join(os.path.dirname(orig_DLC), os.path.basename(orig_DLC)[:-4] + '_corrected.csv')
+                        # self.data_index.loc[ss, 'Corrected_DLC'] = corr_DLC
+
+                        # if not os.path.exists(corr_DLC):
+                        #     corrected_data = {}
+                        #     for bp in kp_list:
+                        #         x_data = np.array(tempData[bp]['x'])
+                        #         y_data = np.array(tempData[bp]['y'])
+                        #         p_data = np.array(tempData[bp]['p'])
+
+                        #     # Calculate differences between consecutive frames
+                        #         dx = np.abs(np.diff(x_data))
+                        #         dy = np.abs(np.diff(y_data))
+                        #         distance = np.sqrt(dx**2 + dy**2)
+                        #         # Define a threshold for detecting jumps (this may need to be adjusted)
+                        #         jump_threshold = 200  # pixels
+
+                        #         # find jump points (where distance deviate largely from its neighbors)
+                        #         k = 5
+                        #         jump_frames = []
+
+                        #         for i in range(len(x_data)):
+                        #             left = max(0, i-k)
+                        #             right = min(len(x_data), i+k+1)
+                        #             neigh_x = np.delete(x_data[left:right], i-left)
+                        #             neigh_y = np.delete(y_data[left:right], i-left)
+
+                        #             med_x = np.median(neigh_x)
+                        #             med_y = np.median(neigh_y)
+
+                        #             dist = np.sqrt((x_data[i] - med_x)**2 + (y_data[i] - med_y)**2)
+                        #             if dist > jump_threshold:
+                        #                 jump_frames.append(i)  # +1 to correct index after diff
+
+                        #         # Correct jumps by interpolation with forward and backward 5 frames that did not jump
+                        #         interp_window = 5
+                        #         for jf in jump_frames:
+                        #             before = []
+                        #             after = []
+                        #             before_i = jf-1
+                        #             while before_i >= 0 and len(before) < interp_window:
+                        #                 if before_i not in jump_frames:
+                        #                     before.append(before_i)
+                        #                 before_i -= 1
+                        #             after_i = jf+1
+                        #             while after_i < len(x_data) and len(after) < interp_window:
+                        #                 if after_i not in jump_frames:
+                        #                     after.append(after_i)
+                        #                 after_i += 1
+                        #             valid_idx = before[::-1] + after 
+                        #             xi = np.array(valid_idx)
+                        #             yi_x = x_data[xi]
+                        #             yi_y = y_data[xi]
+                        #             yi_p = p_data[xi]
+                        #             # interpolate at frame jf
+                        #             x_data[jf] = np.interp(jf, xi, yi_x)
+                        #             y_data[jf] = np.interp(jf, xi, yi_y)
+                        #             p_data[jf] = np.interp(jf, xi, yi_p)
+
+                        #         # set a new matrix to save interpolated data
+                        #         corrected_data[bp] = {'x': x_data, 'y': y_data, 'p': p_data}
+
+                        #         # save the corrected_data to a new csv file
+
+                        #         # load the original csv to get the header
+                        #         orig_df = pd.read_csv(orig_DLC, header=[0,1,2], index_col=0)
+                        #         corrected_df = pd.DataFrame(index=orig_df.index, columns=orig_df.columns)
+                        #         scorer = orig_df.columns.levels[0][0]
+                        #         for bp in kp_list:
+                        #             corrected_df[(scorer, bp, 'x')] = corrected_data[bp]['x']
+                        #             corrected_df[(scorer, bp, 'y')] = corrected_data[bp]['y']
+                        #             corrected_df[(scorer, bp, 'likelihood')] = corrected_data[bp]['p']
+                        #         corrected_df.to_csv(corr_DLC)
+
+                else:
+                    # load the data in savedataname
+                    saveData = pd.read_csv(savedataname)
+                    self.data_index['DLC_obj'][ss].data['rodSpeed_smoothed'] = np.array(saveData['smoothed'])
+                    self.data_index['DLC_obj'][ss].data['rodStart'] = np.array(saveData['Start'])
+                    self.data_index['DLC_obj'][ss].data['rodRun'] = np.array(saveData['Run'])   
+
+                if self.data_index['DLC'][ss] is not None:
+                    tempData = self.data_index['DLC_obj'][ss].data
+                    ave_left_rod_back = np.array([np.mean(np.array(tempData['rod_left_back']['x'])[np.array(tempData['rod_left_back']['p'])>0.95]),
+                                    np.mean(np.array(tempData['rod_left_back']['y'])[np.array(tempData['rod_left_back']['p'])>0.95])])
+                    ave_right_rod_back = np.array([np.mean(np.array(tempData['rod_right_back']['x'])[np.array(tempData['rod_right_back']['p'])>0.95]),
+                                    np.mean(np.array(tempData['rod_right_back']['y'])[np.array(tempData['rod_right_back']['p'])>0.95])])
+                    ave_center_rod_back = (ave_left_rod_back+ave_right_rod_back)/2
+                    self.data_index['DLC_obj'][ss].data['left_rod_back'] = ave_left_rod_back
+                    self.data_index['DLC_obj'][ss].data['right_rod_back'] = ave_right_rod_back
+                    self.data_index['DLC_obj'][ss].data['center_rod_back'] = ave_center_rod_back
+
+                    ave_left_rod_front = np.array([np.mean(np.array(tempData['rod_left_front']['x'])[np.array(tempData['rod_left_front']['p'])>0.95]),
+                                    np.mean(np.array(tempData['rod_left_front']['y'])[np.array(tempData['rod_left_front']['p'])>0.95])])
+                    ave_right_rod_front = np.array([np.mean(np.array(tempData['rod_right_front']['x'])[np.array(tempData['rod_right_front']['p'])>0.95]),
+                                    np.mean(np.array(tempData['rod_right_front']['y'])[np.array(tempData['rod_right_front']['p'])>0.95])])
+                    ave_center_rod_front = (ave_left_rod_front+ave_right_rod_front)/2
+
+                    self.data_index['DLC_obj'][ss].data['left_rod_front'] = ave_left_rod_front
+                    self.data_index['DLC_obj'][ss].data['right_rod_front'] = ave_right_rod_front
+                    self.data_index['DLC_obj'][ss].data['center_rod_front'] = ave_center_rod_front
+
+                    # estimations on the left of 'right_rod_back' is in back area
+                    # on the right of 'right rod front' is in front area
+                    # plot a 1/0 mask to show each keypoints where they belong
+                    kp_list = tempData['bodyparts']
+                    viewMask = np.zeros((len(kp_list), len(tempData['rod_right_back']['x'])))
+                    # 1 for back 0 for front
+                    for idx,kp in enumerate(kp_list):
+                    # on the left of
+                        viewMask[idx,:] = np.array(tempData[kp]['x']) < ave_right_rod_back[0]
+
+                    # plot frame with keypoints
+                    # frame_num = 6180
+                    # curr_frame = read_video(self.data['DLC_obj'][ss].videoPath, frame_num, ifgray=False)
+                    # plt.figure()
+                    # plt.imshow(curr_frame)
+                    # cmap = cm.get_cmap('viridis', len(kp_list))
+                    # for kp in kp_list:
+                    #     plt.scatter(tempData[kp]['x'][frame_num], tempData[kp]['y'][frame_num], c=cmap(kp_list.index(kp)), s=200,label = kp)
+                    #
+                    # plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+
+                    # plot number of back/front keypoints that is actually in back/front view
+                    back_kp = ['spine 3', 'tail 1', 'tail 2', 'tail 3', 'left foot', 'right foot']
+                    front_kp = ['spine 1', 'left ear', 'right ear', 'nose', 'left hand', 'right hand']
+                    viewNumber = np.zeros((3, len(tempData['rod_right_back']['x'])))
+                    for kp in kp_list:
+                        if kp in back_kp:
+                            viewNumber[0,:] = viewNumber[0,:] + viewMask[kp_list.index(kp),:]
+                        elif kp in front_kp:
+                            viewNumber[1,:] = viewNumber[1,:] + 1-viewMask[kp_list.index(kp),:]
+                    viewNumber[2,:] = (viewNumber[0,:] + viewNumber[1,:])/(len(back_kp)+len(front_kp))
+
+                    # plot number of back/front keypoints that is actually in back/front view
+                    # need to set some threshold to identify when the animal turn around
+                    # consistently smaller 50% for longer than 3 seconds?
+                    p_thresh = 0.6
+                    min_duration = 1 # seconds
+                    below_threshold = viewNumber[2,:] < p_thresh
+
+                    # Initialize start and end indices list
+                    segments = []
+                    start_idx = None
+
+                    for i in range(len(viewNumber[2,:])):
+                        if below_threshold[i]:
+                            # Start of a new segment
+                            if start_idx is None:
+                                start_idx = i
+                        else:
+                            # End of a segment
+                            if start_idx is not None:
+                                # Calculate segment duration
+                                duration = tempData['time'][i - 1] - tempData['time'][start_idx]
+                                if duration >= min_duration:
+                                    segments.append((start_idx, i - 1))
+                                start_idx = None
+
+                    # Check if the last segment meets the minimum duration
+                    if start_idx is not None:
+                        duration = tempData['time'][-1] - tempData['time'][start_idx]
+                        if duration >= min_duration:
+                            segments.append((start_idx, len(viewNumber[2,:]) - 1))
+
+                    saveFolder = os.path.join(self.analysis, 'TurnAround')
+                    if not os.path.exists(saveFolder):
+                        os.makedirs(saveFolder)
+                    savepath = os.path.join(saveFolder,
+                                'turning period_' + self.data_index['Animal'][ss] + '_Trial ' + str(self.data_index['Trial'][ss]) + '.png')
+
+                    if not os.path.exists(savepath):
+
+                        fig, ax = plt.subplots(3,1, figsize=(16, 8),
+                                            gridspec_kw={'height_ratios': [3, 1, 1]})  # Adjust figure size for visibility
+                        ax[0].imshow(viewMask, cmap='gray', aspect='auto', interpolation='none')
+                        ax[0].set_yticks(ticks=np.arange(len(kp_list)), labels=kp_list)
+                        #x_tick_interval = 50
+                        #x_positions = np.where((tempData['time'] % x_tick_interval) < (x_tick_interval / len(tempData['time'])))[0]
+                        #x_labels = [f"{int(tempData['time'][idx])}" for idx in x_positions]
+                        #ax[0].set_xticks(ticks=x_positions, label                   ax[1].plot(tempData['time'], viewNumber[0,:],linewidth=1)
+                        ax[1].plot(tempData['time'], viewNumber[1,:],linewidth=1)
+                        ax[1].plot(tempData['time'], viewNumber[2,:],linewidth=1)
+                        for tt in segments:
+                            ax[1].axvspan(tempData['time'][tt[0]], tempData['time'][tt[1]], color='red', alpha=1)
+
+                        ax[2].plot(tempData['rodT'],saveData['smoothed'])
+                        # save the figure
+                        fig.savefig(savepath, dpi=300, bbox_inches='tight')
+                        plt.close()
+
+                    self.data_index['DLC_obj'][ss].data['turning_period'] = segments
+                    self.data_index['DLC_obj'][ss].data['turning_mask'] = np.full((len(self.data_index['DLC_obj'][ss].data['time'])), 1)
+                    for seg in segments:
+                        self.data_index['DLC_obj'][ss].data['turning_mask'][seg[0]:seg[1]+1] = 0
+
 
     def align_with_calcium(self, calcium_timestamps):
         # Align rotarod behavior timestamps with calcium imaging timestamps
         pass
 
-    def get_stride(self):        
-        savedatapath = os.path.join(self.analysis, 'stride_freq.csv')
-        runFile = os.path.join(self.analysis, 'notExist.csv') # a not existing file to allow re-calculating
-        if not os.path.exists(runFile):
-
-            savefigpath = os.path.join(self.analysis)
-            if not os.path.exists(savefigpath):
-                os.makedirs(savefigpath)
-
-            # get rid the the turning period
-            
-            # %% define rod plane first
-            # load reference point
-            ave_left_rod_back = self.data['left_rod_back']
-            ave_right_rod_back = self.data['right_rod_back']
-            ave_center_rod_back = self.data['center_rod_back']
-            ave_left_rod_front = self.data['left_rod_front']
-            ave_right_rod_front = self.data['right_rod_front']
-            ave_center_rod_front = self.data['center_rod_front']
-
-            ref_plot = os.path.join(savefigpath, 'Rod coordinate.png')
-            if not os.path.exists(ref_plot):
-                frame = read_video(self.videoPath, 0, ifgray=False)
-                # overlay the video frame?
-                plt.figure()
-                plt.imshow(frame)
-                plt.scatter(self.data['rod_left_back']['x'], self.data['rod_left_back']['y'],
-                            c=self.data['rod_left_back']['p'], cmap='viridis', s=100)
-
-                # Add color bar to show the scale of likelihood
-                plt.colorbar(label='Confidence')
-
-                plt.scatter(self.data['rod_right_back']['x'], self.data['rod_right_back']['y'],
-                            c=self.data['rod_right_back']['p'], cmap='viridis', s=100)
-
-                plt.scatter(self.data['rod_left_front']['x'], self.data['rod_left_front']['y'],
-                            c=self.data['rod_left_front']['p'], cmap='viridis', s=100)
-
-                # Add color bar to show the scale of likelihood
-
-                plt.scatter(self.data['rod_right_front']['x'], self.data['rod_right_front']['y'],
-                            c=self.data['rod_right_front']['p'], cmap='viridis', s=100)
-
-                # get average from keypoints with confidence higher than 95
-
-
-                plt.scatter(ave_left_rod_back[0],ave_left_rod_back[1], s=500)
-                plt.scatter(ave_right_rod_back[0], ave_right_rod_back[1], s=500)
-                plt.scatter(ave_center_rod_back[0], ave_center_rod_back[1], s=500)
-
-                plt.scatter(ave_left_rod_front[0],ave_left_rod_front[1], s=500)
-                plt.scatter(ave_right_rod_front[0], ave_right_rod_front[1], s=500)
-                plt.scatter(ave_center_rod_front[0], ave_center_rod_front[1], s=500)
-
-                plt.savefig(os.path.join(savefigpath, 'rod_plane.png'))
-                plt.close()
-            # save the figure
-
-            # %% examine the body parts in back view and front view
-
-            # find behavior time (from rod start turning to fall)
-            startTime= self.data['rodT'][self.data['rodSpeed_smoothed']>0][0]
-            if np.isnan(self.data['rodStart'][0]):
-                self.data['rodStart'][0] = 0
-            endTime = startTime+df_entry['TimeOnRod'] + self.data['rodRun'][0] - self.data['rodStart'][0] # need the time stay on rod
-
-            timeMaskDLC = np.logical_and(self.data['time']>=startTime, self.data['time']<= endTime)
-            timeMaskRod = np.logical_and(self.data['rodT']>=startTime, self.data['rodT']<= endTime)
-            nFramesInclude = np.sum(timeMaskDLC)
-            time_include = self.data['time'][timeMaskDLC]
-            kp_list = ['left hand', 'right hand', 'left foot', 'right foot']
-            self.stride = np.full((nFramesInclude, len(kp_list)), np.nan)
-
-            #dataMask = np.logical_and(timeMask, p_mask)
-            #self.notnanChunks = {}  # save the indices of not nan chunks in the stride for later filtering
-            for idx,kp in enumerate(kp_list):
-                if 'hand' in kp:
-                    self.stride[:,idx] = np.sqrt((np.array(self.data[kp]['x'])[timeMaskDLC]-ave_center_rod_front[0])**2 +
-                                            (np.array(self.data[kp]['y'])[timeMaskDLC]-ave_center_rod_front[1])**2)
-                elif 'foot' in kp:
-                    self.stride[:,idx] = np.sqrt((np.array(self.data[kp]['x'])[timeMaskDLC]-ave_center_rod_back[0])**2 +
-                                            (np.array(self.data[kp]['y'])[timeMaskDLC]-ave_center_rod_back[1])**2)
-
-            # try calculate the stride using distance from the rod (a horizontal line)
-            self.stride_rod = np.full((nFramesInclude, len(kp_list)), np.nan)
-
-            #dataMask = np.logical_and(timeMask, p_mask)
-            #self.notnanChunks = {}  # save the indices of not nan chunks in the stride for later filtering
-            for idx,kp in enumerate(kp_list):
-                if 'hand' in kp:
-                    self.stride_rod[:,idx] = distance_points_to_line(np.array(self.data[kp]['x'])[timeMaskDLC],
-                                                                    np.array(self.data[kp]['y'])[timeMaskDLC],
-                                                                    ave_left_rod_front, ave_right_rod_front)
-                elif 'foot' in kp:
-                    self.stride_rod[:,idx] = distance_points_to_line(np.array(self.data[kp]['x'])[timeMaskDLC],
-                                                                    np.array(self.data[kp]['y'])[timeMaskDLC],
-                                                                    ave_right_rod_back, ave_left_rod_back)
-
-            #tempMask = ~p_mask[timeMask]
-            #    self.stride[tempMask,idx] = np.nan
-            #    tempStride, tempIdx = fill_nans_and_split(self.stride[:, idx])
-                # interpolate the nans
-                # self.notnanChunks[kp] = tempIdx
-                # for ich, chunk in enumerate(tempIdx):
-                #     self.stride[chunk[0]:chunk[1]+1,idx] = tempStride[ich]
-
-
-            # low-pass filter the data
-            fps = 50
-            self.t_interp = np.arange(time_include[0], time_include[-1] + 1 / fps, 1 / fps)
-            self.filtered_stride = np.full((len(self.t_interp), len(kp_list)), np.nan)
-            self.interp_stride = np.full((len(self.t_interp), len(kp_list)), np.nan)
-
-            # need to determine the cutoff frequency here
-            for idx, kp in enumerate(kp_list):
-                #for ich, chunk in enumerate(self.notnanChunks[kp]):
-                #    if chunk[1]-chunk[0]+1 > 18:  # padlen
-                # interpolate the data first. Original data were recorded with unstable fps. (around 50)
-                self.interp_stride[:,idx] = np.interp(self.t_interp, time_include, self.stride_rod[:,idx])
-
-                self.filtered_stride[:,idx] = butter_lowpass_filter(self.interp_stride[:,idx], 5,fps,order=5)
-
-            #%%
-            # examine the autocorrelation
-            # average them over genotype and trial
-            # find the time when rod speed reach 5/10
-            #if df_entry['Trial']<=6:
-            startSpeed = 5
-            #else:
-            #    startSpeed = 10
-            startTime_auto = self.data['rodT'][self.data['rodSpeed_smoothed']>startSpeed][0]
-            fig, ax = plt.subplots(2, 2, figsize=(10, 8))  # 2x2 grid for 4 subplots
-            ax = ax.flatten()
-            for ss in range(len(kp_list)):
-                signal = pd.Series(self.filtered_stride[self.t_interp>startTime_auto,ss])
-                autocorr_values = [signal.autocorr(lag=i) for i in range(len(signal)//2)]
-
-                plot_time = 10
-                # Subplot 1 (First row, spanning two columns)
-                ax[ss].plot(np.arange(len(autocorr_values))/fps, autocorr_values, linewidth=0.5)
-                ax[ss].plot(np.arange(len(autocorr_values))/fps, np.zeros(len(autocorr_values)),c='r', linewidth=2)
-                #ax[ss].stem(range(len(autocorr_values)), autocorr_values,linefmt='b-', basefmt=" ", use_line_collection=True)
-                ax[ss].set_title('Autocorrelation of ' + kp_list[ss])
-
-                if ss==0:
-                    # save autocorrelation value and lags in dataframe
-                    autocorr_df = pd.DataFrame({'lags': np.arange(len(autocorr_values))/fps})
-                autocorr_df[kp_list[ss]] = autocorr_values
-
-            plt.tight_layout()  # Adjust subplot parameters to give specified padding
-            plt.savefig(os.path.join(self.analysis, 'Stride autocorrelation.png'), dpi=300)  # Save as PNG fil
-            # save autocorrelation
-            autocorr_df.to_csv(os.path.join(self.analysis, 'Stride autocorrelation.csv'))
-            plt.close()
-
-            #%%
-            # instantaneous frequency with hilbert transform
-
-            # Compute the analytic signal
-            #
-            # analytic_signal = hilbert(self.interp_stride[:,2])
-            # instantaneous_phase = np.unwrap(np.angle(analytic_signal))
-            # instantaneous_frequency = np.diff(instantaneous_phase) / (2.0 * np.pi * (1 / fps))
-
-
-            # Plot spectrogram
-
-            # %% short time fourier transform
-            # from scipy.signal import stft
-            # frequencies, times, Zxx = stft(self.filtered_stride[:,3], fs=50, nperseg=256)
-            # plt.pcolormesh(times, frequencies, np.abs(Zxx), shading='gouraud')
-            # plt.colorbar(label='Magnitude')
-            # plt.ylabel('Frequency [Hz]')
-            # plt.xlabel('Time [s]')
-            # plt.title('STFT Magnitude')
-
-            #%% pearson correlation between limbs
-            # phase lag?
-            # generate some plots
-            pcorr = pd.DataFrame({'time': self.t_interp})
-            corr_group = [['left hand','right hand'], ['left foot', 'right foot'],
-                           ['left hand', 'left foot'], ['right hand', 'right foot']]
-            corr_Idx = [[0,1], [2,3], [0,2], [1,3]]
-            # xcorr between hands/feet/left/right
-            timeStep = 2 # in second
-            for kp_pairs,kp_idx in zip(corr_group,corr_Idx):
-                corrCoeff_running = np.zeros((len(self.t_interp)))
-                for idx,t in enumerate(self.t_interp):
-                    tMask = np.logical_and(self.t_interp>t, self.t_interp <t+timeStep)
-                    corrCoeff_running[idx] = np.corrcoef(self.filtered_stride[tMask,kp_idx[0]],
-                                                             self.filtered_stride[tMask,kp_idx[1]])[0,1]
-                pcorr[kp_pairs[0]+'-'+kp_pairs[1]] = corrCoeff_running
-            
-            # cross correlation
-            max_lag_sec = 1.0  # maximum lag to compute (in seconds)
-            dt = self.t_interp[1] - self.t_interp[0]  # time step of your signal
-            max_lag_samples = int(max_lag_sec / dt)
-
-            # Store results
-            max_xcorr = pd.DataFrame({'time': self.t_interp})
-            max_lag = pd.DataFrame({'time': self.t_interp})
-
-            for kp_pairs, kp_idx in zip(corr_group, corr_Idx):
-                # Each element will be a 2D array: shape (len(t_interp), 2*max_lag_samples+1)
-                # Arrays for max correlation and lag at each time point
-                corr_max = np.full(len(self.t_interp), np.nan)
-                lag_at_max = np.full(len(self.t_interp), np.nan)
-
-                lags = np.arange(-max_lag_samples, max_lag_samples + 1) * dt
-
-                for idx, t in enumerate(self.t_interp):
-                    # 2-second window mask
-                    tMask = (self.t_interp > t) & (self.t_interp < t + timeStep)
-                    x = self.filtered_stride[tMask, kp_idx[0]]
-                    y = self.filtered_stride[tMask, kp_idx[1]]
-
-                    if len(x) < 2 or len(y) < 2:
-                        continue
-
-                    # Normalize signals
-                    x = x - np.mean(x)
-                    y = y - np.mean(y)
-
-                    # Compute normalized cross-correlation
-                    c = correlate(y, x, mode='full')
-                    c = c / (np.std(x) * np.std(y) * len(x))
-
-                    # Center index
-                    mid = len(c) // 2
-                    c_window = c[mid - max_lag_samples: mid + max_lag_samples + 1]
-
-                    # Find max correlation and corresponding lag
-                    max_idx = np.nanargmax(c_window)
-                    corr_max[idx] = c_window[max_idx]
-                    lag_at_max[idx] = lags[max_idx]
-                
-                max_xcorr[kp_pairs[0]+'-'+kp_pairs[1]] = corr_max
-                max_lag[kp_pairs[0]+'-'+kp_pairs[1]] = lag_at_max
-
-            #save cross correlation results
-            pcorr_renamed = pcorr.copy()
-            pcorr_renamed.columns = ['time'] + [col + '_pearson' for col in pcorr.columns[1:]]
-
-            max_xcorr_renamed = max_xcorr.copy()
-            max_xcorr_renamed.columns = ['time'] + [col + '_maxxcorr' for col in max_xcorr.columns[1:]]
-
-            max_lag_renamed = max_lag.copy()
-            max_lag_renamed.columns = ['time'] + [col + '_lag' for col in max_lag.columns[1:]]
-
-            # 2. Merge all DataFrames on 'time'
-            combined_df = pcorr_renamed.merge(max_xcorr_renamed, on='time').merge(max_lag_renamed, on='time')
-
-            # 3. Save to CSV
-            combined_df.to_csv(os.path.join(self.analysis, 'Stride correlation.csv'), index=False)
-
-            # make a plot to show pearson correlation and cross correlation and max lag
-            fig,ax = plt.subplots(4, 1, figsize=(16, 10))
-            # Subplot 1 (First row, spanning two columns)
-            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
-            for start_idx, end_idx in self.data['turning_period']:
-                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
-                    color='grey', alpha=0.3)
-            ax[0].set_title('Rod speed')
-            ax[0].set_ylabel('Rod speed (RPM)')
-            ax[0].tick_params(axis='x', which='both', labelbottom=False)
-            #ax[0].plot(self.t_interp , self.filtered_stride[:,1])
-            #ax[0].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            
-            # plot pearson correlation of hands and foot
-            ax[1].plot(self.t_interp, pcorr['left hand-right hand'], label= 'Hands')
-            ax[1].plot(self.t_interp, pcorr['left foot-right foot'], label = 'Feet')
-            #ax[1].legend(loc='upper left', bbox_to_anchor=(1, 1))
-            ax[1].set_title('Pearson correlation coefficient')
-            ax[1].tick_params(axis='x', which='both', labelbottom=False)
-
-            # plot cross correlation 
-            ax[2].plot(self.t_interp, max_xcorr['left hand-right hand'], label= 'Hands')
-            ax[2].plot(self.t_interp, max_xcorr['left foot-right foot'], label = 'Feet')
-            ax[2].tick_params(axis='x', which='both', labelbottom=False)
-            ax[2].set_title('Max cross correlation coefficient')
-            #ax[2].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            # plot max lag
-            ax[3].plot(self.t_interp, max_lag['left hand-right hand'], label= 'Hands')
-            ax[3].plot(self.t_interp, max_lag['left foot-right foot'], label = 'Feet')
-            ax[3].set_title('Max lag (s)')
-            ax[3].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            for a in ax:  # ax is a list/array of subplots
-                a.spines['top'].set_visible(False)
-                a.spines['right'].set_visible(False)
-
-            plt.savefig(os.path.join(self.analysis,'Stride correlation - HF.png'), dpi=300)  # Save as PNG fil
-            #plt.show()
-            plt.close()
-
-            # same plot to show left and right
-            fig,ax = plt.subplots(4, 1, figsize=(16, 10))
-            # Subplot 1 (First row, spanning two columns)
-            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
-            for start_idx, end_idx in self.data['turning_period']:
-                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
-                    color='grey', alpha=0.3)
-            ax[0].set_title('Rod speed')
-            ax[0].set_ylabel('Rod speed (RPM)')
-            ax[0].tick_params(axis='x', which='both', labelbottom=False)
-            #ax[0].plot(self.t_interp , self.filtered_stride[:,1])
-            #ax[0].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            
-            # plot pearson correlation of hands and foot
-            ax[1].plot(self.t_interp, pcorr['left hand-left foot'], label= 'Left')
-            ax[1].plot(self.t_interp, pcorr['right hand-right foot'], label = 'Right')
-            #ax[1].legend(loc='upper left', bbox_to_anchor=(1, 1))
-            ax[1].set_title('Pearson correlation coefficient')
-            ax[1].tick_params(axis='x', which='both', labelbottom=False)
-
-            # plot cross correlation 
-            ax[2].plot(self.t_interp, max_xcorr['left hand-left foot'], label= 'LEft')
-            ax[2].plot(self.t_interp, max_xcorr['right hand-right foot'], label = 'Right')
-            ax[2].tick_params(axis='x', which='both', labelbottom=False)
-            ax[2].set_title('Max cross correlation coefficient')
-            #ax[2].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            # plot max lag
-            ax[3].plot(self.t_interp, max_lag['left hand-left foot'], label= 'Hands')
-            ax[3].plot(self.t_interp, max_lag['right hand-right foot'], label = 'Feet')
-            ax[3].set_title('Max lag (s)')
-            ax[3].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            for a in ax:  # ax is a list/array of subplots
-                a.spines['top'].set_visible(False)
-                a.spines['right'].set_visible(False)
-
-            plt.savefig(os.path.join(self.analysis,'Stride correlation - LR.png'), dpi=300)  # Save as PNG fil
-            #plt.show()
-            plt.close()
-
-            #%% calculate hand/foot step amplitude and frequency based on peak detection
-            self.stride_amp = []
-            self.stride_time = []
-            self.stride_freq = np.full(self.filtered_stride.shape, np.nan)
-
-            time = self.t_interp
-            for ll in range(4): # step size and amplitude of 4 limbs
-            # Detect peaks (foot lifts)
-            
-                distance = self.filtered_stride[:,ll]
-                peaks, props = find_peaks(distance, prominence=2, distance=None)
-
-                # Estimate baseline before each step using local minima
-                inv_distance = -distance
-                troughs, _ = find_peaks(inv_distance, prominence=2 / 2, distance=None)
-
-                step_amplitudes = []
-                step_times = []
-
-                for peak in peaks:
-                    # Find the closest following trough (baseline)
-                    next_troughs = troughs[troughs > peak]
-                    if len(next_troughs) == 0:
-                        continue
-                    baseline_idx = next_troughs[0]
-                    amplitude = distance[peak] - distance[baseline_idx]
-                    step_amplitudes.append(amplitude)
-                    step_times.append(time[peak])
-
-                step_amplitudes = np.array(step_amplitudes)
-                step_times = np.array(step_times)
-
-                self.stride_amp.append(step_amplitudes)
-                self.stride_time.append(step_times)
-
-
-                # Compute step frequency (Hz) in running 2 second window
-                window = 2
-                freqs = np.full(len(time), np.nan)  # preallocate
-
-                for i, t in enumerate(time):
-                    # count steps within [t - window/2, t + window/2]
-                    mask = (step_times >= t - window/2) & (step_times <= t + window/2)
-                    steps_in_window = step_times[mask]
-
-                    if len(steps_in_window) >= 1:
-                        intervals = np.diff(steps_in_window)
-                        freqs[i] = 1 / np.mean(intervals)
-                    else:
-                        freqs[i] = np.nan
-
-                self.stride_freq[:,ll] = freqs
-
-
-            fig,ax = plt.subplots(5, 1, figsize=(16, 16))
-            # rod speed
-            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
-            for start_idx, end_idx in self.data['turning_period']:
-                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
-                    color='grey', alpha=0.3)
-            ax[0].set_title('Rod speed')
-            ax[0].set_ylabel('Rod speed (RPM)')
-            ax[0].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 2, stride of hand
-            ax[1].plot(self.t_interp, self.filtered_stride[:,0])
-            ax[1].plot(self.t_interp , self.filtered_stride[:,1])
-            ax[1].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[1].set_title('Distance between left/right hand and the rod')
-            ax[1].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 3 foot
-            ax[2].plot(self.t_interp, self.filtered_stride[:,2])
-            ax[2].plot(self.t_interp, self.filtered_stride[:,3])
-            ax[2].legend(['left foot', 'right foot'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[2].set_title('Distance between left/right foot and the rod')
-            ax[2].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 4 hand amplitude
-            ax[3].stem(self.stride_time[0], self.stride_amp[0], linefmt='C0-',  basefmt=" ", label='left hand')
-            ax[3].stem(self.stride_time[1], self.stride_amp[1],linefmt='C1-',  basefmt=" ",label='right hand')
-            ax[3].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[3].set_title('Hand step amplitude')
-            ax[3].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 4 (Third row, first column)
-            ax[4].stem(self.stride_time[2], self.stride_amp[2], linefmt='C0-',  basefmt=" ", label='left foot')
-            ax[4].stem(self.stride_time[3], self.stride_amp[3], linefmt='C1-',  basefmt=" ", label='right foot')
-            ax[4].legend(['left foot', 'right foot'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[4].set_title('Foot step amplitude')
-
-            for a in ax:  # ax is a list/array of subplots
-                a.spines['top'].set_visible(False)
-                a.spines['right'].set_visible(False)
-            
-            plt.tight_layout()  # Adjust subplot parameters to give specified padding
-            plt.savefig(os.path.join(self.analysis,'Stride amplitude.png'), dpi=300)  # Save as PNG fil
-            #plt.show()
-            plt.close()
-
-            data = {'left hand': self.filtered_stride[:,0],
-                    'right hand': self.filtered_stride[:,1],
-                    'left foot': self.filtered_stride[:, 2],
-                    'right foot': self.filtered_stride[:, 3],
-                    'stride amplitude': self.stride_amp,
-                    'stride time': self.stride_time,
-                    'stride frequency': self.stride_freq,
-                    'time': self.t_interp}
-            #dataDF = pd.DataFrame(data)
-            #dataDF.to_csv(savedatapath)
-            # save to pickle file
-            with open( os.path.join(self.analysis, 'stride_freq.pickle'), 'wb') as f:
-                pickle.dump(data, f)
-
-            #%%
-            # cumulative area under the curve
-            # cum_xcorr_foot = np.cumsum(xcorr['left foot-right foot'])/fps
-            # cum_xcorr_hand = np.cumsum(xcorr['left hand-right hand']) / fps
-            # cum_xcorr_left = np.cumsum(xcorr['left hand-left foot'])/fps
-            # cum_xcorr_right = np.cumsum(xcorr['right hand-right foot']) / fps
-            # plt.figure()
-            # plt.plot(self.t_interp, cum_xcorr_foot)
-            # plt.plot(self.t_interp, cum_xcorr_hand)
-            # plt.plot(self.t_interp, cum_xcorr_left)
-            # plt.plot(self.t_interp, cum_xcorr_right)
-            # plt.plot(self.data['rodT'][timeMaskRod], self.data['rodSpeed_smoothed'][timeMaskRod])
-            # plt.xlabel('time')
-            # plt.ylabel('Cumulative area under the curve of xcorr')
-            # plt.legend(['feet','hands','left','right', 'Rod speed'])
-            # plt.savefig(os.path.join(self.analysis,'Stride correlation.png'), dpi=300)  # Save as PNG fil
-            # #plt.show()
-            # plt.close()
-            # # cross correlation in 10 second window
-
-            # # save data in csv
-            # xcorr.to_csv(os.path.join(self.analysis, 'Stride crosscorrelation.csv'))
-
-            #
-            #%% tail angle
-            # calculate spine 3 - tail 1 - tail 2 angle
-            A = np.array([self.data['spine 3']['x'], self.data['spine 3']['y']]).T
-            B = np.array([self.data['tail 1']['x'], self.data['tail 1']['y']]).T
-            C = np.array([self.data['tail 2']['x'], self.data['tail 2']['y']]).T
-
-            A = A[timeMaskDLC,:]
-            B = B[timeMaskDLC,:]
-            C = C[timeMaskDLC,:]
-            # Calculate vectors AB and BC
-            AB = B - A
-            BC = C - B
-
-            # Calculate the angle between AB and BC
-            # Calculate dot and cross products for each time point
-            dot_product = np.sum(AB * BC, axis=1)  # Dot product for each row (time point)
-            cross_product = AB[:, 0] * BC[:, 1] - AB[:, 1] * BC[:, 0]  # Cross product for each time point
-
-            # Calculate the angle at each time point
-            angles = np.arctan2(cross_product, dot_product)
-
-            # Convert to degrees
-            angles = np.degrees(angles)
-
-            # interpolate and filter the angle
-            fps = 50
-            self.filtered_angle = np.full((len(self.t_interp)), np.nan)
-            self.interp_angle = np.full((len(self.t_interp)), np.nan)
-
-            # need to determine the cutoff frequency here
-
-                # interpolate the data first. Original data were recorded with unstable fps. (around 50)
-            self.interp_angle= np.interp(self.t_interp, time_include, angles)
-
-            self.filtered_angle = butter_lowpass_filter(self.interp_angle, 5,fps,order=5)
-
-
-            # save data in csv
-            tail_angle= pd.DataFrame({'angle':self.filtered_angle, 'time':self.t_interp})
-            tail_angle.to_csv(os.path.join(self.analysis, 'Tail angle.csv'))
-            # Calculate the angle in radians using atan2 for correct sign
-
-            # plot the video frame with keypoint estimatino
-            # frame_num = 7760
-            # curr_frame = read_video(self.videoPath, frame_num, ifgray=False)
-            # plt.figure()
-            # plt.imshow(curr_frame)
-            # kp_plot = ['tail 2']
-            # for kp in kp_plot:
-            #     plt.scatter(self.data[kp]['x'][frame_num], self.data[kp]['y'][frame_num], s=20)
-
-            #%% head angle
-
-            #%% tail position
-            # plot the density distribution of the tail
-            # set coordinate of tail 1 to be (0, 0)
-            # ego_tail = {}
-            # tail_key = ['tail 1', 'tail 2', 'tail 3']
-            # for t in tail_key:
-            #     ego_tail[t] = {}
-            #     ego_tail[t]['x']= np.array(self.data[t]['x'])-np.array(self.data['tail 1']['x'])
-            #     ego_tail[t]['y'] = np.array(self.data[t]['y']) - np.array(self.data['tail 1']['y'])
-            #
-            # plt.figure(figsize=(12, 6))
-            # # Density plot for aligned b coordinates
-            # sns.kdeplot(data=pd.DataFrame(ego_tail['tail 2']), x='x', y='y',
-            #             fill=True, cmap='Blues', alpha=0.5, label='Point B',
-            #             thresh=0.001,  # Avoid clipping at 0
-            #             levels=20,
-            #             norm=LogNorm())
-            # # Density plot for aligned c coordinates
-            # sns.kdeplot(data=pd.DataFrame(ego_tail['tail 3']), x='x', y='y',
-            #             fill=True, cmap='Reds', alpha=0.5, label='Point C',
-            #             thresh=0.001,  # Avoid clipping at 0
-            #             levels=20,
-            #             norm=LogNorm()
-            #             )
-            # plt.axhline(0, color='black', lw=1, ls='--', label='y = 0')
-            # plt.axvline(0, color='black', lw=1, ls='--', label='x = 0')
-            #
-            # plt.title('Density Distribution of Aligned Points B and C')
-            # plt.xlabel('Aligned B X')
-            # plt.ylabel('Aligned B Y / Aligned C Y')
-            # plt.axhline(0, color='black', lw=0.5, ls='--')
-            # plt.axvline(0, color='black', lw=0.5, ls='--')
-            # plt.legend()
-            # plt.grid()
-            # plt.show()
-            # with open(savedatapath, 'wb') as f:
-            #     pickle.dump(self.stride, self. f)
-            # f.close()
-        else:
-            print("Analysis already done")
-            return np.nan
-
-    def stride_session(self):
+    def stride_session(self, front_kp, back_kp):
         #todo: go over each trial and run get_stride for them
-        pass
+        for idx, obj in enumerate(self.data_index['DLC_obj']):
+            # check if DLC exist
+
+            if (self.data_index['DLC'][idx] is not None) and (len(self.data_index['DLC'][idx])>0):
+                obj.get_stride(front_kp, back_kp, self.data_index.iloc[idx])
 
     def stride_summary(self):
                 # things to do:
@@ -1511,14 +1619,14 @@ class BehDataRotarod(BehData):
             stride_freq_running[key] = [[[] for _ in range(nTrials)] for _ in range(self.nSubjects)]
 
         amp_std['perf'] = np.full((self.nSubjects, nTrials),np.nan)
-        genotype = self.GeneBG
+        genotype = self.Genotypes
 
-        for idx, obj in enumerate(self.data['DLC_obj']):
-            animal = self.data['Animal'][idx]
-            trialIdx = self.data['Trial'][idx]-1
-            animalIdx = self.animals.index(animal)
+        for idx, obj in enumerate(self.data_index['DLC_obj']):
+            animal = self.data_index['Animal'][idx]
+            trialIdx = self.data_index['Trial'][idx]-1
+            animalIdx = self.Animals.index(animal)
 
-            if self.data['DLC'][idx] is not None:
+            if (self.data_index['DLC'][idx] is not None) and (obj is not None):
                 #%%  load the Stride_freq
                 stridepickle = os.path.join(obj.analysis,'stride_freq.pickle')
                 with open(stridepickle, 'rb') as handle:
@@ -1548,10 +1656,10 @@ class BehDataRotarod(BehData):
                 for kidx, key in enumerate(bp_keys):
                     amp_std[key][animalIdx, trialIdx] = np.nanstd(truncatedStride['stride amplitude'][kidx])
                 
-                if not self.data['FallByTurning'][np.logical_and(self.data['Animal']==animal,
-                                                 self.data['Trial']==trialIdx+1)].any():
-                    amp_std['perf'][animalIdx, trialIdx] = self.data['TimeOnRod'][np.logical_and(self.data['Animal']==animal,
-                                                                                            self.data['Trial']==trialIdx+1)]
+                if not self.data_index['FallByTurning'][np.logical_and(self.data_index['Animal']==animal,
+                                                 self.data_index['Trial']==trialIdx+1)].any():
+                    amp_std['perf'][animalIdx, trialIdx] = self.data_index['Performance'][np.logical_and(self.data_index['Animal']==animal,
+                                                                                            self.data_index['Trial']==trialIdx+1)].values[0]
                 
                 # calculate running amplitude STD as a function of rod speed
                 rod_time    = np.array(rodSpeed['time'])
@@ -1636,7 +1744,7 @@ class BehDataRotarod(BehData):
                     tEnd = min(stride['time'][len(stride['time'])-1],obj.data['time'][tInterval[1]])
                     nanMask = np.logical_and(correlation['time']>=tStart, correlation['time']<=tEnd)
                     for key in corr_keys:
-                        truncatedCorr[key][nanMask] = np.nan
+                        truncatedCorr.loc[nanMask, key] = np.nan
 
                 # initialize variable in the beginning
                 if idx == 0:
@@ -1746,7 +1854,7 @@ class BehDataRotarod(BehData):
 
             # --- masks ---
             wt_mask = genotype == 'WT'
-            ko_mask = genotype == 'KO'
+            ko_mask = genotype == 'HET'
 
             # --- flatten + remove NaN for correlation ---
             def clean_flatten(mask):
@@ -1812,9 +1920,9 @@ class BehDataRotarod(BehData):
             plt.show()
 
             # save fig in png and svg format
-            savefigpath = os.path.join(self.sumFolder, 'Performance vs ' + key + ' Amplitude SD.png')
+            savefigpath = os.path.join(self.summary, 'Performance vs ' + key + ' Amplitude SD.png')
             plt.savefig(savefigpath, dpi=300)
-            savefigpath = os.path.join(self.sumFolder, 'Performance vs ' + key + ' Amplitude SD.svg')
+            savefigpath = os.path.join(self.summary, 'Performance vs ' + key + ' Amplitude SD.svg')
             plt.savefig(savefigpath, format='svg')
 
         #%% plot running std vs rod speed for different gnotype
@@ -1842,7 +1950,7 @@ class BehDataRotarod(BehData):
                         })
 
             df_long = pd.DataFrame(rows)
-            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'KO'])
+            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'HET'])
 
             # --- Step 0: Drop rows with NaN in relevant columns ---
             df_clean = df_long.dropna(subset=['stride_SD', 'genotype', 'rod_speed', 'trial'])
@@ -1856,22 +1964,22 @@ class BehDataRotarod(BehData):
             def get_p(name):
                 return pvals.get(name, np.nan)
 
-            p_genotype = get_p('genotype[T.KO]')
-            p_genotype_speed = get_p('genotype[T.KO]:rod_speed')
+            p_genotype = get_p('genotype[T.HET]')
+            p_genotype_speed = get_p('genotype[T.HET]:rod_speed')
             p_trial = get_p('trial')
-            p_genotype_trial = get_p('genotype[T.KO]:trial')
+            p_genotype_trial = get_p('genotype[T.HET]:trial')
 
 
             # data_3d: shape (nSubjects, nTrials, nSpeeds)
-            # genotype: list of 'WT' or 'KO', length nSubjects
+            # genotype: list of 'WT' or 'HET', length nSubjects
             # plot_speed: array of speeds
 
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
+            genotypes_unique = ['WT', 'HET']
+            colors = {'WT': 'black', 'HET': 'red'}
 
             plt.figure(figsize=(15, 8))
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
+            genotypes_unique = ['WT', 'HET']
+            colors = {'WT': 'black', 'HET': 'red'}
 
             # 1️⃣ Left plot: rod_speed
             ax1 = plt.subplot(1, 2, 1)
@@ -1923,9 +2031,9 @@ class BehDataRotarod(BehData):
             plt.tight_layout()
             plt.show()
 
-            savefigpath = os.path.join(self.sumFolder, 'Changes of ' + key + ' Amplitude SD.png')
+            savefigpath = os.path.join(self.summary, 'Changes of ' + key + ' Amplitude SD.png')
             plt.savefig(savefigpath, dpi=300)
-            savefigpath = os.path.join(self.sumFolder, 'Changes of  ' + key + ' Amplitude SD.svg')
+            savefigpath = os.path.join(self.summary, 'Changes of  ' + key + ' Amplitude SD.svg')
             plt.savefig(savefigpath, format='svg')
 
         #%% plot average frequency and amplitude vs rod speed
@@ -1951,7 +2059,7 @@ class BehDataRotarod(BehData):
                         })
 
             df_long = pd.DataFrame(rows)
-            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'KO'])
+            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'HET'])
 
             # --- Step 0: Drop rows with NaN in relevant columns ---
             df_clean = df_long.dropna(subset=['stride_SD', 'genotype', 'rod_speed', 'trial'])
@@ -1965,22 +2073,22 @@ class BehDataRotarod(BehData):
             def get_p(name):
                 return pvals.get(name, np.nan)
 
-            p_genotype = get_p('genotype[T.KO]')
-            p_genotype_speed = get_p('genotype[T.KO]:rod_speed')
+            p_genotype = get_p('genotype[T.HET]')
+            p_genotype_speed = get_p('genotype[T.HET]:rod_speed')
             p_trial = get_p('trial')
-            p_genotype_trial = get_p('genotype[T.KO]:trial')
+            p_genotype_trial = get_p('genotype[T.HET]:trial')
 
 
             # data_3d: shape (nSubjects, nTrials, nSpeeds)
-            # genotype: list of 'WT' or 'KO', length nSubjects
+            # genotype: list of 'WT' or 'HET', length nSubjects
             # plot_speed: array of speeds
 
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
+            genotypes_unique = ['WT', 'HET']
+            colors = {'WT': 'black', 'HET': 'red'}
 
             plt.figure(figsize=(15, 8))
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
+            genotypes_unique = ['WT', 'HET']
+            colors = {'WT': 'black', 'HET': 'red'}
 
             # 1️⃣ Left plot: rod_speed
             ax1 = plt.subplot(1, 2, 1)
@@ -2032,9 +2140,9 @@ class BehDataRotarod(BehData):
             plt.tight_layout()
             plt.show()
 
-            savefigpath = os.path.join(self.sumFolder, 'Changes of ' + key + ' Average Amplitude.png')
+            savefigpath = os.path.join(self.summary, 'Changes of ' + key + ' Average Amplitude.png')
             plt.savefig(savefigpath, dpi=300)
-            savefigpath = os.path.join(self.sumFolder, 'Changes of  ' + key + 'Average Amplitude.svg')
+            savefigpath = os.path.join(self.summary, 'Changes of  ' + key + 'Average Amplitude.svg')
             plt.savefig(savefigpath, format='svg')
 
         for key in bp_keys:
@@ -2059,7 +2167,7 @@ class BehDataRotarod(BehData):
                         })
 
             df_long = pd.DataFrame(rows)
-            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'KO'])
+            df_long['genotype'] = pd.Categorical(df_long['genotype'], categories=['WT', 'HET'])
 
             # --- Step 0: Drop rows with NaN in relevant columns ---
             df_clean = df_long.dropna(subset=['stride_SD', 'genotype', 'rod_speed', 'trial'])
@@ -2073,22 +2181,22 @@ class BehDataRotarod(BehData):
             def get_p(name):
                 return pvals.get(name, np.nan)
 
-            p_genotype = get_p('genotype[T.KO]')
-            p_genotype_speed = get_p('genotype[T.KO]:rod_speed')
+            p_genotype = get_p('genotype[T.HET]')
+            p_genotype_speed = get_p('genotype[T.HET]:rod_speed')
             p_trial = get_p('trial')
-            p_genotype_trial = get_p('genotype[T.KO]:trial')
+            p_genotype_trial = get_p('genotype[T.HET]:trial')
 
 
             # data_3d: shape (nSubjects, nTrials, nSpeeds)
-            # genotype: list of 'WT' or 'KO', length nSubjects
+            # genotype: list of 'WT' or 'HET', length nSubjects
             # plot_speed: array of speeds
 
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
+            genotypes_unique = ['WT', 'HET']
+            colors = {'WT': 'black', 'HET': 'red'}
 
             plt.figure(figsize=(15, 8))
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
+            genotypes_unique = ['WT', 'HET']
+            colors = {'WT': 'black', 'HET': 'red'}
 
             # 1️⃣ Left plot: rod_speed
             ax1 = plt.subplot(1, 2, 1)
@@ -2140,9 +2248,9 @@ class BehDataRotarod(BehData):
             plt.tight_layout()
             plt.show()
 
-            savefigpath = os.path.join(self.sumFolder, 'Changes of ' + key + ' Average Frequency.png')
+            savefigpath = os.path.join(self.summary, 'Changes of ' + key + ' Average Frequency.png')
             plt.savefig(savefigpath, dpi=300)
-            savefigpath = os.path.join(self.sumFolder, 'Changes of  ' + key + 'Average Frequency.svg')
+            savefigpath = os.path.join(self.summary, 'Changes of  ' + key + 'Average Frequency.svg')
             plt.savefig(savefigpath, format='svg')
 
         #%% plot average correlation vs rod speed for different genotype
@@ -2192,12 +2300,12 @@ class BehDataRotarod(BehData):
             # genotype: list of 'WT' or 'KO', length nSubjects
             # plot_speed: array of speeds
 
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
+            genotypes_unique = ['WT', 'HET']
+            colors = {'WT': 'black', 'HET': 'red'}
 
             plt.figure(figsize=(15, 8))
-            genotypes_unique = ['WT', 'KO']
-            colors = {'WT': 'black', 'KO': 'red'}
+            genotypes_unique = ['WT', 'HET']
+            colors = {'WT': 'black', 'HET': 'red'}
 
             # 1️⃣ Left plot: rod_speed
             ax1 = plt.subplot(1, 2, 1)
@@ -2249,9 +2357,9 @@ class BehDataRotarod(BehData):
             plt.tight_layout()
             plt.show()
 
-            savefigpath = os.path.join(self.sumFolder, 'Changes of ' + key + '.png')
+            savefigpath = os.path.join(self.summary, 'Changes of ' + key + '.png')
             plt.savefig(savefigpath, dpi=300)
-            savefigpath = os.path.join(self.sumFolder, 'Changes of  ' + key + '.svg')
+            savefigpath = os.path.join(self.summary, 'Changes of  ' + key + '.svg')
             plt.savefig(savefigpath, format='svg')
 
         #%% plot average amplitude/frequency at 5-20 RPM within trial 1-3, 4-6, 7-9, and 10-12
@@ -2541,9 +2649,16 @@ class DLCSession:
         else:
             data['time'] = np.nan
         # load rod speed data
-        rodSpeed = pd.read_csv(self.rodPath, header=None)
-        data['rodSpeed'] = rodSpeed.iloc[:, 0].values
-        data['rodT'] = (rodSpeed.iloc[:, 1].values-self.t_start)/1000
+        # check if rodPath is None
+        if self.rodPath is not None:
+            rodSpeed = pd.read_csv(self.rodPath, header=None)
+            data['rodSpeed'] = rodSpeed.iloc[:, 0].values
+            data['rodT'] = (rodSpeed.iloc[:, 1].values-self.t_start)/1000
+        else:
+            rodSpeed = None
+            data['rodSpeed'] = rodSpeed
+            data['rodT'] = None
+
 
         #%% for estimations with likelihood less than 0.8, replace the value with linear fit
         # based on previous and next value
@@ -2730,12 +2845,33 @@ class DLCSession:
             
             # %% define rod plane first
             # load reference point
-            ave_left_rod_back = self.data['left_rod_back']
-            ave_right_rod_back = self.data['right_rod_back']
-            ave_center_rod_back = self.data['center_rod_back']
-            ave_left_rod_front = self.data['left_rod_front']
-            ave_right_rod_front = self.data['right_rod_front']
-            ave_center_rod_front = self.data['center_rod_front']
+            # calculate the average position
+            tempData = self.data
+            ave_left_rod_back = np.array([np.mean(np.array(tempData['rod_left_back']['x'])[np.array(tempData['rod_left_back']['p'])>0.95]),
+                            np.mean(np.array(tempData['rod_left_back']['y'])[np.array(tempData['rod_left_back']['p'])>0.95])])
+            ave_right_rod_back = np.array([np.mean(np.array(tempData['rod_right_back']['x'])[np.array(tempData['rod_right_back']['p'])>0.95]),
+                            np.mean(np.array(tempData['rod_right_back']['y'])[np.array(tempData['rod_right_back']['p'])>0.95])])
+            ave_center_rod_back = (ave_left_rod_back+ave_right_rod_back)/2
+            self.data['ref_left_rod_back'] = ave_left_rod_back
+            self.data['ref_right_rod_back'] = ave_right_rod_back
+            self.data['ref_center_rod_back'] = ave_center_rod_back
+
+            ave_left_rod_front = np.array([np.mean(np.array(tempData['rod_left_front']['x'])[np.array(tempData['rod_left_front']['p'])>0.95]),
+                            np.mean(np.array(tempData['rod_left_front']['y'])[np.array(tempData['rod_left_front']['p'])>0.95])])
+            ave_right_rod_front = np.array([np.mean(np.array(tempData['rod_right_front']['x'])[np.array(tempData['rod_right_front']['p'])>0.95]),
+                            np.mean(np.array(tempData['rod_right_front']['y'])[np.array(tempData['rod_right_front']['p'])>0.95])])
+            ave_center_rod_front = (ave_left_rod_front+ave_right_rod_front)/2
+
+            self.data['ref_left_rod_front'] = ave_left_rod_front
+            self.data['ref_right_rod_front'] = ave_right_rod_front
+            self.data['ref_center_rod_front'] = ave_center_rod_front
+
+            ave_left_rod_back = self.data['ref_left_rod_back']
+            ave_right_rod_back = self.data['ref_right_rod_back']
+            ave_center_rod_back = self.data['ref_center_rod_back']
+            ave_left_rod_front = self.data['ref_left_rod_front']
+            ave_right_rod_front = self.data['ref_right_rod_front']
+            ave_center_rod_front = self.data['ref_center_rod_front']
 
             ref_plot = os.path.join(savefigpath, 'Rod coordinate.png')
             if not os.path.exists(ref_plot):
@@ -2781,7 +2917,7 @@ class DLCSession:
             startTime= self.data['rodT'][self.data['rodSpeed_smoothed']>0][0]
             if np.isnan(self.data['rodStart'][0]):
                 self.data['rodStart'][0] = 0
-            endTime = startTime+df_entry['TimeOnRod'] + self.data['rodRun'][0] - self.data['rodStart'][0] # need the time stay on rod
+            endTime = startTime+df_entry['Performance'] + self.data['rodRun'][0] - self.data['rodStart'][0] # need the time stay on rod
 
             timeMaskDLC = np.logical_and(self.data['time']>=startTime, self.data['time']<= endTime)
             timeMaskRod = np.logical_and(self.data['rodT']>=startTime, self.data['rodT']<= endTime)
@@ -2942,7 +3078,8 @@ class DLCSession:
 
                     # Compute normalized cross-correlation
                     c = correlate(y, x, mode='full')
-                    c = c / (np.std(x) * np.std(y) * len(x))
+                    if np.std(x) != 0 and np.std(y) != 0:
+                        c = c / (np.std(x) * np.std(y) * len(x))
 
                     # Center index
                     mid = len(c) // 2

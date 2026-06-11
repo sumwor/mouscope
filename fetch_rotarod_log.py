@@ -18,6 +18,9 @@ sh = gc.open_by_url(google_url)
 rotarod_ws = sh.worksheet("rotarod")
 df = pd.DataFrame(rotarod_ws.get_all_records())
 
+# add a sex colum to df
+df['sex'] = ''
+
 # forward merge for date, start age
 
 
@@ -36,16 +39,16 @@ for cc in merge_col:
 
 #%% remember to add digging later
 
-columns2fill = ['age', 'date', 'odor', 'genotype']
+columns2fill = ['age', 'date', 'odor', 'genotype', 'sex']
 columns2look = ['ROTAROD START AGE', 'ROTAROD START DATE', 
-                'ODOR START DATE', 'GENOTYPE']
+                'ODOR START DATE', 'GENOTYPE', 'SEX']
 nEntries = df.shape[0]
 
 startRow = 408  # records before this row is disregarded
 # due to different exp. protocol
 
 for ee in tqdm(range(408, nEntries)):
-    animal_id = df.loc[ee, 'ASD ID']
+    animal_id = df.loc[ee, 'asd_id']
     ID_idx = np.where(ID_df['ASD ID'] == animal_id)[0][0]
 
     sheet_row = ee + 2  # IMPORTANT
@@ -80,13 +83,16 @@ for ee in tqdm(range(408, nEntries)):
             elif col == 'genotype':
                 value = ID_df.loc[ID_idx, columns2look[cIdx]]
 
+            elif col == 'sex': # 
+                value = ID_df.loc[ID_idx, columns2look[cIdx]]
+
             df.loc[ee, col] = value
             #rotarod_ws.update_cell(sheet_row, sheet_col, value)
 
 values = [df.columns.tolist()] + df.astype(str).values.tolist()
 
-rotarod_ws.clear()
-rotarod_ws.update(values, "A1")
+#rotarod_ws.clear()
+#rotarod_ws.update(values, "A1")
 
           
 rotarod_data_dir = r'Y:\HongliWang\Rotarod\ASD_strains'
@@ -118,10 +124,10 @@ for ss in strains:
 
         df_group = df.loc[df_mask,:]
         
-        animals = np.unique(df_group['ASD ID'])
+        animals = np.unique(df_group['asd_id'])
         genotypes = []
         for animal in animals:
-            geno = np.unique(df_group['genotype'][df_group['ASD ID']==animal])
+            geno = np.unique(df_group['genotype'][df_group['asd_id']==animal])
             genotypes.append(geno[0])
 
         # update animalList.csv
@@ -132,9 +138,10 @@ for ss in strains:
         # columns: AnimalID, Genpotype, Age, Weight, Date, Trial, Performance, FBT, Odor, Digging
 
         # remember to add digging later
-        performance_df = pd.DataFrame({'AnimalID': df_group['ASD ID'], 
+        performance_df = pd.DataFrame({'AnimalID': df_group['asd_id'], 
                                        'Genotype': df_group['genotype'],
                                        'Age': df_group['age'],
+                                       'Sex': df_group['sex'],
                                        'Weight': df_group['weight'],
                                        'Date': df_group['date'],
                                        'Trial': df_group['trial'],

@@ -1,0 +1,15 @@
+state:
+11 left trial pre-state (trial start)
+1  right trial pre-state (trial start)
+
+
+
+
+channel:
+1 center port in
+2 center port out
+3 left port in
+4 left port out
+5 right port in
+6 right port out
+8 timer up
