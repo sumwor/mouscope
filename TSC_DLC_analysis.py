@@ -16,9 +16,9 @@ Odor.load_data()
 #Odor.session_analysis()
 
 #%% model fitting (only implemented policy gradient for now)
-#Odor.model_fit(fit_mode='sessions')
+#Odor.model_fitting(fit_mode='sessions')
 Odor.model_fitting(fit_mode='concat')
-Odor.model_summary()
+
 #Odor.plot_performance()
 #Odor.find_eureka()
 #Odor.plot_response_times()

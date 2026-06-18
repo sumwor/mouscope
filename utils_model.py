@@ -130,18 +130,31 @@ def fit_policy_gradient(data, animalID, savedatapath):
 
     # save
 
-    rec_dat = {"args": args, 'res': res, 'opt_hyper': opt_hyper, "wMode": wMode, 'AIC': AIC, 'BIC': BIC, 'weight': ['bias', 'stim', 'stick']}
+    #H, g = compHess_nolog(evd_lossfun, rec_dat['res'].x, 5e-2, {"keywords": hess_args})
+    #hyp_std = np.sqrt(np.diag(np.linalg.inv(H)))
+
+    #rec_dat['hyp_std'] = hyp_std
+    #%% estimate p_right from the fitted weights
+    sti = dat['inputs']['cBoth']
+    stick = dat['inputs']['stick']
+    sti = np.asarray(sti, dtype=float).ravel()
+    stick = np.asarray(stick, dtype=float).ravel()
+
+    x = np.vstack((np.ones(len(sti)), sti, stick))
+    
+    weighted_sum = np.sum(x * wMode, axis=0)
+    # estimate the probability to choose right
+    pR = expit(-weighted_sum)
+
+    #%% save the file in json
+    rec_dat = {"args": args, 'res': res, 'opt_hyper': opt_hyper, 
+               "pR_fit": pR,"wMode": wMode, 'AIC': AIC, 'BIC': BIC,
+                 'weight': ['bias', 'stim', 'stick']}
 
     # recover hyper parameters and std
     hess_args = rec_dat['args'].copy()
     hess_args["wMode"] = rec_dat['wMode'].flatten()
     hess_args["learning_rule"] = hess_args["learning_rule"]
-    #H, g = compHess_nolog(evd_lossfun, rec_dat['res'].x, 5e-2, {"keywords": hess_args})
-    #hyp_std = np.sqrt(np.diag(np.linalg.inv(H)))
-
-    #rec_dat['hyp_std'] = hyp_std
-
-    # save the file in json
 
     with open(savedatapath, 'w') as f:
         json.dump(
@@ -185,18 +198,18 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
         if w_mode.ndim == 1:
             w_mode = w_mode[None, :]
         weights = latent_fit['weight']
-        # estimate the probability of correct based on the latent weights
+        # # estimate the probability of correct based on the latent weights
 
         sti = latent_fit['args']['dat']['inputs']['cBoth']
         stick = latent_fit['args']['dat']['inputs']['stick']
         sti = np.asarray(sti, dtype=float).ravel()
         stick = np.asarray(stick, dtype=float).ravel()
 
-        x = np.vstack((np.ones(len(sti)), sti, stick))
+        # x = np.vstack((np.ones(len(sti)), sti, stick))
         
-        weighted_sum = np.sum(x * w_mode, axis=0)
+        # weighted_sum = np.sum(x * w_mode, axis=0)
         # estimate the probability to choose right
-        pR = expit(-weighted_sum)
+        pR = latent_fit['pR_fit']
         # convert pR to pCorrect_fit
         pCorrect_fit = [1 - pR[i] if sti[i]<0 else pR[i] for i in range(len(pR))]
         pCorrect_fit_smooth = pd.Series(pCorrect_fit).rolling(60, center=True, min_periods=1).mean().to_numpy()

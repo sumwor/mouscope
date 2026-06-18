@@ -1027,7 +1027,11 @@ class BehDataOdor(BehData):
                 plot_latent_session(data, latent_fit, model_label,savefigpath)
 
         elif fit_mode == 'concat':
-            for animal in self.data_index['Animal'].unique():
+            fit_params = pd.DataFrame()
+            for aidx, animal in enumerate(self.data_index['Animal'].unique()):
+                fit_params.loc[aidx, 'animal'] = animal
+                fit_params.loc[aidx, 'protocol'] = 'concat'
+                fit_params.loc[aidx, 'genotype'] = self.data_index[self.data_index['Animal'] == animal]['Genotype'].iloc[0]
                 result_concat = {}
                 result_concat['AB'] = pd.DataFrame()
                 result_concat['CD'] = pd.DataFrame()
@@ -1081,9 +1085,20 @@ class BehDataOdor(BehData):
                     #else:
                     latent_fit = fit_policy_gradient(data, 
                                                          animalID=animal, savedatapath=savedatapath)
+                    
+                    # load data in dataframe 
+                    weights = latent_fit['weight']
+                    opt_vars = latent_fit['args']['optList']
+                    for widx, ww in enumerate(weights):
+                        for vv in opt_vars:
+                            fit_params.loc[aidx, f'{ww}_{vv}_{pp}'] = latent_fit['opt_hyper'][vv][widx]
+                    fit_params.loc[aidx, f'AIC_{pp}'] = latent_fit['AIC']
+                    fit_params.loc[aidx, f'BIC_{pp}'] = latent_fit['BIC']
+                    
                     model_label = 'Policy Gradient'
                     savefigpath = os.path.join(save_path, f'{animal}_{pp}_latent_fit_concat')
                     plot_latent_session(data, latent_fit, model_label,savefigpath)
+
 
     
     def odor_summary(self):
@@ -1092,7 +1107,7 @@ class BehDataOdor(BehData):
         # 2. psychometric curves
         # 3. weights of bias and stickiness pre/post learning
         pass
-    
+
     def find_eureka(self):
         """ for each animal, concatenate the first 3 AB sessions, makes a decision on when learning occurs
         then look for a peak of the derivative of the fitted weights"""
