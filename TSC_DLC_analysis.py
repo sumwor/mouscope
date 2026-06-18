@@ -8,14 +8,23 @@ plt.ion()
 
 #%% for odor behavioral data
 # analyze the TSC2 behavioral recording data
-# root_dir = r'Y:\HongliWang\Juvi_ASD Deterministic\Syngap_Res_adult'
-# strain = 'SGR_adult'
-# Odor = BehDataOdor(root_dir, strain)
-# Odor.load_data()
-# #Odor.find_eureka()
-# Odor.plot_performance()
-# Odor.align_timeStamps()
-# Odor.DLC_analysis()
+strain = 'Scn2A_adol'
+root_dir = os.path.join(r'Y:\HongliWang\Juvi_ASD Deterministic', strain)
+
+Odor = BehDataOdor(root_dir, strain)
+Odor.load_data()
+#Odor.session_analysis()
+
+#%% model fitting (only implemented policy gradient for now)
+#Odor.model_fit(fit_mode='sessions')
+Odor.model_fitting(fit_mode='concat')
+Odor.model_summary()
+#Odor.plot_performance()
+#Odor.find_eureka()
+#Odor.plot_response_times()
+
+Odor.align_timeStamps()
+Odor.DLC_analysis()
 
 #%% for rotarod data
 # for rotarod, need to run the code to update the RR_result from google sheet

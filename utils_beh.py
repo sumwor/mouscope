@@ -934,6 +934,14 @@ def plot_learning_curve(
     )['subject'].nunique()
     trial_codes = {trial: idx for idx, trial in enumerate(trial_order)}
 
+    # find the max performance to determine plot limits
+    max_performance = clean_df['performance'].max()
+    if max_performance <= 1:
+        ymax = 1
+    elif max_performance > 50 & max_performance <= 300:
+        ymax = 300
+
+
     if ax is None:
         fig, ax = plt.subplots(figsize=(7, 5))
     else:
@@ -986,11 +994,14 @@ def plot_learning_curve(
             ha='left',
             fontsize=9
         )
-
+    # plot 0.5 and 0.7 line in the plot
+    ax.axhline(y=0.5, color=[0.7, 0.7, 0,.7], linestyle='--')
+    ax.axhline(y=0.7, color=[0.7, 0.7, 0,.7], linestyle='--')
     ax.set_xticks(np.arange(len(trial_order)))
     ax.set_xticklabels([str(t) for t in trial_order])
     ax.set_xlabel('Trial / Block')
     ax.set_ylabel(ylabel)
+    ax.set_ylim(0, ymax)
     ax.set_title(title)
     ax.legend(frameon=False)
     ax.spines['top'].set_visible(False)
@@ -1003,6 +1014,212 @@ def plot_learning_curve(
         fig.savefig(os.path.join(summary_path, 'BehPlots', f'{save_name}.svg'), format='svg')
 
     #return fig, ax, stats_df, clean_df
+
+def plot_session(resultdf, protocol, save_path=None, label=None):
+    # for each odor behavior session, plot the performance
+    # first subplot
+    # plot the performance of each session and running average reward rate
+
+    # input:
+    # resultdf: result data frame read from the behavior csv file
+    # protocol: the training protocol (AB, AB-CD.. etc)
+    # save_path: optional directory where the figure files will be saved
+    # tlabel: optional label for the figure title and filenames
+
+    # disable interactive mode
+    
+    plt.ioff()
+
+    save_name = f'session-beh_{label}'
+    png_path = os.path.join(save_path, f'{save_name}.png')
+    if not os.path.exists(png_path):
+   
+        os.makedirs(save_path, exist_ok=True)
+
+        n_plot = int(len(resultdf))
+
+        schedule = pd.to_numeric(resultdf['schedule'], errors='coerce').astype(int).to_numpy()
+        reward = pd.to_numeric(resultdf['reward'], errors='coerce').fillna(0).to_numpy()
+        actions = pd.to_numeric(resultdf['actions'], errors='coerce').values
+
+        value2Plot = ((-1) ** schedule) * np.ceil(schedule / 2)
+        max_val = int(np.nanmax(np.abs(value2Plot))) if n_plot > 0 else 0
+        x = np.arange(1, n_plot + 1)
+
+        def reward_rate(code, start_idx, end_idx):
+            if start_idx > end_idx or start_idx < 0 or end_idx < 0:
+                return np.nan
+            end_idx = min(end_idx, n_plot - 1)
+            segment = schedule[start_idx:end_idx + 1]
+            segment_reward = reward[start_idx:end_idx + 1]
+            mask = segment == code
+            denom = np.sum(mask)
+            if denom == 0:
+                return np.nan
+            return np.sum(np.logical_and(mask, segment_reward > 0)) / denom
+
+        fig, axs = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [2, 1]})
+        ax = axs[0]
+        ax.bar(x, value2Plot * (value2Plot < 0), width=1.0, color='red', edgecolor='none', align='center')
+        ax.bar(x, value2Plot * (value2Plot > 0), width=1.0, color='blue', edgecolor='none', align='center')
+
+        if n_plot > 0:
+            reward_marker_y = max_val + 0.25
+            for ii in range(n_plot):
+                if reward[ii] > 0:
+                    y = reward_marker_y if actions[ii] == 1 else -reward_marker_y
+                    ax.scatter(x[ii], y, marker='.', color='red')
+
+        switch_trial = [np.nan, np.nan]
+        if max_val >= 2:
+            cdswitch = np.where(np.abs(value2Plot) == 2)[0]
+            if cdswitch.size > 0:
+                switch_trial[0] = cdswitch[0] + 1
+            if max_val == 3:
+                revswitch = np.where(np.abs(value2Plot) == 3)[0]
+                if revswitch.size > 0:
+                    switch_trial[1] = revswitch[0] + 1
+
+        leftRewardRate = [np.nan, np.nan, np.nan]
+        rightRewardRate = [np.nan, np.nan, np.nan]
+
+        def to_index(value):
+            return int(value) - 1 if not np.isnan(value) else None
+
+        switch_idx_1 = to_index(switch_trial[0])
+        switch_idx_2 = to_index(switch_trial[1])
+
+        if switch_idx_1 is None and switch_idx_2 is None:
+            leftRewardRate[0] = reward_rate(1, 0, n_plot - 1)
+            rightRewardRate[0] = reward_rate(2, 0, n_plot - 1)
+        else:
+            if switch_idx_2 is None:
+                leftRewardRate[0] = reward_rate(1, 0, switch_idx_1)
+                rightRewardRate[0] = reward_rate(2, 0, switch_idx_1)
+                leftRewardRate[1] = reward_rate(3, switch_idx_1, n_plot - 1)
+                rightRewardRate[1] = reward_rate(4, switch_idx_1, n_plot - 1)
+            elif switch_idx_1 is None:
+                leftRewardRate[0] = reward_rate(1, 0, switch_idx_2)
+                rightRewardRate[0] = reward_rate(2, 0, switch_idx_2)
+                leftRewardRate[2] = reward_rate(6, switch_idx_2, n_plot - 1)
+                rightRewardRate[2] = reward_rate(5, switch_idx_2, n_plot - 1)
+            else:
+                leftRewardRate[0] = reward_rate(1, 0, switch_idx_1)
+                rightRewardRate[0] = reward_rate(2, 0, switch_idx_1)
+                leftRewardRate[1] = reward_rate(3, switch_idx_1, switch_idx_2)
+                rightRewardRate[1] = reward_rate(4, switch_idx_1, switch_idx_2)
+                leftRewardRate[2] = reward_rate(6, switch_idx_2, n_plot - 1)
+                rightRewardRate[2] = reward_rate(5, switch_idx_2, n_plot - 1)
+
+        label_x = max(1, n_plot - 100)
+        if switch_idx_1 is None and switch_idx_2 is None:
+            ax.text(label_x, -2, f'{leftRewardRate[0]:.2f}', fontsize=12, color='red')
+            ax.text(label_x, 2, f'{rightRewardRate[0]:.2f}', fontsize=12, color='red')
+        elif switch_idx_2 is None:
+            ax.text(switch_idx_1 - 100, -3, f'{leftRewardRate[0]:.2f}', fontsize=12, color='red')
+            ax.text(switch_idx_1 - 100, 3, f'{rightRewardRate[0]:.2f}', fontsize=12, color='red')
+            ax.text(max(1, n_plot - 200), -3, f'{leftRewardRate[1]:.2f}', fontsize=12, color='red')
+            ax.text(max(1, n_plot - 200), 3, f'{rightRewardRate[1]:.2f}', fontsize=12, color='red')
+        elif switch_idx_1 is None:
+            ax.text(switch_idx_2 - 100, -3, f'{leftRewardRate[0]:.2f}', fontsize=12, color='red')
+            ax.text(switch_idx_2 - 100, 3, f'{rightRewardRate[0]:.2f}', fontsize=12, color='red')
+            ax.text(max(1, n_plot - 200), 3, f'{leftRewardRate[2]:.2f}', fontsize=12, color='red')
+            ax.text(max(1, n_plot - 200), -3, f'{rightRewardRate[2]:.2f}', fontsize=12, color='red')
+        else:
+            ax.text(switch_idx_1 - 100, -4, f'{leftRewardRate[0]:.2f}', fontsize=12, color='red')
+            ax.text(switch_idx_1 - 100, 4, f'{rightRewardRate[0]:.2f}', fontsize=12, color='red')
+            ax.text(switch_idx_2 - 100, -4, f'{leftRewardRate[1]:.2f}', fontsize=12, color='red')
+            ax.text(switch_idx_2 - 100, 4, f'{rightRewardRate[1]:.2f}', fontsize=12, color='red')
+            ax.text(max(1, n_plot - 100), -4, f'{leftRewardRate[2]:.2f}', fontsize=12, color='red')
+            ax.text(max(1, n_plot - 100), 4, f'{rightRewardRate[2]:.2f}', fontsize=12, color='red')
+
+        ax.set_xlim([0, n_plot])
+        ax.set_ylim([-max_val - 0.5, max_val + 0.5])
+
+        if max_val == 1:
+            ax.set_yticks([-1.25, -1, 1, 1.25])
+            ax.set_yticklabels(['Reward', 'A', 'B', 'Reward'])
+        elif max_val == 2:
+            if switch_idx_1 is not None:
+                ax.axvline(switch_idx_1 + 1, color='black', linewidth=3)
+            ax.set_yticks([-2.25, -2, -1, 1, 2, 2.25])
+            ax.set_yticklabels(['Reward', 'A', 'C', 'B', 'D', 'Reward'])
+        elif max_val == 3:
+            if switch_idx_1 is not None:
+                ax.axvline(switch_idx_1 + 1, color='black', linewidth=3)
+            if switch_idx_2 is not None:
+                ax.axvline(switch_idx_2 + 1, color='black', linewidth=3)
+            ax.set_yticks([-3.25, -3, -2, -1, 1, 2, 3, 3.25])
+            ax.set_yticklabels(['Reward', 'A', 'C', 'D', 'B', 'D', 'C', 'Reward'])
+
+        ax.set_title(label)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        ax2 = axs[1]
+        window_size = 60
+        runningReward = np.full((n_plot, 2), np.nan)
+
+        for ii in range(max(0, n_plot - window_size)):
+            end_incl = ii + window_size - 1
+            if switch_idx_1 is None and switch_idx_2 is None:
+                runningReward[ii, 0] = reward_rate(1, ii, end_incl)
+                runningReward[ii, 1] = reward_rate(2, ii, end_incl)
+            else:
+                if switch_idx_2 is None:
+                    if ii < switch_idx_1:
+                        valid_end = min(end_incl, switch_idx_1)
+                        runningReward[ii, 0] = reward_rate(1, ii, valid_end)
+                        runningReward[ii, 1] = reward_rate(2, ii, valid_end)
+                    else:
+                        runningReward[ii, 0] = reward_rate(3, ii, end_incl)
+                        runningReward[ii, 1] = reward_rate(4, ii, end_incl)
+                elif switch_idx_1 is None:
+                    if ii < switch_idx_2:
+                        valid_end = min(end_incl, switch_idx_2)
+                        runningReward[ii, 0] = reward_rate(1, ii, valid_end)
+                        runningReward[ii, 1] = reward_rate(2, ii, valid_end)
+                    else:
+                        runningReward[ii, 0] = reward_rate(6, ii, end_incl)
+                        runningReward[ii, 1] = reward_rate(5, ii, end_incl)
+                else:
+                    if ii < switch_idx_1:
+                        valid_end = min(end_incl, switch_idx_1)
+                        runningReward[ii, 0] = reward_rate(1, ii, valid_end)
+                        runningReward[ii, 1] = reward_rate(2, ii, valid_end)
+                    elif ii < switch_idx_2:
+                        valid_end = min(end_incl, switch_idx_2)
+                        runningReward[ii, 0] = reward_rate(3, ii, valid_end)
+                        runningReward[ii, 1] = reward_rate(4, ii, valid_end)
+                    else:
+                        runningReward[ii, 0] = reward_rate(6, ii, end_incl)
+                        runningReward[ii, 1] = reward_rate(5, ii, end_incl)
+
+        ax2.plot(x, runningReward[:, 0], color='red')
+        ax2.plot(x, runningReward[:, 1], color='blue')
+        ax2.plot([1, n_plot], [0.7, 0.7], color='gray', linestyle='--')
+        ax2.set_ylim([0, 1])
+        ax2.set_xlim([1, n_plot])
+        ax2.set_title('Running average in 60-trial window')
+        ax2.spines['top'].set_visible(False)
+        ax2.spines['right'].set_visible(False)
+
+        if max_val == 2 and switch_idx_1 is not None:
+            ax2.axvline(switch_idx_1 + 1, color='black', linewidth=3)
+        elif max_val == 3:
+            if switch_idx_1 is not None:
+                ax2.axvline(switch_idx_1 + 1, color='black', linewidth=3)
+            if switch_idx_2 is not None:
+                ax2.axvline(switch_idx_2 + 1, color='black', linewidth=3)
+
+        fig.tight_layout()
+        png_path = os.path.join(save_path, f'{save_name}.png')
+        svg_path = os.path.join(save_path, f'{save_name}.svg')
+        fig.savefig(png_path, dpi=300, bbox_inches='tight')
+        fig.savefig(svg_path, format='svg', bbox_inches='tight')
+        plt.close(fig)
+        return fig
+    
 
 def read_video(videoPath, frame, ifgray):
     # ifgray: if convert the image to grayscale

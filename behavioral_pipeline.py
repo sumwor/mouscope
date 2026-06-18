@@ -21,11 +21,13 @@ import imageio.v3 as iio
 import ruptures as rpt
 import statsmodels.stats.api as smf
 from scipy.signal import spectrogram,hilbert,correlate, find_peaks
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, mannwhitneyu
+from statsmodels.stats.multitest import multipletests
 from scipy.optimize import minimize
 import matlab.engine
 eng = matlab.engine.start_matlab()
 
+from utils_model import *
 
 # add matlab code into the path
 #eng.addpath(r'C:\Users\Linda\Documents\GitHub\ASD_RLWM\Behavior', nargout=0)
@@ -54,6 +56,551 @@ class BehData:
         else:   
             self.Hemisphere = [None] * len(self.Animals)
 
+class BehDataOF(BehData):
+
+    def __init__(self, root_file, strain):
+        super().__init__(root_file, strain)
+        self.bodyparts = ['nose', 'head', 'left ear', 'right ear', 'left hand', 'right hand',
+                          'spine 1', 'spine 2', 'spine 3', 'left foot', 'right foot', 'tail 1',
+                          'tail 2', 'tail 3']
+        self.make_dataIndex()
+        self.behavior = 'Openfield'
+
+        # get the behCSV path
+        self.load_data()
+
+    def make_dataIndex(self):
+        # create a dataIndex for all open field data
+        DLC_results = []
+        video = []
+        animalID = []
+        analysis = []
+        GeneBGID = []
+        sessionID = []
+        sexID = []
+        for aidx,aa in enumerate(self.animals):
+            sessionPattern = r'_([0-9]{1,2})(?=DLC)'
+            filePatternCSV = '*' + aa + '_OF_*.csv'
+            filePatternVideo = '*' + aa + '*.mp4'
+            csvfiles = glob.glob(f"{dataFolder}/{'DLC'}/{filePatternCSV}")
+            if not csvfiles == []:
+                for ff in range(len(csvfiles)):
+                    DLC_results.append(csvfiles[ff])
+                    video.append(glob.glob(f"{dataFolder}/{'Videos'}/{filePatternVideo}")[ff])
+                    animalID.append(aa)
+
+                    analysis.append(os.path.join(self.analysisFolder, aa))
+                    sessionID.append(aa)
+                    GeneBGID.append(self.GeneBG[aidx])
+                    sexID.append(self.Sex[aidx])
+
+        self.data_index = pd.DataFrame(animalID, columns=['Animal'])
+        self.data_index['CSV'] = DLC_results
+        self.data_index['Video'] = video
+
+        self.data_index['AnalysisPath'] = analysis
+        self.data_index['GeneBG'] = GeneBGID
+        self.data_index['Sex'] = sexID
+        self.nSubjects = len(self.animals)
+
+        self.nSessions = len(self.data['Animal'])
+        DLC_obj = []
+
+        minFrames = 10 ** 8
+        for s in range(self.nSessions):
+            analysisPath = self.data['AnalysisPath'][s]
+            filePath = self.data['CSV'][s]
+            videoPath = self.data['Video'][s]
+            dlc = DLCSession(filePath, videoPath, analysisPath, fps)
+            DLC_obj.append(dlc)
+            if dlc.nFrames < minFrames:
+                minFrames = dlc.nFrames
+
+        self.minFrames = minFrames
+        self.data['DLC_obj'] = DLC_obj
+        self.plotT = np.arange(0, minFrames-1)/fps
+        animalIdx = np.arange(self.nSessions)
+        self.WTIdx = animalIdx[self.data['GeneBG'] == groups[0]]
+        self.MutIdx = animalIdx[self.data['GeneBG'] == groups[1]]
+        # grouping the animals
+
+        if self.Sex[0]==np.nan: # if no sex info
+            nGroups = 1
+        else:
+            nGroups = 2
+
+
+        if nGroups==2:
+            self.maleIdx = np.where(self.data['Sex']=='M')[0]
+            self.femaleIdx = np.where(self.data['Sex']=='F')[0]
+
+    def load_data(self):
+        # load the open field DLC data
+        nFiles = self.data_index.shape[0]
+
+        if self.behavior == 'Odor':
+            for ii in range(nFiles):
+                # check if figure has been generated
+                savefigpath = os.path.join(self.analysis, self.data_index['Animal'][ii], self.behavior, 'Imaging',
+                    self.data_index['Date'][ii])
+                DLCPath = self.data_index['DLC'][ii]
+                DLCdata = load_DLC(DLCPath)
+
+    def center_analysis(self, savefigpath):
+        centerMat = np.full((self.minFrames, self.nSubjects), np.nan)
+        runningAve_center = np.full((self.minFrames, self.nSubjects), np.nan)
+        numCrossMat = np.full((self.minFrames, self.nSubjects), np.nan)
+        plotT = np.arange(self.minFrames)/self.fps
+        for idx, obj in enumerate(self.data['DLC_obj']):
+            savefigFolder = os.path.join(self.analysisFolder, self.animals[idx])
+            if not os.path.exists(savefigFolder):
+                os.makedirs(savefigFolder)
+            obj.moving_trace(savefigFolder)
+            obj.get_time_in_center()
+            t = 5*60
+            obj.plot_distance_to_center(t, savefigFolder)
+            centerMat[:,idx] = obj.cumu_time_center[0:self.minFrames]
+            numCrossMat[:, idx] = obj.num_cross[0:self.minFrames]
+            if idx==0:
+                nbins = len(obj.dist_center_bins[1])
+                centerDistMat = np.full((nbins-1, self.nSubjects), np.nan)
+                centerDistMat30 = np.full((nbins - 1, self.nSubjects), np.nan)
+            centerDistMat[:,idx] = obj.dist_center_bins[0]
+            centerDistMat30[:,idx] = obj.dist_center_bins_30[0]
+
+            runningAve_center[0: len(obj.dist_center_running), idx]=obj.dist_center_running.flatten()
+
+        WTColor = (255 / 255, 189 / 255, 53 / 255)
+        MutColor = (63 / 255, 167 / 255, 150 / 255)
+        # save centerMat result
+
+        # total time in the center
+        totalCenter = centerMat[-1,:]
+        totalCross = numCrossMat[-1,:]
+        # violin plot
+        custom_palette = {0: WTColor, 1: MutColor}
+        ax=sns.violinplot(data=[totalCenter[self.WTIdx], totalCenter[self.MutIdx]],palette=custom_palette)
+        ax.set_xticklabels(['WT', 'Mut'])
+        ax.set_ylabel('Total time in the center')
+        ax.set_xlabel('Group')
+        ax.set_title('Total time in the center')
+        plt.savefig(savefigpath + '\\violin_center_time.png', dpi=300)
+        plt.savefig(savefigpath + '\\violin_center_time.svg', dpi=300)
+        plt.close()
+
+        ax=sns.violinplot(data=[totalCross[self.WTIdx], totalCross[self.MutIdx]],palette=custom_palette)
+        ax.set_xticklabels(['WT', 'Mut'])
+        ax.set_ylabel('Total cross time')
+        ax.set_xlabel('Group')
+        ax.set_title('Total cross time')
+        plt.savefig(savefigpath + '/violin_cross_time.png', dpi=300)
+        plt.savefig(savefigpath + '/violin_cross_time.svg', dpi=300)
+        plt.close()
+
+        data = {'animalID':self.animals,
+                'timeinCenter': totalCenter,
+                'crossTime': totalCross}
+        data = pd.DataFrame(data)
+        data.to_csv(savefigpath + '/timeinCenter.csv')
+
+        # WTBoot = bootstrap(centerMat[:, self.WTIdx], 1,
+        #                        centerMat[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(centerMat[:, self.MutIdx], 1,
+        #                         centerMat[:, self.MutIdx].shape[0])
+        # WTColor = (255 / 255, 189 / 255, 53 / 255)
+        # MutColor = (63 / 255, 167 / 255, 150 / 255)
+        #
+        # binX = (obj.dist_center_bins[1][0:-1] + obj.dist_center_bins[1][1:]) / 2
+        #
+        # for ss in ['male','female','allsex']:
+        #     # plot distance
+        #     self.plot_movement_results(centerMat,plotT,savefigpath,
+        #                                'Time spent in the center', ss,
+        #                                ['WT', 'Mut'],WTColor, MutColor)
+        #     self.plot_movement_results(centerDistMat,binX,savefigpath,
+        #                                'Distribution of distance from center', ss,
+        #                                ['WT', 'Mut'],WTColor, MutColor)
+        #     self.plot_movement_results(centerDistMat30,binX,savefigpath,
+        #                                'Distribution of distance from center 30 mins', ss,
+        #                                ['WT', 'Mut'],WTColor, MutColor)
+        #     self.plot_movement_results(runningAve_center,plotT,savefigpath,
+        #                                'Time spent in the center in running 5 mins windows', ss,
+        #                                ['WT', 'Mut'],WTColor, MutColor)
+        #     self.plot_movement_results(numCrossMat,plotT,savefigpath,
+        #                                'Num of crossings', ss,
+        #                                ['WT', 'Mut'],WTColor, MutColor)
+
+        # KS test
+        # from scipy.stats import ks_2samp
+        # WTMale = centerDistMat30[:,  list(set(self.WTIdx) & set(self.maleIdx))]
+        # MutMale = centerDistMat30[:,  list(set(self.MutIdx) & set(self.maleIdx))]
+        # WTFemale = centerDistMat30[:,  list(set(self.WTIdx) & set(self.femaleIdx))]
+        # MutFemale = centerDistMat30[:,  list(set(self.MutIdx) & set(self.femaleIdx))]
+        # # Assuming you have two arrays of data: data1 and data2
+        # # Perform the KS test
+        # statistic, p_value = ks_2samp(WTMaleBoot['bootAve'], MutMaleBoot['bootAve'])
+        #
+        # from scipy.stats import permutation_test
+        # res = permutation_test((WTMale.T,MutMale.T), ks_2samp)
+        #
+        # # Print the test statistic and p-value
+        # print("KS statistic:", statistic)
+        # print("p-value:", p_value)
+        # # two-way ANOVA for centerDistMat30
+        # gene_anova_male = []
+        # dist_anova_male = []
+        # response_anova_male = []
+        # subject_male = []
+        # gene_anova_female = []
+        # dist_anova_female = []
+        # subject_female = []
+        # response_anova_female = []
+        #
+        # for t in range(len(self.GeneBG)):
+        #     for s in range(len(binX)):
+        #         if self.Sex[t] == 'M':
+        #             response_anova_male.append(centerDistMat30[s,t])
+        #             gene_anova_male.append(self.GeneBG[t])
+        #             dist_anova_male.append(binX[s])
+        #             subject_male.append(self.animals[t])
+        #         else:
+        #             response_anova_female.append(centerDistMat30[s,t])
+        #             gene_anova_female.append(self.GeneBG[t])
+        #             dist_anova_female.append(binX[s])
+        #             subject_female.append(self.animals[t])
+        #
+        # anova_data = pd.DataFrame({'gene': gene_anova_male,
+        #                            'dist': dist_anova_male,
+        #                            'response': response_anova_male,
+        #                            'subject': subject_male
+        #                            })
+        # model = ols('response ~ gene + dist + gene:dist', anova_data).fit()
+        # anova_table = sm.stats.anova_lm(model, typ=3)
+        # # print ANOVA table
+        # print(anova_table)
+        #
+        # # three way anova?
+        # gene_anova = []
+        # dist_anova = []
+        # response_anova = []
+        # subject = []
+        # sex = []
+        #
+        #
+        # for t in range(len(self.GeneBG)):
+        #     for s in range(len(binX)):
+        #         response_anova.append(centerDistMat30[s,t])
+        #         gene_anova.append(self.GeneBG[t])
+        #         dist_anova.append(binX[s])
+        #         subject.append(self.animals[t])
+        #         sex.append(self.Sex[t])
+        #
+        # anova_data = pd.DataFrame({'gene': gene_anova,
+        #                            'dist': dist_anova,
+        #                            'response': response_anova,
+        #                            'sex': sex,
+        #                            'subject': subject
+        #                            })
+        # model = ols('response ~ gene + dist + sex + gene:dist + gene:sex + dist:sex + dist:sex:gene', anova_data).fit()
+        # anova_table = sm.stats.anova_lm(model, typ=3)
+        # # print ANOVA table
+        # print(anova_table)
+        #
+        #
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Time (s)')
+        # distPlot.ax.set_ylabel('Time spent in the center (s)')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Time spent in the center.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Time spent in the center.svg', 'svg', savefigpath)
+        #
+        # # distribution of distance from center
+        # WTBoot = bootstrap(centerDistMat[:, self.WTIdx], 1,
+        #                        centerDistMat[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(centerDistMat[:, self.MutIdx], 1,
+        #                         centerDistMat[:, self.MutIdx].shape[0])
+        # binX = (obj.dist_center_bins[1][0:-1] + obj.dist_center_bins[1][1:])/2
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(binX, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(binX, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(binX, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(binX, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Distance from center (px)')
+        # distPlot.ax.set_ylabel('Number of frames')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Distribution of distance from center.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Distribution of distance from center.svg', 'svg', savefigpath)
+        #
+        # # plot average distance from center in running windows
+        # WTBoot = bootstrap(runningAve_center[:, self.WTIdx], 1,
+        #                        runningAve_center[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(runningAve_center[:, self.MutIdx], 1,
+        #                         runningAve_center[:, self.MutIdx].shape[0])
+        #
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Time (s)')
+        # distPlot.ax.set_ylabel('Time spent in the center in running 5 mins windows (s)')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Time spent in the center in running 5 mins windows.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Time spent in the center in running 5 mins windows.svg', 'svg', savefigpath)
+
+    def motion_analysis(self, savefigpath):
+        # basic analysis for motion related variables
+        # distance traveled, speed, angular velocity...
+        distanceMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
+        velocityMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
+        # in 5 mins window
+        runningAve_distance = np.full((self.minFrames - 1, self.nSubjects), np.nan)
+        runningAve_velocity = np.full((self.minFrames - 1, self.nSubjects), np.nan)
+        #
+        velEdges = np.arange(0, 1000, 10)
+        velocityDist = np.full((len(velEdges), self.nSubjects), np.nan)
+        angEdges = np.arange(-15, 15, 0.5)
+        angularDist = np.full((len(angEdges), self.nSubjects), np.nan)
+        headAngularDist = np.full((len(angEdges), self.nSubjects), np.nan)
+
+        for idx, obj in enumerate(self.data['DLC_obj']):
+            obj.get_movement()
+            # cumulative curve of distance travelled
+            cumu_dist = np.cumsum(obj.dist)
+            distanceMat[:, idx] = cumu_dist[0:self.minFrames - 1]
+            velocityMat[:, idx] = obj.vel[0:self.minFrames - 1, 0]
+            counts, _ = np.histogram(obj.vel, bins=velEdges)
+            velocityDist[0:-1, idx] = counts * 100 / (sum(counts))
+
+            obj.get_angular_velocity()
+            counts, _ = np.histogram(obj.angVel, bins=angEdges)
+            angularDist[0:-1, idx] = counts * 100 / (sum(counts))
+
+            obj.get_head_angular_velocity()
+            counts, _ = np.histogram(obj.headAngVel, bins=angEdges)
+            headAngularDist[0:-1, idx] = counts * 100 / (sum(counts))
+
+            # running windows
+            savefigFolder = os.path.join(self.analysisFolder, self.animals[idx])
+            t = 5*60  # running windos of 5 mins
+            obj.get_movement_running(t, savefigFolder)
+            obj.get_angular_velocity_running(t, savefigFolder)
+
+            runningAve_distance[0:len(obj.dist_running),idx]=obj.dist_running.flatten()
+            runningAve_velocity[0:len(obj.dist_running), idx] = obj.vel_running.flatten()
+        """ make plots"""
+        """distance plot"""
+        if 'KO' in np.unique(self.data['GeneBG']):
+            mutLabel = 'KO'
+        elif 'Mut' in np.unique(self.data['GeneBG']):
+            mutLabel = 'Mut'
+
+        # WTIdx = np.where(self.data['GeneBG'] == 'WT')[0]
+
+        # plot the result without considering sex info
+        # WTBoot = bootstrap(distanceMat[:, self.WTIdx], 1,
+        #                        distanceMat[:, self.WTIdx].shape[0], 500)
+        # MutBoot = bootstrap(distanceMat[:, self.MutIdx], 1,
+        #                         distanceMat[:, self.MutIdx].shape[0],500)
+        WTColor = (255 / 255, 189 / 255, 53 / 255)
+        MutColor = (63 / 255, 167 / 255, 150 / 255)
+
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Time (s)')
+        # distPlot.ax.set_ylabel('Distance travelled (px)')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Distance traveled.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Distance traveled.svg', 'svg', savefigpath)
+        #
+        # """velocity plot"""
+        # WTBoot = bootstrap(velocityDist[:, self.WTIdx], 1,
+        #                        velocityDist[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(velocityDist[:, self.MutIdx], 1,
+        #                         velocityDist[:, self.MutIdx].shape[0])
+        # velPlot = StartPlots()
+        # velPlot.ax.plot(velEdges, WTBoot['bootAve'], color=WTColor, label='WT')
+        # velPlot.ax.fill_between(velEdges, WTBoot['bootLow'],
+        #                             WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # velPlot.ax.plot(velEdges, MutBoot['bootAve'], color=MutColor, label='KO')
+        # velPlot.ax.fill_between(velEdges, MutBoot['bootLow'],
+        #                             MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # velPlot.ax.set_xlabel('Velocity (px/s)')
+        # velPlot.ax.set_ylabel('Velocity distribution (%)')
+        # velPlot.legend(['WT', 'KO'])
+        # velPlot.save_plot('Velocity distribution.tif', 'tif', savefigpath)
+        # velPlot.save_plot('Velocity distribution.svg', 'svg', savefigpath)
+        #
+        # """ plot angular velocity distribution"""
+        # WTBoot = bootstrap(angularDist[:, self.WTIdx], 1,
+        #                        angularDist[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(angularDist[:, self.MutIdx], 1,
+        #                         angularDist[:, self.MutIdx].shape[0])
+        #
+        # """angular velocity plot"""
+        # angPlot = StartPlots()
+        # angPlot.ax.plot(angEdges, WTBoot['bootAve'], color=WTColor, label='WT')
+        # angPlot.ax.fill_between(angEdges, WTBoot['bootLow'],
+        #                             WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # angPlot.ax.plot(angEdges, MutBoot['bootAve'], color=MutColor, label='Mut')
+        # angPlot.ax.fill_between(angEdges, MutBoot['bootLow'],
+        #                             MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # angPlot.ax.set_xlabel('Angular velocity (radian/s)')
+        # angPlot.ax.set_ylabel('Angular velocity distribution (%)')
+        # angPlot.legend(['WT', 'Mut'])
+        # angPlot.save_plot('Angular velocity distribution.tif', 'tif', savefigpath)
+        # angPlot.save_plot('Angular velocity distribution.svg', 'svg', savefigpath)
+        #
+        # """plot head angular velocity distribution"""
+        # WTBoot = bootstrap(headAngularDist[:, self.WTIdx], 1,
+        #                        headAngularDist[:, self.WTIdx].shape[0])
+        # MutBoot = bootstrap(headAngularDist[:, self.MutIdx], 1,
+        #                         headAngularDist[:, self.MutIdx].shape[0])
+        #
+        # angPlot = StartPlots()
+        # angPlot.ax.plot(angEdges, WTBoot['bootAve'], color=WTColor, label='WT')
+        # angPlot.ax.fill_between(angEdges, WTBoot['bootLow'],
+        #                             WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # angPlot.ax.plot(angEdges, MutBoot['bootAve'], color=MutColor, label='Mut')
+        # angPlot.ax.fill_between(angEdges, MutBoot['bootLow'],
+        #                             MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # angPlot.ax.set_xlabel('Angular velocity(head) (radian/s)')
+        # angPlot.ax.set_ylabel('Angular velocity(head) distribution (%)')
+        # angPlot.legend(['WT', 'Mut'])
+        # angPlot.save_plot('Angular velocity(head) distribution.tif', 'tif', savefigpath)
+        # angPlot.save_plot('Angular velocity(head distribution.svg', 'svg', savefigpath)
+        #
+        #
+        # # distance and velocity in 5 mins running window
+        # WTBoot = bootstrap(runningAve_distance[:, self.WTIdx], 1,
+        #                        runningAve_distance[:, self.WTIdx].shape[0], 500)
+        # MutBoot = bootstrap(runningAve_distance[:, self.MutIdx], 1,
+        #                         runningAve_distance[:, self.MutIdx].shape[0],500)
+        #
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Time (s)')
+        # distPlot.ax.set_ylabel('Running average distance travelled in 5 mins (px)')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Running average distance travelled in 5 mins.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Running average distance travelled in 5 mins.svg', 'svg', savefigpath)
+        #
+        # WTBoot = bootstrap(runningAve_velocity[:, self.WTIdx], 1,
+        #                        runningAve_velocity[:, self.WTIdx].shape[0], 500)
+        # MutBoot = bootstrap(runningAve_velocity[:, self.MutIdx], 1,
+        #                         runningAve_velocity[:, self.MutIdx].shape[0],500)
+        #
+        # distPlot = StartPlots()
+        # distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
+        # distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
+        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
+        # distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
+        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
+        # distPlot.ax.set_xlabel('Time (s)')
+        # distPlot.ax.set_ylabel('Running average velocity in 5 mins (px)')
+        # distPlot.legend(['WT', 'KO'])
+        # # save the plot
+        # distPlot.save_plot('Running average distance travelled in 5 mins.tif', 'tif', savefigpath)
+        # distPlot.save_plot('Running average distance travelled in 5 mins.svg', 'svg', savefigpath)
+        #
+        # plt.close('all')
+
+        # plot result separating male and female
+        # save distanceMat, runningAve_distance
+
+        # convert to cm
+        savedistPath = os.path.join(savefigpath, 'CumulativeDistance.csv')
+        data = {}
+        for idx,animal in enumerate(self.animals):
+            data[animal] = distanceMat[:,idx]
+        data['time'] = self.plotT
+        data = pd.DataFrame(data)
+        data.to_csv(savedistPath)
+
+        savedistPath = os.path.join(savefigpath, 'runningAverageDistance.csv')
+        data = {}
+        for idx,animal in enumerate(self.animals):
+            data[animal] = runningAve_distance[:,idx]
+        data['time'] = self.plotT
+        data = pd.DataFrame(data)
+        data.to_csv(savedistPath)
+
+        for ss in ['male','female', 'allsex']:
+            # plot distance
+            self.plot_movement_results(distanceMat,self.plotT,savefigpath,
+                                       'Distance travelled', ss,
+                                       ['WT', 'Mut'],WTColor, MutColor)
+
+            self.plot_movement_results(velocityDist,velEdges,savefigpath,
+                                       'Velocity', ss,
+                                       ['WT', 'Mut'],WTColor, MutColor)
+            self.plot_movement_results(angularDist,angEdges,savefigpath,
+                                       'Angular velocity', ss,
+                                       ['WT', 'Mut'],WTColor, MutColor)
+            self.plot_movement_results(runningAve_distance,self.plotT,savefigpath,
+                                       'Distance running 5 mins', ss,
+                                       ['WT', 'Mut'],WTColor, MutColor)
+
+    def plot_movement_results(self, variableMat, plotT, savefigpath, label, group, leg,color1, color2):
+        if group =='male':
+        # if consider sex info
+            WTIdx = list(set(self.WTIdx) & set(self.maleIdx))
+            mutIdx = list(set(self.MutIdx) & set(self.maleIdx))
+        elif group == 'female':
+            WTIdx = list(set(self.WTIdx) & set(self.femaleIdx))
+            mutIdx = list(set(self.MutIdx) & set(self.femaleIdx))
+        elif group == 'allsex':
+            WTIdx = self.WTIdx
+            mutIdx = self.MutIdx
+        WTBoot = bootstrap(variableMat[:, WTIdx], 1,
+                               variableMat[:, WTIdx].shape[0], 200)
+        MutBoot = bootstrap(variableMat[:, mutIdx], 1,
+                                variableMat[:, mutIdx].shape[0],200)
+        WTColor = color1
+        MutColor = color2
+
+        distPlot = StartPlots()
+        distPlot.ax.plot(plotT, WTBoot['bootAve'], color=color1, label='WT')
+        distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
+                                     WTBoot['bootHigh'], color=color1, alpha=0.2, label='_nolegend_')
+        distPlot.ax.plot(plotT, MutBoot['bootAve'], color=color2, label='KO')
+        distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
+                                     MutBoot['bootHigh'], color=color2, alpha=0.2, label='_nolegend_')
+        distPlot.ax.set_xlabel('Time (s)')
+        title = label + ' ' + group
+        distPlot.ax.set_ylabel(title)
+        distPlot.legend(leg)
+        #distPlot.ax.set_ylim(0, np.nanmax(variableMat))
+        # save the plot
+        distPlot.save_plot(title+'.png', 'png', savefigpath)
+        distPlot.save_plot(title+'.svg', 'svg', savefigpath)
+        plt.close()
 
 class BehDataOdor(BehData):
 
@@ -405,131 +952,741 @@ class BehDataOdor(BehData):
             
             eng.ASD_session(resultdf_path,self.data_index['Protocol'][ss],self.data_index['Animal'][ss], 
                             self.data_index['Date'][ss],self.data_index['AnalysisPath'][ss],nargout=0)
+            
     def session_analysis(self):
         # session-wise anlaysis
         # plot single session performance
         # model fitting
         # use the policy-gradient model for learnind window estimation (take the derivative)
         
-        pass
+        # go over each session
+        nSessions = self.data_index.shape[0]
+        for ss in range(nSessions):
+            # extract the behavior data
+            resultdf_path = self.data_index['BehCSV'][ss]
+            resultdf = pd.read_csv(resultdf_path)
+            
+            #%%
+            # 1. session performance
+            protocol = self.data_index['Protocol'][ss]
+            save_path = self.data_index['AnalysisPath'][ss]
+            animalID = self.data_index['Animal'][ss]
+            date = self.data_index['Date'][ss]
+            protocolDay = self.data_index['ProtocolDay'][ss]
+            label = f'{animalID}_{date}_{protocol}_{protocolDay}'
+            plot_session(resultdf, protocol, save_path = save_path, label = label)
+
+            # model fitting!
+    
+    def model_fitting(self, fit_mode):
+        # fit computational models to the behavioral data
+        # fit mode: 'session' or 'concat'
+        #          'session': fit model to each session separately
+        #          'concat': fit model to the concatenated data of all sessions
+        
+
+        if fit_mode == 'session':
+            nSessions = self.data_index.shape[0]
+            for ss in range(nSessions):
+                # extract the behavior data
+                resultdf_path = self.data_index['BehCSV'][ss]
+                resultdf = pd.read_csv(resultdf_path)
+            
+            #%% policy gradient model
+                protocol = self.data_index['Protocol'][ss]
+                animalID = self.data_index['Animal'][ss]
+                save_path = os.path.join(self.data_index['AnalysisPath'][ss], 'latent')
+                
+                savedatapath = os.path.join(save_path,'policy_gradient_fit.json')
+
+                # preprocess the data (remove AB trials for AB-CD sessions)
+                # fit AB and AB-CD sessions only
+                if protocol == 'AB-CD-DC' or protocol=='AB-DC':
+                    continue
+                resultdf.replace({"actions": ["NAN","NaN", "nan", "None", ""]}, np.nan, inplace=True)
+                resultdf.replace({"schedule": ["NAN", "NaN", "nan", "None", ""]}, np.nan, inplace=True)
+                data = resultdf.dropna(subset=["actions"])
+                data = data.dropna(subset=['schedule'])
+                data.schedule = data.schedule.astype(int)
+                # if CD session
+                nOdors = np.unique(data['schedule'])
+                if 'CD' in protocol:
+                    # remove AB trials
+                    data = data[np.logical_and(data['schedule']!=1,data['schedule']!=2)].copy()
+                    data['schedule'] = data['schedule']-2
+
+
+                if os.path.exists(savedatapath):
+                    # load the existing fit
+                    with open(savedatapath, 'r') as f:
+                        latent_fit = json.load(f)
+                else:
+                    latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
+                model_label = 'Policy Gradient'
+                savefigpath = os.path.join(save_path, f'{animalID}_{protocol}_latent_fit')
+                plot_latent_session(data, latent_fit, model_label,savefigpath)
+
+        elif fit_mode == 'concat':
+            for animal in self.data_index['Animal'].unique():
+                result_concat = {}
+                result_concat['AB'] = pd.DataFrame()
+                result_concat['CD'] = pd.DataFrame()
+
+                Animal_sessions = self.data_index[self.data_index['Animal'] == animal]
+                AB_CD_1_idx = Animal_sessions[Animal_sessions['Protocol'].str.contains('AB-CD')].index[0] if not Animal_sessions[Animal_sessions['Protocol'].str.contains('AB-CD')].empty else None            
+                if AB_CD_1_idx is not None:
+                    AB_sessions = Animal_sessions.loc[:AB_CD_1_idx-1]
+                else:
+                    AB_sessions = Animal_sessions
+                AB_CD_sessions = Animal_sessions[np.logical_and(Animal_sessions['Protocol']=='AB-CD', 
+                                                                Animal_sessions['ProtocolDay'] <=3 )]
+
+                for sIdx in AB_sessions.index:
+                    temp_result = pd.read_csv(AB_sessions.loc[sIdx]['BehCSV'])
+                    # remove miss trials
+                    temp_result = temp_result[~np.isnan(temp_result['actions'])]
+                    result_concat['AB'] = pd.concat([result_concat['AB'], temp_result], ignore_index=True)
+
+                for sIdx in AB_CD_sessions.index:
+                    temp_result = pd.read_csv(AB_CD_sessions.loc[sIdx]['BehCSV'])
+                    # remove miss trials
+                    temp_result = temp_result[~np.isnan(temp_result['actions'])]
+                    # remove AB trials
+                    temp_result = temp_result[temp_result['schedule']>2]
+                    result_concat['CD'] = pd.concat([result_concat['CD'], temp_result], ignore_index=True)
+                    
+
+                # calculate running reward rate
+                protocols = ['AB', 'CD']
+                for pp in protocols:
+                    if len(result_concat[pp]) == 0:
+                        continueclas
+                    resultdf = result_concat[pp]
+                    resultdf.replace({"actions": ["NAN","NaN", "nan", "None", ""]}, np.nan, inplace=True)
+                    resultdf.replace({"schedule": ["NAN", "NaN", "nan", "None", ""]}, np.nan, inplace=True)
+                    data = resultdf.dropna(subset=["actions"])
+                    data = data.dropna(subset=['schedule'])
+                    data.schedule = data.schedule.astype(int)
+                    save_path = os.path.join(self.analysis,animal,self.behavior, 'Behavior', 'Summary')
+                    if not os.path.exists(save_path):
+                        os.makedirs(save_path)
+                    savedatapath = os.path.join(save_path,
+                                                 f'{animal}_{pp}_fit.json')
+                    if os.path.exists(savedatapath):
+                    # load the existing fit
+                        with open(savedatapath, 'r') as f:
+                            latent_fit = json.load(f)
+                    else:
+                        latent_fit = fit_policy_gradient(data, 
+                                                         animalID=animal, savedatapath=savedatapath)
+                    model_label = 'Policy Gradient'
+                    savefigpath = os.path.join(save_path, f'{animal}_{pp}_latent_fit_concat')
+                    plot_latent_session(data, latent_fit, model_label,savefigpath)
 
     def odor_summary(self):
         pass
     
     def find_eureka(self):
-        """Fit a two-parameter logistic learning curve to session reward outcomes."""
-        if self.data_index.shape[0] == 0:
-            raise ValueError('No sessions available in data_index.')
+        """ for each animal, concatenate the first 3 AB sessions, makes a decision on when learning occurs
+        then look for a peak of the derivative of the fitted weights"""
 
-        resultdf = pd.read_csv(self.data_index['BehCSV'][0]) 
-        t = pd.Series(np.arange(len(resultdf), dtype=float) + 1) 
-        # set missing values to 0, 3 or 2 to 1 
-        y = resultdf['reward'].fillna(0) 
-        y = y.replace([2, 3], 1) 
-        t_vals = t.to_numpy(dtype=float) 
-        y_vals = y.to_numpy(dtype=float) 
+        # for each animal, concatenate AB sessions before the first AB-CD session
+        # and concatenate the 3 AB-CD sessions
+        saveData = {}
+        learning_summary_rows = []
+        for animal in self.data_index['Animal'].unique():
+            saveData[animal] = {}
+            saveData[animal]['AB'] = {}
+            saveData[animal]['CD'] = {}
+            result_concat = {}
+            result_concat['AB'] = pd.DataFrame()
+            result_concat['CD'] = pd.DataFrame()
+            pgFit = {}
+            pgFit['AB'] = []
+            pgFit['CD'] = []
+            Animal_sessions = self.data_index[self.data_index['Animal'] == animal]
+            AB_CD_1_idx = Animal_sessions[Animal_sessions['Protocol'].str.contains('AB-CD')].index[0] if not Animal_sessions[Animal_sessions['Protocol'].str.contains('AB-CD')].empty else None            
+            if AB_CD_1_idx is not None:
+                AB_sessions = Animal_sessions.loc[:AB_CD_1_idx-1]
+            else:
+                AB_sessions = Animal_sessions
+            AB_CD_sessions = Animal_sessions[np.logical_and(Animal_sessions['Protocol']=='AB-CD', 
+                                                            Animal_sessions['ProtocolDay'] <=3 )]
 
-        def logistic_prob(params, x):
-            p_low, p_delta, k, tau = params
-            return p_low + p_delta/(1+np.exp(-k*(x-tau)))
-        
-        def neg_log_likelihood(params): 
+            for sIdx in AB_sessions.index:
+                temp_result = pd.read_csv(AB_sessions.loc[sIdx]['BehCSV'])
+                # remove miss trials
+                temp_result = temp_result[~np.isnan(temp_result['actions'])]
+                result_concat['AB'] = pd.concat([result_concat['AB'], temp_result], ignore_index=True)
+
+                # load policy gradient fit
+                savedatapath = os.path.join(AB_sessions.loc[sIdx]['AnalysisPath'], 'latent', 'policy_gradient_fit.json')
+                if os.path.exists(savedatapath):
+                    with open(savedatapath, 'r') as f:
+                        fitResult = json.load(f)
+                        fitted_weights = np.array(fitResult['wMode'])
+                    pgFit['AB'].append(fitted_weights)
+            if len(pgFit['AB']) > 0:
+                pgFit['AB'] = np.concatenate(pgFit['AB'], axis=1)
+
+            for sIdx in AB_CD_sessions.index:
+                temp_result = pd.read_csv(AB_CD_sessions.loc[sIdx]['BehCSV'])
+                # remove miss trials
+                temp_result = temp_result[~np.isnan(temp_result['actions'])]
+                # remove AB trials
+                temp_result = temp_result[temp_result['schedule']>2]
+                result_concat['CD'] = pd.concat([result_concat['CD'], temp_result], ignore_index=True)
+                
+                # load policy gradient fit
+                savedatapath = os.path.join(AB_CD_sessions.loc[sIdx]['AnalysisPath'], 'latent', 'policy_gradient_fit.json')
+                if os.path.exists(savedatapath):
+                    with open(savedatapath, 'r') as f:
+                        fitResult = json.load(f)
+                        fitted_weights = np.array(fitResult['wMode'])
+                    pgFit['CD'].append(fitted_weights)
+            if len(pgFit['CD']) > 0:
+                pgFit['CD'] = np.concatenate(pgFit['CD'], axis=1)
             
-            p = logistic_prob(params, t_vals) 
-            p = np.clip(p, 1e-8, 1.0 - 1e-8) 
-            return -np.sum(y_vals * np.log(p) + (1.0 - y_vals) * np.log(1.0 - p)) 
-        
-        initial = [0.5, 0.5, 0.1, np.median(t_vals)] 
-        bounds = [
-            (0.4,0.6),     # p_low
-            (0.5,1.0),     # p_high
-            (1e-6,None),   # k
-            (1,len(t_vals))
-        ]
-        result = minimize( 
-            neg_log_likelihood, 
-            x0=initial, 
-            bounds=bounds, 
-            method='L-BFGS-B' ) 
-        
-        if not result.success: 
-            raise RuntimeError(f'Logistic fit failed: {result.message}') 
-        k_fit, tau_fit = result.x 
-        fitted = logistic_prob(result.x, t_vals) 
+            # calculate running reward rate
+            protocols = ['AB', 'CD']
+            for pp in protocols:
+                if result_concat[pp].empty:
+                    reward = np.array([np.nan])
+                else:
+                    reward = result_concat[pp]['reward'].fillna(0)
+                    reward = reward.replace([2, 3], 1)
+                rewarded = (reward > 0).astype(float)
+                n_trials = len(rewarded)
+                window_size = 60
+                running_reward_prob = np.full(n_trials, np.nan)
+            
+                if n_trials >= window_size:
+                    csum = np.empty(n_trials + 1, dtype=float)
+                    csum[0] = 0.0
+                    np.cumsum(rewarded.to_numpy(), out=csum[1:])
+                    running_reward_prob[:n_trials - window_size + 1] = (
+                        csum[window_size:] - csum[:-window_size]
+                    ) / window_size
+                pCorrect = pd.Series(running_reward_prob).rolling(500, center=True, min_periods=1).mean().to_numpy()
+            
+                p = np.asarray(pCorrect, dtype=float)
+                valid_idx = np.flatnonzero(np.isfinite(p))
+                learned_level = 0.6
+                plateau_stability_tol = 0.03
+                # choose plateau window length relative to the available data
+                # so it adapts for long or short sessions rather than using a hard 200-trial window.
+                plateau_min_frac = 0.05
+                plateau_min_n = max(100, int(np.ceil(valid_idx.size * plateau_min_frac)))
+                plateau_min_n = min(plateau_min_n, 250)
+                learning_window = (np.nan, np.nan)
+                learning_window_perf = (np.nan, np.nan)
+                plateau_window = None
+                plateau_perf = np.nan
+                sigmoid_tau = np.nan
+                sigmoid_boundary_10_90 = (np.nan, np.nan)
+                sigmoid_params = (np.nan, np.nan, np.nan, np.nan)
+                x_curve = valid_idx.astype(float) + 1
+                y_curve = []
+                if valid_idx.size:
+                    p_valid = p[valid_idx]
+                    above_learned = p_valid >= learned_level
+                    # identify windows of length `plateau_min_n` where the
+                    # performance is stable (max-min <= tolerance) and the
+                    # window median is above the learned level. This finds the
+                    # start of a sustained, stable plateau rather than the
+                    # first time the curve crosses the threshold.
+                    plateau_start_pos = None
+                    if p_valid.size >= plateau_min_n:
+                        try:
+                            from numpy.lib.stride_tricks import sliding_window_view
+                            windows = sliding_window_view(p_valid, plateau_min_n)
+                        except Exception:
+                            # fallback to manual stacking if sliding_window_view
+                            # isn't available
+                            windows = np.vstack([
+                                p_valid[i: i + plateau_min_n]
+                                for i in range(p_valid.size - plateau_min_n + 1)
+                            ])
 
-        output = { 'k': float(k_fit), 
-                  'tau': float(tau_fit), 
-                  'trial': t_vals, 
-                  'outcome': y_vals, 
-                  'fitted_probability': fitted, 
-                  'nll': float(result.fun), }
+                        # window median and range
+                        window_median = np.nanmedian(windows, axis=1)
+                        window_range = np.nanmax(windows, axis=1) - np.nanmin(windows, axis=1)
 
-        tt = np.arange(1, len(t_vals)+1)
+                        candidates = np.flatnonzero((window_median >= learned_level) & (window_range <= plateau_stability_tol))
+                        if candidates.size:
+                            plateau_start_pos = int(candidates[0])
+                    if plateau_start_pos is not None:
+                        plateau_end_pos = plateau_start_pos + plateau_min_n - 1
+                        while (
+                            plateau_end_pos + 1 < above_learned.size
+                            and above_learned[plateau_end_pos + 1]
+                        ):
+                            # Check if expanding the window maintains stability:
+                            # (1) range is small, and (2) no sustained trend (first half median ≈ second half median)
+                            window = p_valid[plateau_end_pos - plateau_min_n + 2:plateau_end_pos + 2]
+                            if window.size > 0:
+                                window_range = np.nanmax(window) - np.nanmin(window)
+                                # Split window into halves and check medians (detect sustained rise/fall)
+                                mid = len(window) // 2
+                                first_half_median = np.nanmedian(window[:mid]) if mid > 0 else np.nan
+                                second_half_median = np.nanmedian(window[mid:]) if (len(window) - mid) > 0 else np.nan
+                                trend_magnitude = abs(second_half_median - first_half_median)
+                                
+                                # Only expand if range is small AND trend is negligible
+                                if window_range <= plateau_stability_tol and trend_magnitude <= plateau_stability_tol / 2:
+                                    plateau_end_pos += 1
+                                else:
+                                    break
+                            else:
+                                break
+                        plateau_window = (
+                            int(valid_idx[plateau_start_pos] + 1),
+                            int(valid_idx[plateau_end_pos] + 1)
+                        )
+                        plateau_perf = float(np.nanmedian(p_valid[plateau_start_pos:plateau_end_pos + 1]))
 
-        p_right = model_prob(
-            result.x,
-            tt,
-            np.zeros_like(tt)
+                        # refine plateau start to the first point where performance
+                        # reaches (or nearly reaches) the identified plateau performance.
+                        # This moves the reported start to the point where the curve
+                        # actually attains the plateau level (useful for cases like
+                        # animal '381' where plateau_perf ~ 0.8 and the true start
+                        # is later than the learned_level crossing).
+                        try:
+                            plateau_thresh = plateau_perf - 0.02
+                            if plateau_thresh < learned_level:
+                                plateau_thresh = learned_level
+
+                            # find earliest index in p_valid that reaches threshold
+                            reach_idxs = np.flatnonzero(p_valid >= plateau_thresh)
+                            if reach_idxs.size:
+                                # pick the first occurrence that is not after the originally
+                                # detected plateau start (guard against odd cases)
+                                new_start_pos = int(reach_idxs[0])
+                                if new_start_pos > plateau_start_pos:
+                                    plateau_start_pos = new_start_pos
+                                    # update plateau_window start coordinate
+                                    plateau_window = (
+                                        int(valid_idx[plateau_start_pos] + 1),
+                                        plateau_window[1]
+                                    )
+                        except Exception:
+                            # if anything goes wrong, keep original plateau_start_pos
+                            pass
+
+                        start_search = p_valid[:plateau_start_pos + 1]
+                        if start_search.size:
+                            baseline_n = max(1, min(500, start_search.size // 2))
+                            baseline_level = np.nanmedian(start_search[:baseline_n])
+                            rise_threshold = max(0.02, 0.2 * (np.nanmedian(p_valid[plateau_start_pos:plateau_end_pos + 1]) - baseline_level))
+                            transition_mask = start_search >= baseline_level + rise_threshold
+                            transition_n = min(10, transition_mask.size)
+                            sustained_rise = np.convolve(
+                                transition_mask.astype(int),
+                                np.ones(transition_n, dtype=int),
+                                mode='valid'
+                            ) == transition_n
+                            rise_pos = np.flatnonzero(sustained_rise)
+                            if rise_pos.size:
+                                chance_pos = np.flatnonzero(start_search[:rise_pos[0] + 1] <= baseline_level + 0.02)
+                                start_pos = chance_pos[-1] if chance_pos.size else rise_pos[0]
+                            else:
+                                start_pos = 0
+                        else:
+                            start_pos = 0
+
+                        start_idx = valid_idx[start_pos]
+                        end_idx = valid_idx[plateau_start_pos]
+                        learning_window = (int(start_idx + 1), int(end_idx + 1))
+                        learning_window_perf = (float(p[start_idx]), float(p[end_idx]))
+                        fit_pad = max(250, end_idx - start_idx)
+                        fit_start = max(0, start_idx - fit_pad)
+                        fit_end_idx = min(
+                            valid_idx[plateau_start_pos] + 400,
+                            valid_idx[plateau_end_pos]
+                        )
+                        fit_end = min(len(p), fit_end_idx + 1)
+                        fit_idx = np.arange(fit_start, fit_end)
+                        fit_idx = fit_idx[np.isfinite(p[fit_idx])]
+                        if fit_idx.size >= 8:
+                            x_fit = fit_idx.astype(float) + 1
+                            y_fit = p[fit_idx]
+
+                            # fix the high asymptote to the estimated plateau performance
+                            def sigmoid(params, x):
+                                p_low, k, tau = params
+                                p_delta = plateau_perf - p_low
+                                return p_low + p_delta / (1 + np.exp(-k * (x - tau)))
+
+                            def sigmoid_loss(params):
+                                y_hat = sigmoid(params, x_fit)
+                                return np.mean((y_fit - y_hat) ** 2)
+
+                            p_low0 = float(np.nanpercentile(y_fit, 10))
+                            p_low0 = min(p_low0, plateau_perf - 0.02)
+                            initial = [
+                                p_low0,
+                                0.01,
+                                float((learning_window[0] + learning_window[1]) / 2),
+                            ]
+                            bounds = [
+                                (0.0, plateau_perf - 1e-6),
+                                (1e-6, None),
+                                (float(x_fit[0]), float(x_fit[-1])),
+                            ]
+                            result = minimize(sigmoid_loss, initial, bounds=bounds, method='L-BFGS-B')
+                            if result.success:
+                                p_low, k, tau = result.x
+                                p_delta = plateau_perf - p_low
+                                sigmoid_tau = float(tau)
+                                sigmoid_params = (float(p_low), float(p_delta), float(k), float(tau))
+                                delta_t = np.log(9) / k
+                                sigmoid_boundary_10_90 = (float(tau - delta_t), float(tau + delta_t))
+                                
+                                y_curve = sigmoid(result.x, x_curve)
+
+                    else:
+                        # no learning occurred, set the tau to be the total number of trials
+                        sigmoid_boundary_10_90 = [np.nan, np.nan]
+                        sigmoid_tau = np.nan
+
+                    if plateau_window is None:
+                        saveData[animal][pp]['learning_window'] = None
+                        saveData[animal][pp]['learning_window_perf'] = None
+                        saveData[animal][pp]['plateau_window'] = None
+                        saveData[animal][pp]['plateau_perf'] = None
+                        saveData[animal][pp]['sigmoid_tau'] = len(valid_idx)
+                        saveData[animal][pp]['sigmoid_boundary_10_90'] = None
+                        saveData[animal][pp]['sigmoid_params'] = None
+                        saveData[animal][pp]['sigmoid_par_name'] = None
+                    else:
+                        saveData[animal][pp]['learning_window'] = learning_window
+                        saveData[animal][pp]['learning_window_perf'] = learning_window_perf
+                        saveData[animal][pp]['plateau_window'] = plateau_window
+                        saveData[animal][pp]['plateau_perf'] = plateau_perf
+                        saveData[animal][pp]['sigmoid_tau'] = sigmoid_tau
+                        saveData[animal][pp]['sigmoid_boundary_10_90'] = sigmoid_boundary_10_90
+                        saveData[animal][pp]['sigmoid_params'] = sigmoid_params
+                        saveData[animal][pp]['sigmoid_par_name'] = ['p_low', 'p_delta', 'k', 'tau']
+                        startTrial = int(sigmoid_boundary_10_90[0])
+                        endTrial = int(sigmoid_boundary_10_90[1])
+                        saveData[animal][pp]['response_times_preLearning'] = result_concat[pp]['outcome'][0:startTrial] - result_concat[pp]['center_in'][0:startTrial]
+                        saveData[animal][pp]['response_times_duringLearning'] = result_concat[pp]['outcome'][startTrial:endTrial] - result_concat[pp]['center_in'][startTrial:endTrial]
+                        saveData[animal][pp]['intertrial_intervals_preLearning'] = np.diff(result_concat[pp]['center_in'][0:startTrial])
+                        saveData[animal][pp]['intertrial_intervals_duringLearning'] = np.diff(result_concat[pp]['center_in'][startTrial:endTrial])
+                    # get the response times and intertrial intervals before learning
+                    # and during learning
+
+                    learning_summary_rows.append({
+                        'Animal': animal,
+                        'Gender': Animal_sessions['Gender'].iloc[0],
+                        'Genotype': Animal_sessions['Genotype'].iloc[0],
+                        'Protocol': pp,
+                        'FittedTau': saveData[animal][pp]['sigmoid_tau'],
+                        'PlateauPerformance': saveData[animal][pp]['plateau_perf'],
+                        'FittedK': (
+                            saveData[animal][pp]['sigmoid_params'][2]
+                            if saveData[animal][pp]['sigmoid_params'] is not None
+                            else np.nan
+                        ),
+                    })
+
+                    # make the plot
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    ax.plot(x_curve, p[valid_idx], color='black', linewidth=2, label='Data')
+                    # plot y = 0.5 line
+                    ax.axhline(0.5, color='black', linestyle='--', linewidth=1.5)
+                    if plateau_window is not None:
+                        ax.axvspan(
+                            plateau_window[0],
+                            plateau_window[1],
+                            color='green',
+                            alpha=0.12,
+                            label='First plateau'
+                        )
+                    if len(y_curve) > 0:
+                        ax.plot(x_curve, y_curve, color='red', linewidth=2, label='Sigmoid fit')
+                        ax.axvspan(
+                            sigmoid_boundary_10_90[0],
+                            sigmoid_boundary_10_90[1],
+                            color='red',
+                            alpha=0.15,
+                            label='10-90% boundary'
+                        )
+                        ax.axvline(sigmoid_tau, color='red', linestyle='--', linewidth=1.5, label='Tau')
+                    ax.set_xlabel('Trial')
+                    ax.set_ylabel('P(correct)')
+                    ax.set_ylim(0, 1)
+                    ax.set_title(f'{animal} {pp} learning curve')
+                    ax.legend(frameon=False)
+                    ax.spines['top'].set_visible(False)
+                    ax.spines['right'].set_visible(False)
+                    fig.tight_layout()
+                    os.makedirs(os.path.join(self.summary, animal), exist_ok=True)
+                    fig.savefig(
+                        os.path.join(self.summary,animal, f'{animal}_{pp}_learning_sigmoid.png'),
+                        dpi=300,
+                        bbox_inches='tight'
+                    )
+                    plt.close(fig)
+                    
+            if not hasattr(self, 'eureka_learning'):
+                self.eureka_learning = {}
+            self.eureka_learning[animal] = saveData[animal]
+
+        eureka_learning_summary = pd.DataFrame.from_records(
+            learning_summary_rows,
+            columns=['Animal', 'Genotype', 'Gender','Protocol', 'FittedTau', 'PlateauPerformance', 'FittedK']
         )
+        os.makedirs(self.summary, exist_ok=True)
+        eureka_learning_summary.to_csv(os.path.join(self.summary, 'eureka_learning_summary.csv'), index=False)
+        self.eureka_learning_summary = eureka_learning_summary
 
-        p_left = model_prob(
-            result.x,
-            tt,
-            np.ones_like(tt)
-        )
+        for gender in eureka_learning_summary['Gender'].unique():
+            gender_df = eureka_learning_summary[eureka_learning_summary['Gender'] == gender]
+            metrics = [
+                ('FittedTau', 'Fitted tau'),
+                ('FittedK', 'Fitted K'),
+            ]
+            genotype_order = [g for g in ['WT', 'HET', 'KO'] if g in set(gender_df['Genotype'].dropna())]
+            genotype_order += [g for g in gender_df['Genotype'].dropna().unique() if g not in genotype_order]
+            stats_rows = []
 
-        plt.figure()
+            for protocol, protocol_df in gender_df.groupby('Protocol', sort=False):
+                if protocol_df.empty or not genotype_order:
+                    continue
 
-        plt.plot(tt, p_right, label='Right')
-        plt.plot(tt, p_left, label='Left')
+                for metric, _ in metrics:
+                    plot_data = [
+                        pd.to_numeric(
+                            protocol_df.loc[protocol_df['Genotype'] == genotype, metric],
+                            errors='coerce'
+                        ).dropna().to_numpy()
+                        for genotype in genotype_order
+                    ]
+                    for i, genotype_a in enumerate(genotype_order):
+                        values_a = plot_data[i]
+                        for j in range(i + 1, len(genotype_order)):
+                            genotype_b = genotype_order[j]
+                            values_b = plot_data[j]
+                            if values_a.size and values_b.size:
+                                stat, p_value = mannwhitneyu(values_a, values_b, alternative='two-sided')
+                            else:
+                                stat, p_value = np.nan, np.nan
+                            stats_rows.append({
+                                'Protocol': protocol,
+                                'Metric': metric,
+                                'GenotypeA': genotype_a,
+                                'GenotypeB': genotype_b,
+                                'N_A': values_a.size,
+                                'N_B': values_b.size,
+                                'U': stat,
+                                'PValue': p_value,
+                            })
 
-        plt.xlabel('Trial')
-        plt.ylabel('P(correct)')
-        plt.legend()
+            eureka_learning_stats = pd.DataFrame(
+                stats_rows,
+                columns=['Protocol', 'Metric', 'GenotypeA', 'GenotypeB', 'N_A', 'N_B', 'U', 'PValue']
+            )
+            eureka_learning_stats['AdjustedPValue'] = np.nan
+            eureka_learning_stats['Significant'] = False
+            eureka_learning_stats['Gender'] = gender
+            valid_p = np.isfinite(eureka_learning_stats['PValue'])
+            if valid_p.any():
+                reject, adjusted_p, _, _ = multipletests(
+                    eureka_learning_stats.loc[valid_p, 'PValue'],
+                    alpha=0.05,
+                    method='fdr_bh'
+                )
+                eureka_learning_stats.loc[valid_p, 'AdjustedPValue'] = adjusted_p
+                eureka_learning_stats.loc[valid_p, 'Significant'] = reject
 
-        window_size = 60
-        trial = np.arange(1, len(resultdf)+1)
-        reward = resultdf['reward'].fillna(0)
-        reward = reward.replace([2, 3], 1)
-        choice = resultdf['actions']
-        schedule = resultdf['schedule'].values
-        # bin edges
+            for protocol, protocol_df in gender_df.groupby('Protocol', sort=False):
+                if protocol_df.empty or not genotype_order:
+                    continue
 
-        left_rate = []
-        right_rate = []
-        bin_center = []
-        window_centers = np.arange(window_size//2, len(resultdf) - window_size//2)
-        for tt in window_centers:
+                fig, axes = plt.subplots(1, len(metrics), figsize=(4 * len(metrics), 4), squeeze=False)
+                axes = axes[0]
+                for ax, (metric, ylabel) in zip(axes, metrics):
+                    plot_data = [
+                        pd.to_numeric(
+                            protocol_df.loc[protocol_df['Genotype'] == genotype, metric],
+                            errors='coerce'
+                        ).dropna().to_numpy()
+                        for genotype in genotype_order
+                    ]
+                    ax.boxplot(
+                        plot_data,
+                        labels=genotype_order,
+                        patch_artist=True,
+                        showfliers=False,
+                        medianprops={'color': 'black', 'linewidth': 1.5},
+                        boxprops={'facecolor': 'white', 'edgecolor': 'black'},
+                        whiskerprops={'color': 'black'},
+                        capprops={'color': 'black'},
+                    )
+                    for x_pos, values in enumerate(plot_data, start=1):
+                        if values.size:
+                            jitter = np.linspace(-0.08, 0.08, values.size) if values.size > 1 else np.array([0.0])
+                            ax.scatter(
+                                np.full(values.size, x_pos) + jitter,
+                                values,
+                                color='black',
+                                s=25,
+                                alpha=0.8,
+                                zorder=3,
+                            )
+                    metric_stats = eureka_learning_stats[
+                        (eureka_learning_stats['Protocol'] == protocol) &
+                        (eureka_learning_stats['Metric'] == metric)
+                    ]
+                    y_values = np.concatenate([values for values in plot_data if values.size]) if any(values.size for values in plot_data) else np.array([])
+                    if y_values.size and not metric_stats.empty:
+                        y_min = float(np.nanmin(y_values))
+                        y_max = float(np.nanmax(y_values))
+                        y_span = y_max - y_min if y_max > y_min else max(abs(y_max), 1.0)
+                        y_base = y_max + 0.08 * y_span
+                        y_step = 0.12 * y_span
+                        for row_idx, (_, row) in enumerate(metric_stats.iterrows()):
+                            x1 = genotype_order.index(row['GenotypeA']) + 1
+                            x2 = genotype_order.index(row['GenotypeB']) + 1
+                            y = y_base + row_idx * y_step
+                            y_bracket = y + 0.02 * y_span
+                            ax.plot([x1, x1, x2, x2], [y, y_bracket, y_bracket, y], color='black', linewidth=1)
+                            adj_p = row['AdjustedPValue']
+                            p_label = f"FDR p={adj_p:.3g}" if np.isfinite(adj_p) else "FDR p=nan"
+                            ax.text((x1 + x2) / 2, y_bracket + 0.005 * y_span, p_label, ha='center', va='bottom', fontsize=8)
+                        ax.set_ylim(top=y_base + len(metric_stats) * y_step + 0.08 * y_span)
+                    ax.set_title(ylabel)
+                    ax.set_ylabel(ylabel)
+                    ax.spines['top'].set_visible(False)
+                    ax.spines['right'].set_visible(False)
 
-            start = tt - window_size//2
-            end = tt + window_size//2
+                fig.suptitle(f'{protocol} learning fit by genotype {gender}')
+                fig.tight_layout()
+                fig.savefig(
+                    os.path.join(self.summary, f'{protocol}_learning_fit_by_genotype_{gender}.png'),
+                    dpi=300,
+                    bbox_inches='tight'
+                )
+                plt.close(fig)
 
-            idx = (trial >= start) & (trial < end)
+        eureka_learning_stats.to_csv(os.path.join(self.summary, 'eureka_learning_mannwhitney.csv'), index=False)
+        self.eureka_learning_stats = eureka_learning_stats
 
-            left_idx = idx & (schedule == 1)
-            right_idx = idx & (schedule== 2)
-
-            if left_idx.sum() > 0:
-                left_rate.append(reward[left_idx].mean())
-            else:
-                left_rate.append(np.nan)
-
-            if right_idx.sum() > 0:
-                right_rate.append(reward[right_idx].mean())
-            else:
-                right_rate.append(np.nan)
-
-
-
-        plt.figure(figsize=(8,4))
-        plt.plot(window_centers, left_rate, 'o-', label='Left')
-        plt.plot(window_centers, right_rate, '-', label='Right')
-
-        plt.xlabel('Trial')
-        plt.ylabel('Reward rate')
-        plt.ylim(0,1)
-        plt.legend()
-        plt.show()
+    def plot_response_times(self):
+        """Plot distributions of response times and intertrial intervals by genotype."""
+        if not hasattr(self, 'eureka_learning'):
+            print("eureka_learning not found. Run find_eureka first.")
+            return
+        
+        # Collect data by genotype and period
+        data_by_genotype = {}
+        
+        for animal in self.eureka_learning:
+            genotype = self.data_index[self.data_index['Animal'] == animal]['Genotype'].iloc[0]
+            
+            if genotype not in data_by_genotype:
+                data_by_genotype[genotype] = {
+                    'response_times_preLearning': [],
+                    'response_times_duringLearning': [],
+                    'intertrial_intervals_preLearning': [],
+                    'intertrial_intervals_duringLearning': [],
+                }
+            
+            for protocol in self.eureka_learning[animal]:
+                if isinstance(self.eureka_learning[animal][protocol], dict):
+                    data = self.eureka_learning[animal][protocol]
+                    
+                    # Collect response times
+                    if 'response_times_preLearning' in data :
+                        data_by_genotype[genotype]['response_times_preLearning'].extend(data['response_times_preLearning'])
+                    if 'response_times_duringLearning' in data :
+                        data_by_genotype[genotype]['response_times_duringLearning'].extend(data['response_times_duringLearning'])
+                    
+                    # Collect intertrial intervals
+                    if 'intertrial_intervals_preLearning' in data :
+                        data_by_genotype[genotype]['intertrial_intervals_preLearning'].extend(data['intertrial_intervals_preLearning'])
+                    if 'intertrial_intervals_duringLearning' in data :
+                        data_by_genotype[genotype]['intertrial_intervals_duringLearning'].extend(data['intertrial_intervals_duringLearning'])
+        
+        if not data_by_genotype:
+            print("No timing data found in eureka_learning")
+            return
+        
+        genotypes = sorted(data_by_genotype.keys())
+        colors = {'WT': 'black', 'HET': 'orange', 'KO': 'red'}
+        
+        # Plot response times
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # Pre-learning
+        ax = axes[0]
+        for genotype in genotypes:
+            rt_pre = np.array(data_by_genotype[genotype]['response_times_preLearning'])
+            rt_pre = rt_pre[np.isfinite(rt_pre)]
+            if rt_pre.size > 0:
+                ax.hist(rt_pre, bins=30, alpha=0.6, label=genotype, color=colors.get(genotype, 'gray'))
+        ax.set_xlabel('Response time (s)')
+        ax.set_ylabel('Frequency')
+        ax.set_title('Response Times (Pre-Learning)')
+        ax.legend()
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        # During learning
+        ax = axes[1]
+        for genotype in genotypes:
+            rt_during = np.array(data_by_genotype[genotype]['response_times_duringLearning'])
+            rt_during = rt_during[np.isfinite(rt_during)]
+            if rt_during.size > 0:
+                ax.hist(rt_during, bins=30, alpha=0.6, label=genotype, color=colors.get(genotype, 'gray'))
+        ax.set_xlabel('Response time (s)')
+        ax.set_ylabel('Frequency')
+        ax.set_title('Response Times (During Learning)')
+        ax.legend()
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.summary, 'response_times_by_genotype.png'), dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        
+        # Plot intertrial intervals
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # Pre-learning
+        ax = axes[0]
+        for genotype in genotypes:
+            iti_pre = np.array(data_by_genotype[genotype]['intertrial_intervals_preLearning'])
+            iti_pre = iti_pre[np.isfinite(iti_pre)]
+            if iti_pre.size > 0:
+                ax.hist(iti_pre, bins=30, alpha=0.6, label=genotype, color=colors.get(genotype, 'gray'))
+        ax.set_xlabel('Intertrial interval (s)')
+        ax.set_ylabel('Frequency')
+        ax.set_title('Intertrial Intervals (Pre-Learning)')
+        ax.legend()
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        # During learning
+        ax = axes[1]
+        for genotype in genotypes:
+            iti_during = np.array(data_by_genotype[genotype]['intertrial_intervals_duringLearning'])
+            iti_during = iti_during[np.isfinite(iti_during)]
+            if iti_during.size > 0:
+                ax.hist(iti_during, bins=30, alpha=0.6, label=genotype, color=colors.get(genotype, 'gray'))
+        ax.set_xlabel('Intertrial interval (s)')
+        ax.set_ylabel('Frequency')
+        ax.set_title('Intertrial Intervals (During Learning)')
+        ax.legend()
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.summary, 'intertrial_intervals_by_genotype.png'), dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        
+        print(f"Response times and intertrial intervals plots saved to {self.summary}")
 
     def plot_performance(self):
         # call matlab function to plot the performance
