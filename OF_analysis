@@ -1,0 +1,14 @@
+from behavioral_pipeline import *
+
+# interactive plot background
+import matplotlib
+matplotlib.use('QtAgg') 
+import matplotlib.pyplot as plt
+
+plt.ion()
+
+# root directory
+strain = 'Scn2A'
+root_dir = os.path.join(r'Y:\HongliWang\Openfield_ASD', strain)
+
+OF = BehDataOF(root_dir, strain)
