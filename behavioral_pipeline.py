@@ -1060,30 +1060,37 @@ class BehDataOdor(BehData):
                 protocols = ['AB', 'CD']
                 for pp in protocols:
                     if len(result_concat[pp]) == 0:
-                        continueclas
+                        continue
                     resultdf = result_concat[pp]
                     resultdf.replace({"actions": ["NAN","NaN", "nan", "None", ""]}, np.nan, inplace=True)
                     resultdf.replace({"schedule": ["NAN", "NaN", "nan", "None", ""]}, np.nan, inplace=True)
                     data = resultdf.dropna(subset=["actions"])
-                    data = data.dropna(subset=['schedule'])
+                    #data = data.dropna(subset=['schedule'])
                     data.schedule = data.schedule.astype(int)
+                    if pp == 'CD':
+                        data['schedule'] = data['schedule']-2
                     save_path = os.path.join(self.analysis,animal,self.behavior, 'Behavior', 'Summary')
                     if not os.path.exists(save_path):
                         os.makedirs(save_path)
                     savedatapath = os.path.join(save_path,
                                                  f'{animal}_{pp}_fit.json')
-                    if os.path.exists(savedatapath):
+                    #if os.path.exists(savedatapath):
                     # load the existing fit
-                        with open(savedatapath, 'r') as f:
-                            latent_fit = json.load(f)
-                    else:
-                        latent_fit = fit_policy_gradient(data, 
+                    #    with open(savedatapath, 'r') as f:
+                    #        latent_fit = json.load(f)
+                    #else:
+                    latent_fit = fit_policy_gradient(data, 
                                                          animalID=animal, savedatapath=savedatapath)
                     model_label = 'Policy Gradient'
                     savefigpath = os.path.join(save_path, f'{animal}_{pp}_latent_fit_concat')
                     plot_latent_session(data, latent_fit, model_label,savefigpath)
 
+    
     def odor_summary(self):
+        # plot summary figures for model fitting
+        # 1. fitted parameters (genotype comparisons)
+        # 2. psychometric curves
+        # 3. weights of bias and stickiness pre/post learning
         pass
     
     def find_eureka(self):
@@ -1806,10 +1813,6 @@ class BehDataOdor(BehData):
         # plot_learning_curve(perf_plot_AB2, save_name = 'AB2_dprime', 
         #     value_col =   'd', trial_col = 'Block')
         plt.close('all')
-
-    def model_fit(self):
-        # call matlab function to fit the computational model
-        pass
 
     def DLC_analysis(self):
         # analyze DLC result per session
