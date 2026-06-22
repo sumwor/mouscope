@@ -11,5 +11,19 @@ plt.ion()
 strain = 'Syngap_B'
 root_dir = os.path.join(r'Y:\HongliWang\Openfield_ASD', strain)
 
-# initializ
+# initialize the openfield instance
+# create a attribute 
+# OF.data_index, a date frame that contains the info of every recording session
+# columns: 
+# Animal - the animal ID
+# Genotype - the genotype of the animal
+# Gender - 
+# Age - the age of the animal at the time of recording
+# AnalysisPath - the path of the analysis folder for that recording session (save single session analysis result)
+# CSV - Path  of the DLC csv file
+# Video - Path of the video file
+# Timestamp - Path of the timestamp csv file
+# DLC_obj - the DLC object that contains the DLC data and analysis results
+# DL_obj.data - the variable containing the DLC labeling data
 OF = BehDataOF(root_dir, strain)
+

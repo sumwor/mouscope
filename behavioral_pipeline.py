@@ -80,6 +80,7 @@ class BehDataOF(BehData):
         # create a dataIndex for all open field data
         DLC_results = []
         video = []
+        timestamp = []
         animalID = []
         analysis = []
         GeneBGID = []
@@ -90,25 +91,28 @@ class BehDataOF(BehData):
             sessionPattern = r'_([0-9]{1,2})(?=DLC)'
             filePatternCSV = '*' + aa + '*_OF*filtered.csv'
             filePatternVideo = '*' + aa + '*.avi'
+            filePatternTimeStamp = '*' + aa + '*timestamps*.csv'
             dataFolder = os.path.join(self.data, aa, 'Openfield', 'BehavioralRecording')
             # find folders in dataFolder
             for folder in os.listdir(dataFolder):
-                csvfiles = glob.glob(f"{dataFolder}/{folder}/{filePatternCSV}")
-                DLC_results.append(csvfiles[0])
-                video.append(glob.glob(f"{dataFolder}/{folder}/{filePatternVideo}")[0])
-                animalID.append(aa)
-                analysis.append(os.path.join(self.analysis, aa, 'Openfield', folder))
-                GeneBGID.append(self.Genotypes[aidx])
-                genderID.append(self.Gender[aidx])
+                if not folder == '.DS_Store':
+                    csvfiles = glob.glob(f"{dataFolder}/{folder}/{filePatternCSV}")
+                    DLC_results.append(csvfiles[0])
+                    video.append(glob.glob(f"{dataFolder}/{folder}/{filePatternVideo}")[0])
+                    timestamp.append(glob.glob(f"{dataFolder}/{folder}/{filePatternTimeStamp}")[0])
+                    animalID.append(aa)
+                    analysis.append(os.path.join(self.analysis, aa, 'Openfield', folder))
+                    GeneBGID.append(self.Genotypes[aidx])
+                    genderID.append(self.Gender[aidx])
 
-                # find the recorded age
-                behAge.append(folder[-3:])
+                    # find the recorded age
+                    behAge.append(folder[-3:])
 
         self.data_index = pd.DataFrame(animalID, columns=['Animal'])
         self.data_index['CSV'] = DLC_results
         self.data_index['Video'] = video
         self.data_index['Age'] = behAge
-
+        self.data_index['Timestamp'] = timestamp
         self.data_index['AnalysisPath'] = analysis
         self.data_index['Genotype'] = GeneBGID
         self.data_index['Gender'] = genderID
