@@ -29,7 +29,7 @@ eng = matlab.engine.start_matlab()
 from scipy.special import expit
 
 from utils_model import *
-
+from pyPlotHW import StartPlots
 # add matlab code into the path
 #eng.addpath(r'C:\Users\Linda\Documents\GitHub\ASD_RLWM\Behavior', nargout=0)
 
@@ -401,10 +401,8 @@ class BehDataOF(BehData):
             runningAve_velocity[0:len(obj.dist_running), idx] = obj.vel_running.flatten()
         """ make plots"""
         """distance plot"""
-        if 'KO' in np.unique(self.data['GeneBG']):
-            mutLabel = 'KO'
-        elif 'Mut' in np.unique(self.data['GeneBG']):
-            mutLabel = 'Mut'
+       
+            mutLabel = self.mutGene
 
         # WTIdx = np.where(self.data['GeneBG'] == 'WT')[0]
 
