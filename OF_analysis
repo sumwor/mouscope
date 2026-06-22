@@ -27,3 +27,5 @@ root_dir = os.path.join(r'Y:\HongliWang\Openfield_ASD', strain)
 # DL_obj.data - the variable containing the DLC labeling data
 OF = BehDataOF(root_dir, strain)
 
+# to do:
+OF.motion_analysis()

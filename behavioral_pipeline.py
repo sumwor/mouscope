@@ -374,7 +374,7 @@ class BehDataOF(BehData):
         angularDist = np.full((len(angEdges), self.nSubjects), np.nan)
         headAngularDist = np.full((len(angEdges), self.nSubjects), np.nan)
 
-        for idx, obj in enumerate(self.data['DLC_obj']):
+        for idx, obj in enumerate(self.data_index['DLC_obj']):
             obj.get_movement()
             # cumulative curve of distance travelled
             cumu_dist = np.cumsum(obj.dist)
