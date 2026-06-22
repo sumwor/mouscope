@@ -148,7 +148,8 @@ def fit_policy_gradient(data, animalID, savedatapath):
 
     #%% save the file in json
     rec_dat = {"args": args, 'res': res, 'opt_hyper': opt_hyper, 
-               "pR_fit": pR,"wMode": wMode, 'AIC': AIC, 'BIC': BIC,
+               "pR_fit": pR, 'weighted_sum': weighted_sum,
+               "wMode": wMode, 'AIC': AIC, 'BIC': BIC,
                  'weight': ['bias', 'stim', 'stick']}
 
     # recover hyper parameters and std
