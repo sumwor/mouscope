@@ -16,11 +16,10 @@ Odor.load_data()
 #Odor.session_analysis()
 
 #%% model fitting (only implemented policy gradient for now)
-#Odor.model_fitting(fit_mode='sessions')
-Odor.model_fitting(fit_mode='concat')
+Odor.model_fitting(fit_mode='session')
+#Odor.model_fitting(fit_mode='concat')
 
 #Odor.plot_performance()
-#Odor.find_eureka()
 #Odor.plot_response_times()
 
 Odor.align_timeStamps()
