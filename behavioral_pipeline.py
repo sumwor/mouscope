@@ -1,29 +1,36 @@
 # code to process behavior files and align calcium data with behavior timestamps
-import os
-import numpy as np
-import pandas as pd
+import copy
 import glob
+import os
+import pickle
+import re
 from collections import defaultdict
 from datetime import datetime
-import re
-from utils_imaging import *
-from utils_beh import *
+
+import imageio.v3 as iio
+
+# matplotlib
 import matplotlib
-matplotlib.use('QtAgg') 
+matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
+plt.ion()
 from matplotlib.collections import LineCollection
-import pickle
-import copy
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.patches import Patch
-import imageio.v3 as iio
+
+import numpy as np
+import pandas as pd
 import ruptures as rpt
 import statsmodels.stats.api as smf
-from scipy.signal import spectrogram,hilbert,correlate, find_peaks
-from scipy.stats import pearsonr, mannwhitneyu
-from statsmodels.stats.multitest import multipletests
+
 from scipy.optimize import minimize
+from scipy.signal import correlate, find_peaks, hilbert, spectrogram
+from scipy.special import expit
+from scipy.stats import mannwhitneyu, pearsonr
+from statsmodels.stats.multitest import multipletests
+
+
 try:
     import matlab.engine
 except ModuleNotFoundError:
@@ -34,9 +41,12 @@ if matlab is not None:
 else:
     eng = None
 
-from scipy.special import expit
-from utils_model import *
+# Project-local utilities
 from pyPlotHW import StartPlots
+from utils_beh import *
+from utils_imaging import *
+from utils_model import *
+
 # add matlab code into the path
 #eng.addpath(r'C:\Users\Linda\Documents\GitHub\ASD_RLWM\Behavior', nargout=0)
 
@@ -419,7 +429,7 @@ class BehDataOF(BehData):
         """ make plots"""
         """distance plot"""
        
-            mutLabel = self.mutGene
+        mutLabel = self.mutGene
 
         # WTIdx = np.where(self.data['GeneBG'] == 'WT')[0]
 
