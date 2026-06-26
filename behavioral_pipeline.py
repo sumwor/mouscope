@@ -64,9 +64,13 @@ class BehData:
         else:   
             self.Hemisphere = [None] * len(self.Animals)
 
-        if strain == 'Syngap_B':
-            self.WTGene = 'WT'
-            self.mutGene = 'HET'
+        strain_parts = strain.split('_')
+        if any(part in ['Cntnap2'] for part in strain_parts):
+            self.Mut = 'KO'
+        elif any(part in ['TSC2', 'Shank3B', 'ChD8', 'Syngap', 'Scn2A'] for part in strain_parts):
+            self.Mut = 'HET'
+        elif any(part in ['Nlgn3'] for part in strain_parts):
+            self.Mut = 'HEM'
 
 class BehDataOF(BehData):
 
@@ -143,13 +147,9 @@ class BehDataOF(BehData):
         self.data_index['DLC_obj'] = DLC_obj
         self.plotT = np.arange(0, minFrames-1)/fps
         animalIdx = np.arange(self.nSessions)
-        genotype = self.data_index['Genotype'].astype(str).str.strip().str.upper().to_numpy()
 
-        self.WTGene = 'WT'
-        self.mutGene = 'Mut'
-
-        self.WTIdx = animalIdx[genotype == self.WTGene]
-        self.MutIdx = animalIdx[(genotype != self.WTGene) & (genotype != '') & (genotype != 'NAN')]
+        self.WTIdx = animalIdx[self.data_index['Genotype'] == self.WTGene]
+        self.MutIdx = animalIdx[self.data_index['Genotype'] == self.mutGene]
         # grouping the animals
 
         if len(np.unique(self.Gender))==2:
