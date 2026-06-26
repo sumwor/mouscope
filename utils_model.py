@@ -5,7 +5,7 @@ from scipy.special import expit
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Qt5Agg")
+matplotlib.use("QtAgg")
 import os
 import json
 

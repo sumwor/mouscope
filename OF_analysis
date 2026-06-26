@@ -8,8 +8,9 @@ import matplotlib.pyplot as plt
 plt.ion()
 
 # root directory
-strain = 'Syngap_B'
-root_dir = os.path.join(r'Y:\HongliWang\Openfield_ASD', strain)
+# change this variable to analyze one strain at a time, e.g. 'Syngap' or 'Scn2A'
+strain = 'Scn2A'
+root_dir = os.path.join(r'Z:\HongliWang\Openfield_ASD', strain)
 
 # initialize the openfield instance
 # create a attribute 
@@ -27,5 +28,7 @@ root_dir = os.path.join(r'Y:\HongliWang\Openfield_ASD', strain)
 # DL_obj.data - the variable containing the DLC labeling data
 OF = BehDataOF(root_dir, strain)
 
-# to do:
-OF.motion_analysis()
+summary_path = os.path.join(root_dir, 'summary')
+os.makedirs(summary_path, exist_ok=True)
+
+OF.motion_analysis(summary_path)
