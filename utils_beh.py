@@ -1,5 +1,6 @@
 # utility functions for behaviral analysis
 import csv
+import gspread
 import numpy as np
 import pandas as pd
 from pygam import LinearGAM, s, f
@@ -11,6 +12,10 @@ from skimage import color
 
 import matplotlib
 matplotlib.use('QtAgg') 
+from datetime import datetime, timedelta
+import time
+from gspread.exceptions import APIError
+from tqdm import tqdm
 
 import matplotlib.pyplot as plt
 plt.ion()
@@ -70,7 +75,6 @@ def load_DLC(filepath):
             print(f'Processed {line_count} lines.')
     
     return data
-
 
 def moving_average(x, window=5):
     return np.convolve(x, np.ones(window)/window, mode='same')
@@ -938,7 +942,7 @@ def plot_learning_curve(
     max_performance = clean_df['performance'].max()
     if max_performance <= 1:
         ymax = 1
-    elif max_performance > 50 & max_performance <= 300:
+    elif max_performance > 50 and max_performance <= 300:
         ymax = 300
 
 
@@ -988,12 +992,21 @@ def plot_learning_curve(
             f"FDA p interaction = {p_values.get('genotype:learning', np.nan):.3g}"
         )
         ax.text(
-            0.02, 0.98, stats_text,
+            0.98, 0.98, stats_text,
             transform=ax.transAxes,
             va='top',
-            ha='left',
+            ha='right',
             fontsize=9
         )
+
+    # save stats to csv
+    # if summary_path is not None:
+    #     os.makedirs(os.path.join(summary_path, 'Results'), exist_ok=True)
+    #     stats_df.to_csv(
+    #         os.path.join(summary_path, 'Results', f'{save_name}_FDA.csv'),
+    #         index=False
+    #     )
+
     # plot 0.5 and 0.7 line in the plot
     ax.axhline(y=0.5, color=[0.7, 0.7, 0,.7], linestyle='--')
     ax.axhline(y=0.7, color=[0.7, 0.7, 0,.7], linestyle='--')
@@ -1013,6 +1026,7 @@ def plot_learning_curve(
         fig.savefig(os.path.join(summary_path, 'BehPlots', f'{save_name}.png'), dpi=300)
         fig.savefig(os.path.join(summary_path, 'BehPlots', f'{save_name}.svg'), format='svg')
 
+    plt.close(fig)
     #return fig, ax, stats_df, clean_df
 
 def plot_session(resultdf, protocol, save_path=None, label=None):
@@ -1270,6 +1284,170 @@ def butter_lowpass_filter(data, cutoff_freq, fs, order=5):
     b, a = butter(order, normal_cutoff, btype='low', analog=False)
     y = filtfilt(b, a, data)
     return y
+
+
+def _worksheet_to_df(ws):
+    values = ws.get_all_values()
+    if len(values) == 0:
+        return pd.DataFrame()
+
+    header_row = 0
+    if not any(str(cell).strip() for cell in values[0]):
+        if len(values) > 1:
+            header_row = 1
+        else:
+            return pd.DataFrame()
+
+    headers = [str(cell).strip() for cell in values[header_row]]
+    data_rows = values[header_row + 1:]
+    return pd.DataFrame(data_rows, columns=headers)
+
+def fetch_rotarod(google_url, root_dir, strains, ages):
+
+    gc = gspread.service_account(filename="credentials/rotarod_reader.json")
+    sh = gc.open_by_url(google_url)
+
+    rotarod_ws = sh.worksheet("Rotarod")
+    df = _worksheet_to_df(rotarod_ws)
+
+    # convert numeric columns to nullable integer dtype so numeric fills work
+    numeric_cols = ['AGE', 'DATE', 'ODOR', 'TRIAL']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+
+    # add a sex colum to df
+    df['gender'] = ''
+
+    # forward merge for date, start age
+
+
+    # get some other info from another tab
+
+    id_ws = sh.worksheet('ASD IDs (COMPREHENSIVE)')
+    values = id_ws.get_all_values()
+    ID_df = pd.DataFrame(values[2:], columns=values[1])
+
+    merge_col = ['ROTAROD START AGE', 'ROTAROD START DATE', 
+                    'ODOR START DATE']
+    for cc in merge_col:
+        ID_df[cc] = ID_df[cc].replace('', np.nan)
+        ID_df[cc] = ID_df[cc].ffill()
+    # go over df, if column is empty, find if there is proper values in ID_df
+
+    #%% remember to add digging later
+
+    columns2fill = ['AGE', 'DATE', 'ODOR', 'GENOTYPE', 'SEX']
+    columns2look = ['ROTAROD START AGE', 'ROTAROD START DATE', 
+                    'ODOR START DATE', 'GENOTYPE', 'SEX']
+    nEntries = df.shape[0]
+
+    startRow = 408  # records before this row is disregarded
+    # due to different exp. protocol
+
+    for ee in tqdm(range(408, nEntries)):
+        animal_id = df.loc[ee, 'ASD_ID']
+        ID_idx = np.where(ID_df['ASD ID'] == animal_id)[0][0]
+
+        sheet_row = ee + 2  # IMPORTANT
+        for cIdx, col in enumerate(columns2fill):
+            val = df.loc[ee, col]
+            if pd.isna(val) or val == '':  # if the entry is empty
+                # try to find the corresponding colomn in ID_df
+
+                # update the corresponding value
+                sheet_col = df.columns.get_loc(col) + 1
+
+                if col == 'AGE':
+                    if not ID_df.loc[ID_idx, columns2look[cIdx]]=='--':
+                        startAge = int(ID_df.loc[ID_idx, columns2look[cIdx]])
+                        days2add = int(np.floor((int(df.loc[ee, 'TRIAL']) - 1) / 3))
+                        value = startAge + days2add
+
+                elif col == 'DATE':
+                    startDate = ID_df.loc[ID_idx, columns2look[cIdx]]
+                    if not startDate == '--':
+                        dt = datetime.strptime(startDate, '%m/%d/%y')
+                        dt2 = dt + timedelta(days=int(np.floor(int((df.loc[ee, 'TRIAL']) - 1) / 3)))
+                        value = int(dt2.strftime('%Y%m%d'))
+
+                elif col == 'ODOR':
+                    odordt = ID_df.loc[ID_idx, columns2look[cIdx]]
+                    if not odordt == '--':
+                        dt = datetime.strptime(odordt, '%m/%d/%y')
+                        value = int(dt.strftime('%Y%m%d'))
+                    else:
+                        value = 0
+
+                elif col == 'GENOTYPE':
+                    value = ID_df.loc[ID_idx, columns2look[cIdx]]
+
+                elif col == 'SEX': # 
+                    value = ID_df.loc[ID_idx, columns2look[cIdx]]
+
+                df.loc[ee, col] = value
+                #rotarod_ws.update_cell(sheet_row, sheet_col, value)
+
+    values = [df.columns.tolist()] + df.astype(str).values.tolist()
+
+    #rotarod_ws.clear()
+    #rotarod_ws.update(values, "A1")
+
+    rotarod_data_dir = root_dir
+
+
+    # go over each folder, update the RR_results.csv 
+    for ss in strains:
+        for aa in ages:
+            strain_folder = os.path.join(rotarod_data_dir, f'{ss}_{aa}')
+            if not os.path.exists(strain_folder):
+                os.makedirs(strain_folder)
+            data_folder = os.path.join(strain_folder, 'Data')
+            if not os.path.exists(data_folder):
+                os.makedirs(data_folder)
+            RR_file = os.path.join(data_folder, 'RR_results.csv')
+            animal_file = os.path.join(data_folder, 'AnimalList.csv')
+            
+            # get the result of a given strain and age from df
+
+            # for 'age', remove empty column with '' first
+            age_col = df['AGE']
+            age_col[df['AGE']==''] = np.nan
+
+            if aa=='adol':
+                df_mask = np.logical_and(df['STRAIN']==ss, age_col<45)
+            else:
+                df_mask = np.logical_and(df['STRAIN']==ss, age_col>=45)
+
+            df_group = df.loc[df_mask,:]
+            
+            animals = np.unique(df_group['ASD_ID'])
+            genotypes = []
+            for animal in animals:
+                geno = np.unique(df_group['GENOTYPE'][df_group['ASD_ID']==animal])
+                genotypes.append(geno[0])
+
+            # update animalList.csv
+            animal_list_df = pd.DataFrame({'AnimalID': animals, 'Genotype': genotypes})
+            animal_list_df.to_csv(animal_file, index=False)
+
+            # update RR_Results.csv
+            # columns: AnimalID, Genpotype, Age, Weight, Date, Trial, Performance, FBT, Odor, Digging
+
+            # remember to add digging later
+            performance_df = pd.DataFrame({'AnimalID': df_group['ASD_ID'], 
+                                        'Genotype': df_group['GENOTYPE'],
+                                        'Age': df_group['AGE'],
+                                        'Gender': df_group['SEX'],
+                                        'Weight': df_group['WEIGHT'],
+                                        'Date': df_group['DATE'],
+                                        'Trial': df_group['TRIAL'],
+                                        'Performance': df_group['PERFORMANCE'],
+                                        'FBT': df_group['FBT'],
+                                        'Odor': df_group['ODOR']
+                                        })
+            performance_df.to_csv(RR_file, index=False)
+
 
 #%%
 if __name__ == '__main__':
