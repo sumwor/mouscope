@@ -46,7 +46,7 @@ from pyPlotHW import StartPlots
 from utils_beh import *
 from utils_imaging import *
 from utils_model import *
-from uiils_Deeplabcut import *
+from utils_Deeplabcut import *
 # add matlab code into the path
 #eng.addpath(r'C:\Users\Linda\Documents\GitHub\ASD_RLWM\Behavior', nargout=0)
 
