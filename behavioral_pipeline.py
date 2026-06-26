@@ -2614,111 +2614,122 @@ class BehDataRotarod(BehData):
 
         self.behavior = 'Rotarod'
 
+        strain_parts = strain.split('_')
+        if any(part in ['Cntnap2'] for part in strain_parts):
+            self.Mut = 'KO'
+        elif any(part in ['TSC2', 'Shank3B', 'ChD8', 'Syngap', 'Scn2A'] for part in strain_parts):
+            self.Mut = 'HET'
+        elif any(part in ['Nlgn3'] for part in strain_parts):
+            self.Mut = 'HEM'
+        
     def make_dataIndex(self):
         # Create a data index, each row is a session
         # build the data index from rr_result
         rr_results_path = os.path.join(self.data, 'RR_results.csv')
         rr_results = pd.read_csv(rr_results_path)
 
-        self.data_index = pd.DataFrame()
-        self.data_index['Animal'] = rr_results['AnimalID']
-        self.data_index['Trial'] = rr_results['Trial']
-        self.data_index['Date'] = rr_results['Date']
-        self.data_index['Performance'] = rr_results['Performance']
-        self.data_index['FallByTurning'] = rr_results['FBT']
-        self.data_index['Genotype'] = rr_results['Genotype']
-        self.data_index['Sex'] = rr_results['Sex']
-
-        if 'HET' in self.data_index['Genotype'].values:
-            self.Mut = 'HET'
-        elif 'KO' in self.data_index['Genotype'].values:
-            self.Mut = 'KO'
-        self.WT = 'WT' 
-
-        # make a list of DLC result, rod speed, timestamp, video path, and analysis path for each session
-        # length should be the same as the number of rows in data_index
-
-        DLC_results = [[] for _ in range(self.data_index.shape[0])]
-        Rod_speed = [[] for _ in range(self.data_index.shape[0])]
-        timeStamp = [[] for _ in range(self.data_index.shape[0])]
-        video= [[] for _ in range(self.data_index.shape[0])]
-        analysis = [[] for _ in range(self.data_index.shape[0])]
-
-
-        # %% load all files
-        for aidx in range(self.data_index.shape[0]):
-            aa = self.data_index['Animal'][aidx]
-            date = self.data_index['Date'][aidx]
-            dataFolder = os.path.join(self.data, aa, 'Rotarod', 'Behavior',aa+'_'+str(date)[2:])
-            trialNum = self.data_index['Trial'][aidx]
-            if os.path.exists(dataFolder):
-                filePatternSpeed = aa + '*speed*.csv'
-                filePatternDLC = aa + '*DLC_resnet*.csv'
-                filePatternVideo = aa + '*.avi'
-                filePatternTimestamp = aa + '*timeStamp*.csv'
-
-                speedCSV = glob.glob(os.path.join(dataFolder, filePatternSpeed))
-                timeStampCSV = glob.glob(os.path.join(dataFolder, filePatternTimestamp))
-                videoFiles = glob.glob(os.path.join(dataFolder, filePatternVideo))
-                DLCFiles = glob.glob(os.path.join(dataFolder, filePatternDLC))
-                num_files = len(videoFiles)
-
-                if num_files>0:
-                    # match the sessions: ASDxxx followed by optional middle part, 
-                    # then trial(trialNum), optional underscore, and date YYYY-MM-DDTHH...
-                    DLC_ID = [ID for ID in range(len(DLCFiles)) if aa in DLCFiles[ID] and 'trial'+str(trialNum) in DLCFiles[ID]]
-                    if len(DLC_ID)>0:
-                        DLC_results[aidx] = DLCFiles[DLC_ID[0]]
-                    else:
-                        DLC_results[aidx] = None
-                    speed_ID = [ID for ID in range(len(speedCSV)) if aa in speedCSV[ID] and 'trial'+str(trialNum) in speedCSV[ID]]
-
-                    if len(speed_ID)>0:
-                        Rod_speed[aidx] = speedCSV[speed_ID[0]]
-                    else:
-                        Rod_speed[aidx] = None
-
-                    timeStamp_ID = [ID for ID in range(len(timeStampCSV)) if aa in timeStampCSV[ID] and 'trial'+str(trialNum) in timeStampCSV[ID]]
-                    if len(timeStamp_ID)>0:
-                        timeStamp[aidx] = timeStampCSV[timeStamp_ID[0]]
-                    else:
-                        timeStamp[aidx] = None
-
-                    video_ID = [ID for ID in range(len(videoFiles)) if aa in videoFiles[ID] and 'trial'+str(trialNum) in videoFiles[ID]]
-                    if len(video_ID)>0:
-                        video[aidx] = videoFiles[video_ID[0]]                    
-                    else:      
-                        video[aidx] = None
-
-                    #stage.append(matches[0])
-                    analysis[aidx] = os.path.join(self.analysis, aa,'Rotarod', 'Behavior', aa+'_'+str(date)[2:], 'trial'+str(trialNum))
+        if rr_results.shape[0] > 0:
+            self.data_index = pd.DataFrame()
+            self.data_index['Animal'] = rr_results['AnimalID']
+            self.data_index['Trial'] = rr_results['Trial']
+            self.data_index['Date'] = rr_results['Date']
+            self.data_index['Performance'] = rr_results['Performance']
+            self.data_index['FallByTurning'] = rr_results['FBT']
+            self.data_index['Genotype'] = rr_results['Genotype']
+            self.data_index['Gender'] = rr_results['Gender']
 
 
 
-        self.data_index['DLC'] = DLC_results
-        self.data_index['Video'] = video
-        self.data_index['Rod_speed'] = Rod_speed
-        self.data_index['AnalysisPath'] = analysis
-        self.data_index['BehTimestamp'] = timeStamp
+            # if 'HET' in self.data_index['Genotype'].values:
+            #     self.Mut = 'HET'
+            # elif 'KO' in self.data_index['Genotype'].values:
+            #     self.Mut = 'KO'
+            self.WT = 'WT' 
+
+            # make a list of DLC result, rod speed, timestamp, video path, and analysis path for each session
+            # length should be the same as the number of rows in data_index
+
+            DLC_results = [[] for _ in range(self.data_index.shape[0])]
+            Rod_speed = [[] for _ in range(self.data_index.shape[0])]
+            timeStamp = [[] for _ in range(self.data_index.shape[0])]
+            video= [[] for _ in range(self.data_index.shape[0])]
+            analysis = [[] for _ in range(self.data_index.shape[0])]
 
 
-        self.nSubjects = len(self.Animals)
-        #sorted_df = self.dataIndex.sort_values(by=['Animal', 'Trial'])
-        #sorted_df = sorted_df.reset_index(drop=True)
-        #self.data=sorted_df
-        self.nSessions = len(self.data_index['Animal'])
+            # %% load all files
+            for aidx in range(self.data_index.shape[0]):
+                aa = self.data_index['Animal'][aidx]
+                date = self.data_index['Date'][aidx]
+                dataFolder = os.path.join(self.data, aa, 'Rotarod', 'Behavior',aa+'_'+str(date)[2:])
+                trialNum = self.data_index['Trial'][aidx]
+                if os.path.exists(dataFolder):
+                    filePatternSpeed = aa + '*speed*.csv'
+                    filePatternDLC = aa + '*DLC_resnet*.csv'
+                    filePatternVideo = aa + '*.avi'
+                    filePatternTimestamp = aa + '*timeStamp*.csv'
+
+                    speedCSV = glob.glob(os.path.join(dataFolder, filePatternSpeed))
+                    timeStampCSV = glob.glob(os.path.join(dataFolder, filePatternTimestamp))
+                    videoFiles = glob.glob(os.path.join(dataFolder, filePatternVideo))
+                    DLCFiles = glob.glob(os.path.join(dataFolder, filePatternDLC))
+                    num_files = len(videoFiles)
+
+                    if num_files>0:
+                        # match the sessions: ASDxxx followed by optional middle part, 
+                        # then trial(trialNum), optional underscore, and date YYYY-MM-DDTHH...
+                        DLC_ID = [ID for ID in range(len(DLCFiles)) if aa in DLCFiles[ID] and 'trial'+str(trialNum) in DLCFiles[ID]]
+                        if len(DLC_ID)>0:
+                            DLC_results[aidx] = DLCFiles[DLC_ID[0]]
+                        else:
+                            DLC_results[aidx] = None
+                        speed_ID = [ID for ID in range(len(speedCSV)) if aa in speedCSV[ID] and 'trial'+str(trialNum) in speedCSV[ID]]
+
+                        if len(speed_ID)>0:
+                            Rod_speed[aidx] = speedCSV[speed_ID[0]]
+                        else:
+                            Rod_speed[aidx] = None
+
+                        timeStamp_ID = [ID for ID in range(len(timeStampCSV)) if aa in timeStampCSV[ID] and 'trial'+str(trialNum) in timeStampCSV[ID]]
+                        if len(timeStamp_ID)>0:
+                            timeStamp[aidx] = timeStampCSV[timeStamp_ID[0]]
+                        else:
+                            timeStamp[aidx] = None
+
+                        video_ID = [ID for ID in range(len(videoFiles)) if aa in videoFiles[ID] and 'trial'+str(trialNum) in videoFiles[ID]]
+                        if len(video_ID)>0:
+                            video[aidx] = videoFiles[video_ID[0]]                    
+                        else:      
+                            video[aidx] = None
+
+                        #stage.append(matches[0])
+                        analysis[aidx] = os.path.join(self.analysis, aa,'Rotarod', 'Behavior', aa+'_'+str(date)[2:], 'trial'+str(trialNum))
+
+
+
+            self.data_index['DLC'] = DLC_results
+            self.data_index['Video'] = video
+            self.data_index['Rod_speed'] = Rod_speed
+            self.data_index['AnalysisPath'] = analysis
+            self.data_index['BehTimestamp'] = timeStamp
+
+
+            self.nSubjects = len(self.Animals)
+            #sorted_df = self.dataIndex.sort_values(by=['Animal', 'Trial'])
+            #sorted_df = sorted_df.reset_index(drop=True)
+            #self.data=sorted_df
+            self.nSessions = len(self.data_index['Animal'])
 
     def plot_performance(self):
         # looks for gender groups
-        sexes = self.data_index['Sex'].unique()
+        sexes = self.data_index['Gender'].unique()
 
           
         for sex in sexes:
-            perf_df = self.data_index[['Animal', 'Genotype', 'Sex','Trial', 'Performance', 'FallByTurning']].copy()
-            if 'Cntnap' in self.strain:
-                perf_df = perf_df[np.logical_or(perf_df['Genotype'] == 'KO', perf_df['Genotype'] == 'WT')]
+            perf_df = self.data_index[['Animal', 'Genotype', 'Gender','Trial', 'Performance', 'FallByTurning']].copy()
+            #if 'Cntnap' in self.strain:
+            perf_df = perf_df[np.logical_or(perf_df['Genotype'] == self.Mut, perf_df['Genotype'] == self.WT)]
             # only consider KO for now
-            perf_df = perf_df[perf_df['Sex'] == sex]
+            perf_df = perf_df[perf_df['Gender'] == sex]
             perf_df['Performance'] = pd.to_numeric(perf_df['Performance'], errors='coerce')
             if perf_df['FallByTurning'].dtype == bool:
                 fbt_mask = perf_df['FallByTurning'].fillna(False)
@@ -2731,7 +2742,7 @@ class BehDataRotarod(BehData):
                 'Animal': 'subject',
                 'Genotype': 'genotype',
                 'Trial': 'trial',
-                'Sex': 'sex',
+                'Gender': 'sex',
                 'Performance': 'performance'
             })
             perf_df['trial'] = pd.Categorical(perf_df['trial'], categories=np.sort(perf_df['trial'].dropna().unique()), ordered=True)
@@ -2757,13 +2768,15 @@ class BehDataRotarod(BehData):
 
             perf_df.loc[exclude_numeric | exclude_text, 'performance'] = np.nan
 
+            # if performance larger than 300, make it 300
+            perf_df.loc[perf_df['performance'] > 300, 'performance'] = 300
             plot_learning_curve(perf_df, save_name = figure_label, 
                         value_col = 'performance', trial_col = 'trial', summary_path = self.summary,
                                 title = figure_label)
 
-            return perf_df, stats_df
+            #return perf_df, stats_df
     
-    def load_data(self):
+    def load_DLC_data(self):
         # Load rotarod behavior data from file
         DLC_obj= []
 
@@ -3958,7 +3971,8 @@ class DLCSession:
         self.videoPath = videoPath
         self.rodPath = rodspeedPath
         self.nFrames = 0
-        if fps is not None:
+        # test if fps is a number or a file path
+        if isinstance(fps, (int, float)):
             self.fps = fps
         else:
             # load the timeStamp csv
