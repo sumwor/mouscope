@@ -24,10 +24,17 @@ from scipy.signal import spectrogram,hilbert,correlate, find_peaks
 from scipy.stats import pearsonr, mannwhitneyu
 from statsmodels.stats.multitest import multipletests
 from scipy.optimize import minimize
-import matlab.engine
-eng = matlab.engine.start_matlab()
-from scipy.special import expit
+try:
+    import matlab.engine
+except ModuleNotFoundError:
+    matlab = None
 
+if matlab is not None:
+    eng = matlab.engine.start_matlab()
+else:
+    eng = None
+
+from scipy.special import expit
 from utils_model import *
 from pyPlotHW import StartPlots
 # add matlab code into the path
@@ -136,8 +143,13 @@ class BehDataOF(BehData):
         self.data_index['DLC_obj'] = DLC_obj
         self.plotT = np.arange(0, minFrames-1)/fps
         animalIdx = np.arange(self.nSessions)
-        self.WTIdx = animalIdx[self.data_index['Genotype'] == self.WTGene]
-        self.MutIdx = animalIdx[self.data_index['Genotype'] == self.mutGene]
+        genotype = self.data_index['Genotype'].astype(str).str.strip().str.upper().to_numpy()
+
+        self.WTGene = 'WT'
+        self.mutGene = 'Mut'
+
+        self.WTIdx = animalIdx[genotype == self.WTGene]
+        self.MutIdx = animalIdx[(genotype != self.WTGene) & (genotype != '') & (genotype != 'NAN')]
         # grouping the animals
 
         if len(np.unique(self.Gender))==2:
@@ -150,7 +162,7 @@ class BehDataOF(BehData):
         numCrossMat = np.full((self.minFrames, self.nSubjects), np.nan)
         plotT = np.arange(self.minFrames)/self.fps
         for idx, obj in enumerate(self.data['DLC_obj']):
-            savefigFolder = os.path.join(self.analysisFolder, self.animals[idx])
+            savefigFolder = os.path.join(self.analysisFolder, self.Animals[idx])
             if not os.path.exists(savefigFolder):
                 os.makedirs(savefigFolder)
             obj.moving_trace(savefigFolder)
@@ -195,7 +207,7 @@ class BehDataOF(BehData):
         plt.savefig(savefigpath + '/violin_cross_time.svg', dpi=300)
         plt.close()
 
-        data = {'animalID':self.animals,
+        data = {'animalID':self.Animals,
                 'timeinCenter': totalCenter,
                 'crossTime': totalCross}
         data = pd.DataFrame(data)
@@ -359,7 +371,8 @@ class BehDataOF(BehData):
         # distPlot.save_plot('Time spent in the center in running 5 mins windows.tif', 'tif', savefigpath)
         # distPlot.save_plot('Time spent in the center in running 5 mins windows.svg', 'svg', savefigpath)
 
-    def motion_analysis(self, savefigpath):
+    def motion_analysis(self, savefigpath=None):
+
         # basic analysis for motion related variables
         # distance traveled, speed, angular velocity...
         distanceMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
@@ -392,7 +405,11 @@ class BehDataOF(BehData):
             headAngularDist[0:-1, idx] = counts * 100 / (sum(counts))
 
             # running windows
-            savefigFolder = os.path.join(self.analysisFolder, self.animals[idx])
+            if savefigpath is None:
+                savefigFolder = self.data_index.iloc[idx]['AnalysisPath']
+            else:
+                savefigFolder = os.path.join(savefigpath, str(self.Animals[idx]))
+            os.makedirs(savefigFolder, exist_ok=True)
             t = 5*60  # running windos of 5 mins
             obj.get_movement_running(t, savefigFolder)
             obj.get_angular_velocity_running(t, savefigFolder)
@@ -402,7 +419,11 @@ class BehDataOF(BehData):
         """ make plots"""
         """distance plot"""
        
-            mutLabel = self.mutGene
+        mutLabel = self.mutGene
+        if not hasattr(self, 'maleIdx'):
+            self.maleIdx = np.where(self.data_index['Gender'].astype(str).str.upper() == 'M')[0]
+        if not hasattr(self, 'femaleIdx'):
+            self.femaleIdx = np.where(self.data_index['Gender'].astype(str).str.upper() == 'F')[0]
 
         # WTIdx = np.where(self.data['GeneBG'] == 'WT')[0]
 
@@ -531,9 +552,12 @@ class BehDataOF(BehData):
         # save distanceMat, runningAve_distance
 
         # convert to cm
+        if savefigpath is None:
+            savefigpath = self.data_index.iloc[0]['AnalysisPath']
+        os.makedirs(savefigpath, exist_ok=True)
         savedistPath = os.path.join(savefigpath, 'CumulativeDistance.csv')
         data = {}
-        for idx,animal in enumerate(self.animals):
+        for idx,animal in enumerate(self.Animals):
             data[animal] = distanceMat[:,idx]
         data['time'] = self.plotT
         data = pd.DataFrame(data)
@@ -541,7 +565,7 @@ class BehDataOF(BehData):
 
         savedistPath = os.path.join(savefigpath, 'runningAverageDistance.csv')
         data = {}
-        for idx,animal in enumerate(self.animals):
+        for idx,animal in enumerate(self.Animals):
             data[animal] = runningAve_distance[:,idx]
         data['time'] = self.plotT
         data = pd.DataFrame(data)
@@ -2681,8 +2705,8 @@ class BehDataRotarod(BehData):
         self.data_index['DLC_obj'] = DLC_obj
         #self.plotT = np.arange(0, minFrames-1)/fps
         animalIdx = np.arange(self.nSessions)
-        self.WTIdx = animalIdx[self.data_index['Genotype'] == self.WT]
-        self.MutIdx = animalIdx[self.data_index['Genotype'] == self.Mut]
+        self.WTIdx = animalIdx[self.data_index['Genotype'] == self.WTGene]
+        self.MutIdx = animalIdx[self.data_index['Genotype'] == self.mutGene]
         # grouping the animals
 
         # if self.Sex[0]==np.nan: # if no sex info
@@ -4048,19 +4072,26 @@ class DLCSession:
         # plot the distribution of distance to center
         # as well as a function of time
         distPlot = StartPlots()
-        self.dist_center_bins = distPlot.ax.hist(self.dist_center, bins = np.linspace(0, 1200, 101))
-        self.dist_center_bins_30 = distPlot.ax.hist(self.dist_center[0:30*60*self.fps],
-                                                    bins = np.linspace(0,1200, 101))
+        self.dist_center_bins = distPlot.ax.hist(self.dist_center, bins=np.linspace(0, 1200, 101))
+        self.dist_center_bins_30 = distPlot.ax.hist(
+            self.dist_center[0:30 * 60 * int(self.fps)],
+            bins=np.linspace(0, 1200, 101)
+        )
         distPlot.ax.set_xlabel('Distance from center (px)')
         distPlot.ax.set_ylabel('Occurance')
         distPlot.save_plot('Distribution of distance from center.tiff', 'tiff', savefigpath)
+
         # average distance from center in a running window
-        self.dist_center_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
-        for ff in range(self.nFrames - 1 - t*self.fps):
-            self.dist_center_running[ff] = np.nanmean(self.dist_center[ff:ff+t*self.fps])
+        window_frames = int(t * self.fps)
+        n_running = self.nFrames - 1 - window_frames
+        self.dist_center_running = np.zeros((n_running, 1))
+
+        for ff in range(n_running):
+            self.dist_center_running[ff] = np.nanmean(self.dist_center[ff:ff + window_frames])
 
         distRunningPlot = StartPlots()
-        distRunningPlot.ax.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.dist_center_running)
+        x = np.arange(len(self.dist_center_running)) / self.fps
+        distRunningPlot.ax.plot(x, self.dist_center_running.flatten())
         distRunningPlot.ax.set_ylabel('Average distance from center (px)')
         distRunningPlot.ax.set_xlabel('Time (s)')
 
@@ -4241,7 +4272,8 @@ class DLCSession:
             f.close()
 
             velPlot = StartPlots()
-            velPlot.ax.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.dist_running)
+            x = np.arange(len(self.dist_running)) / self.fps
+            velPlot.ax.plot(x, self.dist_running.flatten())
             velPlot.ax.set_ylabel('Average distance traveled (px)')
             #ax2 = velPlot.ax.twinx()
             #ax2.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.vel_running, color='red')
@@ -4919,10 +4951,11 @@ class DLCSession:
 
             # plot the velocity here
             angPlot = StartPlots()
-            angPlot.ax.plot(self.t[0:self.nFrames - 1 - t*self.fps], self.angVel_running)
+            x = np.arange(len(self.angVel_running)) / self.fps
+            angPlot.ax.plot(x, self.angVel_running.flatten())
             angPlot.ax.set_ylabel('Angular velocity')
             ax2 = angPlot.ax.twinx()
-            ax2.plot(self.t[0:self.nFrames - 1 - t*self.fps], self.headAngVel_running, color='red')
+            ax2.plot(x, self.headAngVel_running.flatten(), color='red')
             ax2.set_ylabel('Head angular velocity', color='red')
             angPlot.ax.set_xlabel('Time (s)')
 
