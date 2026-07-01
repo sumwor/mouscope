@@ -171,6 +171,10 @@ def fit_policy_gradient(data, animalID, savedatapath):
     return rec_dat
 
 
+def fit_hybrid(data, animalID, savedatapath):
+    pass
+
+
 def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
 
     
