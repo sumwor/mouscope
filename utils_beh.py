@@ -3,10 +3,10 @@ import csv
 import gspread
 import numpy as np
 import pandas as pd
-from pygam import LinearGAM, s, f
-from scipy.stats import chi2
+
 import os
 import shutil
+from bisect import bisect_left, bisect_right
 import imageio
 from skimage import color
 
@@ -22,6 +22,8 @@ plt.ion()
 import matplotlib.pyplot as plt
 # Deeplabcut related, and MotionSequence related functions
 from scipy.signal import butter, filtfilt
+from pygam import LinearGAM, s, f
+from scipy.stats import chi2
 
 def load_DLC(filepath):
 
@@ -1448,26 +1450,195 @@ def fetch_rotarod(google_url, root_dir, strains, ages):
                                         })
             performance_df.to_csv(RR_file, index=False)
 
+def clean_rotarod_videos(video_folder):
+    # input
+    # video_folder: the folder where the raw videos are stored
+    # root_dir: the root directory where the rotarod data is stored
+    # strains: list of strains to fetch
+    # ages: list of ages to fetch
 
-#%%
+    # clean up raw files
+    # 1. remove size 0 files
+    # 2. remove extra spaces in filenames
+
+    video_sessions = os.listdir(video_folder)
+    for video_session in video_sessions:
+        session_path = os.path.join(video_folder, video_session)
+        if not os.path.isdir(session_path):
+            continue
+
+        with os.scandir(session_path) as files:
+            for file_entry in files:
+                if not file_entry.is_file():
+                    continue
+
+                file_path = file_entry.path
+                if file_entry.stat().st_size == 0:
+                    os.remove(file_path)
+                    continue
+
+                if ' ' in file_entry.name:
+                    os.rename(file_path, os.path.join(session_path, file_entry.name.replace(' ', '')))
+
+    # go through the animalList in root_dir/strains, look for videos in rawvideo files
+    
+def organize_beh_videos(root_folders, raw_video_folder, dlc_folder):
+    # move the videos to the corresponding folders in root_dir
+    # find the corresponding dlc files from dlc_folder
+    # move videos without DLC files to a separate folder for DLC labeling
+
+    strain_folders = os.listdir(root_folders)
+    video_exts = {'.avi', '.mp4', '.mov', '.m4v'}
+    dlc_csv_index = []
+
+    # look for DLC csv files in dlc_folder and 
+    # create an index for them
+    if os.path.isdir(dlc_folder):
+        with os.scandir(dlc_folder) as dlc_entries:
+            dlc_csv_index = sorted(
+                (entry.name.lower(), entry.name, entry.path)
+                for entry in dlc_entries
+                if entry.is_file() and entry.name.lower().endswith('.csv')
+            )
+
+    #%% move exising video recordings to destination folders
+    for strain_folder in strain_folders:
+        data_folder = os.path.join(root_folders, strain_folder, 'Data')
+        # load animalCSV
+        animalList = pd.read_csv(os.path.join(data_folder, 'AnimalList.csv'))
+
+        animal_ids = tuple(animalList['AnimalID'].dropna().astype(str).unique())
+        for aID in animal_ids:
+            behavioral_recordings_folder = os.path.join(data_folder, aID,'Rotarod', 'BehavioralRecording')
+            
+
+            with os.scandir(raw_video_folder) as raw_entries:
+                for raw_entry in raw_entries:
+                    if not raw_entry.is_dir() or not raw_entry.name.startswith(aID):
+                        continue
+
+                    destination_path = os.path.join(behavioral_recordings_folder, raw_entry.name)
+                    if os.path.exists(destination_path):
+                        print(f"Destination already exists, skipping {raw_entry.path}")
+                        continue
+
+                    os.makedirs(behavioral_recordings_folder, exist_ok=True)
+                    if not move_directory_safely(raw_entry.path, destination_path):
+                        continue
+
+    #%% move DLC labels to folders containing matching videos
+    for strain_folder in strain_folders:
+        data_folder = os.path.join(root_folders, strain_folder, 'Data')
+        if not os.path.isdir(data_folder):
+            continue
+
+        with os.scandir(data_folder) as animal_entries:
+            for animal_entry in animal_entries:
+                if not animal_entry.is_dir():
+                    continue
+
+                behavioral_recordings_folder = os.path.join(
+                    animal_entry.path, 'Rotarod', 'BehavioralRecording'
+                )
+                if not os.path.isdir(behavioral_recordings_folder):
+                    continue
+
+                for folder_path, _, filenames in os.walk(behavioral_recordings_folder):
+                    for filename in filenames:
+                        video_stem, video_ext = os.path.splitext(filename)
+                        if video_ext.lower() not in video_exts:
+                            continue
+
+                        prefix = video_stem.lower()
+                        start = bisect_left(dlc_csv_index, (prefix, '', ''))
+                        end = bisect_right(dlc_csv_index, (prefix + '\uffff', '', ''))
+
+                        for _, dlc_name, dlc_path in dlc_csv_index[start:end]:
+                            if not os.path.exists(dlc_path):
+                                continue
+
+                            destination_path = os.path.join(folder_path, dlc_name)
+                            if os.path.exists(destination_path):
+                                print(f"Destination already exists, skipping {dlc_path}")
+                                continue
+
+                            shutil.move(dlc_path, destination_path)
+
+    #%% copy videos withoug DLC labeling to a separate folder 
+    # for DLC labeling
+    forDLCfolder = r'Y:\HongliWang\Rotarod\DLC_training'
+    os.makedirs(forDLCfolder, exist_ok=True)
+
+    for strain_folder in strain_folders:
+        data_folder = os.path.join(root_folders, strain_folder, 'Data')
+        if not os.path.isdir(data_folder):
+            continue
+
+        with os.scandir(data_folder) as animal_entries:
+            for animal_entry in animal_entries:
+                if not animal_entry.is_dir():
+                    continue
+
+                behavioral_recordings_folder = os.path.join(
+                    animal_entry.path, 'Rotarod', 'BehavioralRecording'
+                )
+                if not os.path.isdir(behavioral_recordings_folder):
+                    continue
+
+                for folder_path, _, filenames in os.walk(behavioral_recordings_folder):
+                    csv_names = sorted(
+                        filename.lower()
+                        for filename in filenames
+                        if filename.lower().endswith('.csv')
+                    )
+
+                    for filename in filenames:
+                        video_stem, video_ext = os.path.splitext(filename)
+                        if video_ext.lower() not in video_exts:
+                            continue
+
+                        prefix = video_stem.lower()
+                        start = bisect_left(csv_names, prefix)
+                        has_matching_csv = (
+                            start < len(csv_names)
+                            and csv_names[start].startswith(prefix)
+                        )
+                        if has_matching_csv:
+                            continue
+
+                        source_path = os.path.join(folder_path, filename)
+                        destination_path = os.path.join(forDLCfolder, filename)
+                        if os.path.exists(destination_path):
+                            print(f"Destination already exists, skipping {source_path}")
+                            continue
+
+                        shutil.copy2(source_path, destination_path)
+
+
+def move_directory_safely(source_path, destination_path):
+    """Move a directory to the destination, skipping it if access is denied."""
+    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+    try:
+        shutil.move(source_path, destination_path)
+        return True
+    except (PermissionError, shutil.Error, OSError) as exc:
+        print(f"Skipping {source_path}: {exc}")
+        return False
+
+
+#%% test script
 if __name__ == '__main__':
+    root_dir = r'Y:\HongliWang\Rotarod\ASD_strains'
+    #strains = 'TSC2_adol'
+    video_folder = r'Y:\HongliWang\Rotarod\rawRecordings_260622'
+    dlc_folder = r'Y:\HongliWang\Rotarod\Filtered_DLC'
 
-    #Example usage
-    root_dir = r'Y:\HongliWang\Juvi_ASD Deterministic\TSC2\Analysis'
-    # find the folder in the root_dir
-    folders = [f for f in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, f))]
-    for f in folders:
-        #if not os.path.exists(os.path.join(root_dir, f, 'Odor')):
-        #os.makedirs(os.path.join(root_dir, f, 'Odor'), exist_ok=True)
-        # move behavior directory and every file inside in to the Odor folder
-        # remove .csv files in the folder
-        sub_root = os.path.join(root_dir, f, 'Odor','Behavior')
-        sub_folders = [ff for ff in os.listdir(sub_root) if os.path.isdir(os.path.join(sub_root, ff))]
-        for folder in sub_folders:
-            for file in os.listdir(os.path.join(sub_root, folder)):
-                if file.endswith('.csv'):
-                    os.remove(os.path.join(sub_root, folder, file))
+    # remove size 0 files and clean the filenames
+    clean_rotarod_videos(video_folder)
 
-        
+    # move the videos to the corresponding folders in root_dir
+    # find the corresponding dlc files from dlc_folder
+    # move videos without DLC files to a separate folder for DLC labeling
+    organize_beh_videos(root_dir, video_folder, dlc_folder)   
 # %%
  

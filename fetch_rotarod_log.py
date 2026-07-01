@@ -15,50 +15,9 @@ import os
 import glob
 import re
 import shutil
+from bisect import bisect_left, bisect_right
 
-strain_folders = ['Cntnap2_adol', 'TSC2_adol']
-for strain_folder in strain_folders:
-        data_folder = os.path.join(rotarod_data_dir, strain_folder, 'Data')
-        videos_folder = os.path.join(data_folder, 'Videos')
-        speed_folder = os.path.join(data_folder, 'Speed')
-        timeStamp_csv = glob.glob(os.path.join(videos_folder, '*.csv'))
-        # for each speed_csv, group trial 123, 456, 789, 101112 together, find the corresponding video file
-        # and video timestamp
-        # move these files to a folder under Videos/ASDxxx_xxxxxx
-        for speed_file in timeStamp_csv:
-            match = re.search(r"(ASD\d+)_(\d{6})_trial(\d+)_", speed_file)
 
-            if match:
-                animal_id = match.group(1)
-                date = match.group(2)
-                trial = int(match.group(3))
-
-            speed2move = []
-            video2move = []
-            timestame2move = []
-
-            pattern_speed = os.path.join(speed_folder, f"{animal_id}_{date}_trial{trial}*.csv")
-            speed2move.extend(glob.glob(pattern_speed))
-
-            pattern_video = os.path.join(videos_folder, f"{animal_id}_{date}_trial{trial}*.avi")
-            video2move.extend(glob.glob(pattern_video))
-
-            pattern_timestamp = os.path.join(videos_folder, f"{animal_id}_{date}_trial{trial}*.csv")
-            timestame2move.extend(glob.glob(pattern_timestamp))
-
-            dest_folder = os.path.join(videos_folder, f"{animal_id}_{date}")
-            if not os.path.exists(dest_folder):
-                os.makedirs(dest_folder)
-
-            # move the files to the dest_folder
-            for file in speed2move:
-                shutil.move(file, dest_folder)
-
-            for file in video2move:
-                shutil.move(file, dest_folder)
-
-            for file in timestame2move:
-                shutil.move(file, dest_folder)
 
 #%% Sort TSC2 adolescent rotarod DLC outputs into analysis-ready folders:
 # CSVs are made available to both DLC and MoSeq workflows, labeled videos go
@@ -146,10 +105,78 @@ if os.path.isdir(dlc_folder):
 
             shutil.move(entry.path, os.path.join(dest_folder, entry.name))
 
-#todo: go through each file under Y:\HongliWang\Rotarod\ASD_strains\TSC2_adol\Data
-# check if the file name contains xxxxxx(YYMMDD) following ASDxxx, if not, place xxxxxx (seprated by _) 
-# the correct date for xxxxxx can be found in the subfolder name ASDxxx_xxxxxx
-# so the file name becomes ASDxxx_xxxxxx_trialx....,
-# the file stays in the subfolder.
-# also delete the files if the size is 0
+session_folder_re = re.compile(r'^(ASD\d+)_(\d{6})$', re.IGNORECASE)
+
+for root, dirs, files in os.walk(data_folder):
+    if not files:
+        continue
+
+    session_match = session_folder_re.match(os.path.basename(root))
+    if not session_match:
+        continue
+
+    animal_id, session_date = session_match.groups()
+    dated_prefix = f'{animal_id}_{session_date}'
+    animal_prefix_re = re.compile(rf'^{re.escape(animal_id)}(?!_\d{{6}})', re.IGNORECASE)
+
+    for filename in files:
+        path = os.path.join(root, filename)
+        try:
+            if os.path.getsize(path) == 0:
+                os.remove(path)
+                continue
+        except OSError:
+            continue
+
+        if filename.lower().startswith(dated_prefix.lower()):
+            continue
+
+        if not animal_prefix_re.match(filename):
+            continue
+
+        suffix = filename[len(animal_id):].lstrip('_')
+        new_filename = f'{dated_prefix}_{suffix}' if suffix else dated_prefix
+        new_path = os.path.join(root, new_filename)
+        if new_path != path and not os.path.exists(new_path):
+            os.rename(path, new_path)
 # %%
+base_dir = r'Y:\HongliWang\Rotarod\ASD_strains\TSC2_adol\Data'
+# for subfolder in os.scandir(base_dir):
+#     if not subfolder.is_dir():
+#         continue
+
+#     behavior_dir = os.path.join(subfolder.path, 'Rotarod', 'Behavior')
+#     behavioral_recording_dir = os.path.join(subfolder.path, 'Rotarod', 'BehavioralRecording')
+#     if os.path.isdir(behavior_dir) and not os.path.exists(behavioral_recording_dir):
+#         os.rename(behavior_dir, behavioral_recording_dir)
+
+animal_folder_re = re.compile(r'^ASD\d+$', re.IGNORECASE)
+session_folder_re = re.compile(r'^(ASD\d+)_(\d{6})$', re.IGNORECASE)
+
+with os.scandir(base_dir) as animal_entries:
+    for animal_entry in animal_entries:
+        if not animal_entry.is_dir() or not animal_folder_re.match(animal_entry.name):
+            continue
+
+        behavioral_recording_dir = os.path.join(
+            animal_entry.path, 'Rotarod', 'BehavioralRecording'
+        )
+        if not os.path.isdir(behavioral_recording_dir):
+            continue
+
+        has_entry = False
+        session_dirs = []
+        with os.scandir(behavioral_recording_dir) as recording_entries:
+            for recording_entry in recording_entries:
+                has_entry = True
+                if recording_entry.is_dir() and session_folder_re.match(recording_entry.name):
+                    session_dirs.append((recording_entry.name, recording_entry.path))
+
+        if not has_entry:
+            shutil.rmtree(animal_entry.path)
+            continue
+
+        for session_name, session_path in session_dirs:
+            nested_session_path = os.path.join(session_path, session_name)
+            if os.path.isdir(nested_session_path):
+                shutil.rmtree(nested_session_path)
