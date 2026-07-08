@@ -1,6 +1,5 @@
 # master script for analyzing behavioral and imaging data
 
-
 from behavioral_pipeline import *
 
 import matplotlib
@@ -43,7 +42,7 @@ if run_rotarod:
 
     #%% preprocess step need to run from time-to-time when we still actively collecting data
     # after data-collection, no need to run this step
-    preprocess_rotarod = True
+    preprocess_rotarod = False
     if preprocess_rotarod:
         # preprocess step 1: read the rotarod performance data from google sheet
         # google sheet contains the most up-to-date data
@@ -58,7 +57,7 @@ if run_rotarod:
 
         video_folder = r'Y:\HongliWang\Rotarod\rawRecordings_260622'
         #dlc_folder = r'Y:\HongliWang\Rotarod\Filtered_DLC'
-        dlc_folder = r'Y:\HongliWang\Rotarod\ASD_strains\Cntnap2_adol\Data\DLC'
+        dlc_folder = r'Y:\HongliWang\Rotarod\DLC_training'
         # remove size 0 files and clean the filenames
         #clean_rotarod_videos(video_folder)
 
@@ -67,19 +66,35 @@ if run_rotarod:
 
     
     #%% plot rotarod performance for each strain (separating age and gender)
-    for strain in strains:
-        for age in ages:
-            root_dir = os.path.join(rotarod_dir, strain + '_' + age)
-            strain_folder = strain + '_' + age
+    plot_perf = False
+    if plot_perf:
+        for strain in strains:
+            for age in ages:
+                root_dir = os.path.join(rotarod_dir, strain + '_' + age)
+                strain_folder = strain + '_' + age
 
-            # check if there is data
-            Rotarod = BehDataRotarod(root_dir, strain_folder)
-            #Rotarod.plot_performance()
-            if len(Rotarod.Animals) > 0:
-                #Rotarod.load_DLC_data()
-                Rotarod.plot_performance()
+                # check if there is data
+                Rotarod = BehDataRotarod(root_dir, strain_folder)
+                #Rotarod.plot_performance()
+                if len(Rotarod.Animals) > 0:
+                    #Rotarod.load_DLC_data()
+                    Rotarod.plot_performance()
 
+
+    # check one strain first
+    root_dir = r'Y:\HongliWang\Rotarod\ASD_strains\TSC2_adol'
+    strain_folder = 'TSC2_adol'
+
+    # check if there is data
+    Rotarod = BehDataRotarod(root_dir, strain_folder)
+    
+    # process the data and prepare them for Keypoint-moseq analysis
+    Rotarod.load_DLC_data()
     Rotarod.align_timeStamps()
+    
+    Rotarod.process_for_moseq()
+
+
 
     back_keypoints = ['spine 3', 'tail 1', 'tail 2', 'tail 3', 'left foot', 'right foot']
     front_keypoints = ['nose', 'left ear', 'right ear', 'left hand', 'right hand']

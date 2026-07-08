@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import datetime
 
 import imageio.v3 as iio
+import cv2
 
 # matplotlib
 import matplotlib
@@ -29,17 +30,6 @@ from scipy.signal import correlate, find_peaks, hilbert, spectrogram
 from scipy.special import expit
 from scipy.stats import mannwhitneyu, pearsonr
 from statsmodels.stats.multitest import multipletests
-
-
-try:
-    import matlab.engine
-except ModuleNotFoundError:
-    matlab = None
-
-if matlab is not None:
-    eng = matlab.engine.start_matlab()
-else:
-    eng = None
 
 # Project-local utilities
 from pyPlotHW import StartPlots
@@ -747,7 +737,7 @@ class BehDataOdor(BehData):
 
                 results = []
                 for beh in behFiles:
-                    resultdf = eng.extract_behavior_df(beh)
+                    resultdf = extract_behavior_df(beh)
 
                     # deal with float precision problem
                     resultdf['reward'] = resultdf['reward'].round(0)
@@ -976,8 +966,8 @@ class BehDataOdor(BehData):
             #resultdf = resultdf.drop(columns=['Unnamed: 0'], errors='ignore')
             #data_dict = resultdf.to_dict(orient='list')
             
-            eng.ASD_session(resultdf_path,self.data_index['Protocol'][ss],self.data_index['Animal'][ss], 
-                            self.data_index['Date'][ss],self.data_index['AnalysisPath'][ss],nargout=0)
+            #eng.ASD_session(resultdf_path,self.data_index['Protocol'][ss],self.data_index['Animal'][ss], 
+            #                self.data_index['Date'][ss],self.data_index['AnalysisPath'][ss],nargout=0)
             
     def session_analysis(self):
         # session-wise anlaysis
@@ -2635,7 +2625,6 @@ class BehDataOdor(BehData):
                 # # frame is a numpy array (H x W x 3)
                 # print(frame.shape)
 
-
 class BehDataRotarod(BehData):
 
     def __init__(self, root_file, strain):
@@ -2647,7 +2636,7 @@ class BehDataRotarod(BehData):
         strain_parts = strain.split('_')
         if any(part in ['Cntnap2'] for part in strain_parts):
             self.Mut = 'KO'
-        elif any(part in ['TSC2', 'Shank3B', 'ChD8', 'Syngap', 'Scn2A'] for part in strain_parts):
+        elif any(part in ['TSC2', 'Shank3B', 'Chd8', 'Syngap', 'Scn2A'] for part in strain_parts):
             self.Mut = 'HET'
         elif any(part in ['Nlgn3'] for part in strain_parts):
             self.Mut = 'HEM'
@@ -2690,7 +2679,7 @@ class BehDataRotarod(BehData):
             for aidx in range(self.data_index.shape[0]):
                 aa = self.data_index['Animal'][aidx]
                 date = self.data_index['Date'][aidx]
-                dataFolder = os.path.join(self.data, aa, 'Rotarod', 'Behavior',aa+'_'+str(date)[2:])
+                dataFolder = os.path.join(self.data, aa, 'Rotarod', 'BehavioralRecording',aa+'_'+str(date)[2:])
                 trialNum = self.data_index['Trial'][aidx]
                 if os.path.exists(dataFolder):
                     filePatternSpeed = aa + '*speed*.csv'
@@ -2820,6 +2809,8 @@ class BehDataRotarod(BehData):
             #fps = 50
             if fps is None or len(fps)==0:
                dlc = None
+            elif filePath is None:
+                dlc = None
             else:
                 dlc = DLCSession(filePath, videoPath, rodPath, analysisPath, fps)  
             DLC_obj.append(dlc)
@@ -2827,18 +2818,9 @@ class BehDataRotarod(BehData):
         self.data_index['DLC_obj'] = DLC_obj
         #self.plotT = np.arange(0, minFrames-1)/fps
         animalIdx = np.arange(self.nSessions)
-        self.WTIdx = animalIdx[self.data_index['Genotype'] == self.WTGene]
-        self.MutIdx = animalIdx[self.data_index['Genotype'] == self.mutGene]
-        # grouping the animals
+        self.WTIdx = animalIdx[self.data_index['Genotype'] == self.WT]
+        self.MutIdx = animalIdx[self.data_index['Genotype'] == self.Mut]
 
-        # if self.Sex[0]==np.nan: # if no sex info
-        #     nGroups = 1
-        # else:
-        #     nGroups = 2
-
-        # if nGroups==2:
-        #     self.maleIdx = np.where(self.data['Sex']=='M')[0]
-        #     self.femaleIdx = np.where(self.data['Sex']=='F')[0]
 
         self.startVoltage = [4.45, 40] # 5 rpm = 0.273 V
         self.endVoltage = [8.90, 80]
@@ -3985,6 +3967,167 @@ class BehDataRotarod(BehData):
 
         #%% plot average amplitude/frequency at 5-20 RPM within trial 1-3, 4-6, 7-9, and 10-12
         
+
+    def process_for_moseq(self):
+        # stride analysis for rotarod behavior
+        # in situations where individual syllables jumped to the opposite side
+        # infer the coordinate with previous and post frames
+        # also remove the part when animal turns around
+
+        savefilefolder = os.path.join(self.root_path,'DLCforMoseq')
+        saveorigfolder = os.path.join(self.root_path, 'DLCforMoseq_origTS')
+        if not os.path.exists(savefilefolder):
+            os.makedirs(savefilefolder)
+        if not os.path.exists(saveorigfolder):
+            os.makedirs(saveorigfolder)
+
+        for idx, obj in tqdm(enumerate(self.data_index['DLC_obj'])):
+            animal = self.data_index['Animal'][idx]
+            trialIdx = self.data_index['Trial'][idx]
+            animalIdx = self.Animals.index(animal)
+
+            if self.data_index['DLC_obj'][idx] is not None :
+                # process video
+                # remove the turning part, save the DLC and video 6in separate pieces
+                #obj = self.data['DLC_obj'][idx]
+                turning_mask = obj.data['turning_mask']
+                turning_segments = obj.data['turning_period']
+                # load the Stride_freq
+                DLCCSV = self.data_index['DLC'][idx]
+                df = pd.read_csv(DLCCSV)
+
+                # remove the first the last 5 seconds for frames without animal on the rod
+                timeStart = np.where(obj.data['time']>(obj.data['rodRun'][0]))[0][0] 
+                timeOnRod = self.data_index['Performance'][np.logical_and(self.data_index['Animal']==animal,
+                            self.data_index['Trial']==trialIdx)]
+                timeEnd = np.where(obj.data['time']<(obj.data['rodRun'][0]+timeOnRod-8)[idx])[0][-1] 
+                # isolate the time when animals turns around
+                tempMask = np.logical_and(pd.to_numeric(df['scorer'][2:])>timeStart, pd.to_numeric(df['scorer'][2:])<=timeEnd)
+                tempMask = [True, True]+ list(tempMask)
+
+                file_path = os.path.normpath(DLCCSV)
+
+                # Extract the base filename without extension
+                filename = os.path.splitext(os.path.basename(file_path))[0]
+
+                # go through turning segments to get a non-turning segments
+                non_turning_segments = []
+                if len(turning_segments) ==0:
+                    non_turning_segments.append((0, len(obj.data['time'])-1))
+                elif len(turning_segments) ==1:
+                    non_turning_segments.append((0, turning_segments[0][0]-100))
+                    non_turning_segments.append((turning_segments[0][1]+100, len(obj.data['time'])-1))
+                else:
+                    for turnIdx in range(len(turning_segments)):
+                        if turnIdx==0:
+                            start_frame = 0
+                        else:
+                            start_frame = turning_segments[turnIdx-1][1]+100
+                        if turnIdx == len(turning_segments)-1:
+                            end_frame = len(obj.data['time'])
+                        else:
+                            end_frame = turning_segments[turnIdx][0]-100  # remove about 1s before and after turning
+                        non_turning_segments.append((start_frame, end_frame))
+
+                for turnIdx in range(len(non_turning_segments)):
+                    start_frame, end_frame = non_turning_segments[turnIdx]
+                    nonTurningMask = np.zeros(len(obj.data['time']), dtype=bool)
+                    nonTurningMask[start_frame:end_frame+1] = True
+                    nonTurningMask = [True, True]+ list(nonTurningMask)
+                    saveMask = np.logical_and(tempMask, nonTurningMask)
+
+                    # check it is longer than 2 second
+                    if sum(saveMask) > 100 and start_frame<end_frame:
+                    # save the non-turning segment
+                        df_segment = df[saveMask].copy()
+                        orig_index = df_segment.iloc[:,0].copy()
+                        # renumber it
+                        col = df_segment.iloc[:, 0].astype(object)
+                        col.iloc[2:] = pd.to_numeric(col.iloc[2:], errors='coerce')
+
+                        df_segment[df_segment.columns[0]] = col
+
+                        df_segment.iloc[2:,0] = np.arange(len(df_segment)-2)
+
+                        savefilepath = os.path.join(savefilefolder, filename+f"_clip{turnIdx}.csv")
+                        df_segment.to_csv(savefilepath, index=False)
+                        savetimeStamp = os.path.join(saveorigfolder, filename+f"origIndex_clip{turnIdx}.csv")
+                        orig_index.to_csv(savetimeStamp, index=False)
+                        # save the video segment
+                        mask = saveMask.astype(int)
+
+                        ones_idx = np.where(mask[2:] == 1)[0]
+
+                        start_write = ones_idx[0]
+                        end_write   = ones_idx[-1]
+                        videoPath = self.data_index['Video'][idx]
+                        #cap = cv2.VideoCapture(videoPath)
+                        # container = av.open(videoPath)
+                        # stream = container.streams.video[0]
+                        #     # Determine FPS
+                        # fps = float(stream.average_rate)  # frames per second
+                        # width = stream.codec_context.width
+                        # height = stream.codec_context.height
+
+                        # Create output container and stream
+                        savevideopath_segment = os.path.join(savefilefolder, filename +f'_clip{turnIdx}.mp4')
+                        if not os.path.exists(savevideopath_segment):
+
+                            cap = cv2.VideoCapture(videoPath)
+                            fps = cap.get(cv2.CAP_PROP_FPS)
+                            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+                            # Use MJPG or XVID for AVI; use mp4v or H264 for MP4
+                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  
+                            out = cv2.VideoWriter(savevideopath_segment, fourcc, fps, (width, height))
+
+                            frame_idx = 0
+                            while True:
+                                ret, frame = cap.read()
+                                if not ret:
+                                    break
+
+                                if frame_idx < start_write:
+                                    frame_idx += 1
+                                    continue
+                                if frame_idx > end_write:
+                                    break
+
+                                out.write(frame)
+                                frame_idx += 1
+
+                            cap.release()
+                            out.release()
+
+                            # check if the saved video is corrupted (frames mismatch)
+                            verify_cap = cv2.VideoCapture(savevideopath_segment)
+                            verify_idx = 0
+                            while True:
+                                ret, frame = verify_cap.read()
+                                if not ret:
+                                    break
+                                verify_idx += 1
+
+                            verify_cap.release()
+                            if verify_idx < (end_write - start_write + 1):
+                                nonTurningMask = np.zeros(len(obj.data['time']), dtype=bool)
+                                nonTurningMask[start_write:start_write+verify_idx] = True
+                                nonTurningMask = [True, True]+ list(nonTurningMask)
+                                saveMask = np.logical_and(tempMask, nonTurningMask)
+                                df_segment = df[saveMask]
+                                orig_index = df_segment.iloc[:,0].copy()
+                                # renumber it
+                                df_segment.iloc[2:,0] = np.arange(len(df_segment)-2)
+
+                                savefilepath = os.path.join(savefilefolder, filename+f"_clip{turnIdx}.csv")
+                                df_segment.to_csv(savefilepath, index=False)
+                                savetimeStamp = os.path.join(saveorigfolder, filename+f"origIndex_clip{turnIdx}.csv")
+                                orig_index.to_csv(savetimeStamp, index=False)
+                                # if frames is corrupted, rewrite orig TS and DLC file to match the non-currupted video
+
+
+
 
 
 
