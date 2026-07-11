@@ -1224,3 +1224,100 @@ def frame_input(videoPath):
         arena[n] = points[i]
 
     return arena
+
+def map_point(F1, F2, F3, B1, B2):
+    """ utils function used to calculate the points in one view 
+    based on reference points in both views, and the point in the other view"""
+    F1 = np.array(F1)
+    F2 = np.array(F2)
+    F3 = np.array(F3)
+
+    B1 = np.array(B1)
+    B2 = np.array(B2)
+
+    vF = F2 - F1
+    vB = B2 - B1
+
+    # coordinates in front view
+    u = np.dot(F3-F1, vF) / np.dot(vF, vF)
+
+    cross = np.cross(vF, F3-F1)
+    w = cross / np.dot(vF, vF)
+
+    # perpendicular direction in back view
+    perpB = np.array([-vB[1], vB[0]])
+
+    B3 = B1 + u*vB + w*perpB
+
+    return B3
+
+def correct_bodyparts(df, 
+                      ref_bp = ['rod_left_back', 'rod_right_back', 'rod_left_front', 'rod_right_front'],
+                      image_width = 1596):
+    """ Corrects body part positions in the DataFrame. 
+    if a bodypart jumped too far away to another half of the frame, move it back
+    based on the reference point
+    for rotarod data only
+    """
+    # input:
+    # df: DataFrame containing body part positions
+    # ref_bp: list of reference body part names
+    # image_width: width of the image in pixels
+
+    ref = {}
+    df_corrected = df.copy()
+    for bp in ref_bp:
+        ref[bp] = {}
+        x_col = df.columns[(df.iloc[0] == bp) & (df.iloc[1] == 'x')][0]
+        y_col= df.columns[(df.iloc[0] == bp) & (df.iloc[1] == 'y')][0]
+        x = df.loc[2:, x_col].astype(float).to_numpy()
+        y = df.loc[2:, y_col].astype(float).to_numpy()
+
+        # estimate the position by taking the 5%-95% percentiles, and taking average
+        ref[bp]['x'] = np.mean(x[np.logical_and(x >= np.percentile(x, 10), x <= np.percentile(x, 90))])
+        ref[bp]['y'] = np.mean(y[np.logical_and(y >= np.percentile(y, 10), y <= np.percentile(y, 90))])
+
+        #%% for test
+        videofilePath = r'Y:\HongliWang\Rotarod\ASD_strains\TSC2_adol\DLCforMoseq\ASD578_251217_trial12025-12-17T14_41_40DLC_resnet50_rotarodNov5shuffle1_300000_filtered_clip3.mp4'
+        image = read_video(videofilePath, 0, ifgray=True)
+    
+    # for all other bodyparts, look for outliers that is in another half of the frame
+    bodyparts = np.unique(df.iloc[0,1:].tolist())
+    for bp in bodyparts:
+        if bp not in ref_bp:
+            x_col = df.columns[(df.iloc[0] == bp) & (df.iloc[1] == 'x')][0]
+            y_col = df.columns[(df.iloc[0] == bp) & (df.iloc[1] == 'y')][0]
+            x = df.loc[2:, x_col].astype(float).to_numpy()
+            y = df.loc[2:, y_col].astype(float).to_numpy()
+            
+            # determine if x in left or right half of the frame
+            x_mean = np.mean(x[np.logical_and(x >= np.percentile(x, 10), x <= np.percentile(x, 90))])
+
+            if x_mean < image_width / 2:
+                # x is in the left half of the frame
+                # look for outliers in the right half of the frame
+                outlier_mask = x > image_width / 2
+                ref1 = [ref['rod_left_front']['x'], ref['rod_left_front']['y']]
+                ref2 = [ref['rod_right_front']['x'], ref['rod_right_front']['y']]
+                ref3 = [ref['rod_left_back']['x'], ref['rod_left_back']['y']]
+                ref4 = [ref['rod_right_back']['x'], ref['rod_right_back']['y']]
+            else:
+                # x is in the right half of the frame
+                outlier_mask = x < image_width / 2
+                ref3 = [ref['rod_left_front']['x'], ref['rod_left_front']['y']]
+                ref4 = [ref['rod_right_front']['x'], ref['rod_right_front']['y']]
+                ref1 = [ref['rod_left_back']['x'], ref['rod_left_back']['y']]
+                ref2 = [ref['rod_right_back']['x'], ref['rod_right_back']['y']]
+
+
+            # for outliers, calculate the corrected position given the reference point that
+            # rod_left_back = rod_left_front, and rod_right_back = rod_right_front
+            outlier_index = np.where(outlier_mask)[0]
+            
+            for oidx in outlier_index:
+                target_point = [x[oidx], y[oidx]]
+                corrected_point = map_point(ref1, ref2, target_point, ref3, ref4)
+                df_corrected.loc[2 + oidx, x_col] = str(corrected_point[0])
+                df_corrected.loc[2 + oidx, y_col] = str(corrected_point[1])
+
+    return df_corrected

@@ -4049,6 +4049,9 @@ class BehDataRotarod(BehData):
 
                         df_segment.iloc[2:,0] = np.arange(len(df_segment)-2)
 
+                        # go over the bodyparts in the df_segment, if the bodypart jumped to far a way 
+                        # to the other half of the frame, move it back 
+                        correct_bodyparts(df_segment)
                         savefilepath = os.path.join(savefilefolder, filename+f"_clip{turnIdx}.csv")
                         df_segment.to_csv(savefilepath, index=False)
                         savetimeStamp = os.path.join(saveorigfolder, filename+f"origIndex_clip{turnIdx}.csv")
