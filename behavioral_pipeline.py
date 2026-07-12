@@ -12,7 +12,7 @@ import cv2
 
 # matplotlib
 import matplotlib
-matplotlib.use('QtAgg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 plt.ion()
 from matplotlib.collections import LineCollection
@@ -994,12 +994,14 @@ class BehDataOdor(BehData):
 
             # model fitting!
     
-    def model_fitting(self, fit_mode):
+    def model_fitting(self, fit_mode, model_name="policy_gradient"):
         # fit computational models to the behavioral data
         # fit mode: 'session' or 'concat'
         #          'session': fit model to each session separately
         #          'concat': fit model to the concatenated data of all sessions
-        
+
+        if model_name not in ('policy_gradient', 'hybrid'):
+            raise ValueError(f"Unsupported model_name: {model_name}")
 
         if fit_mode == 'session':
             nSessions = self.data_index.shape[0]
@@ -1030,10 +1032,13 @@ class BehDataOdor(BehData):
                 protocolDay = self.data_index['ProtocolDay'][ss]
                 animalID = self.data_index['Animal'][ss]
                 save_path = os.path.join(self.data_index['AnalysisPath'][ss], 'latent')
+                os.makedirs(save_path, exist_ok=True)
                 
                 fit_params.loc[ss, 'protocol'] = f'{protocol}{protocolDay}'
 
-                savedatapath = os.path.join(save_path,'policy_gradient_fit.json')
+                fit_filename = ('policy_gradient_fit.json' if model_name == 'policy_gradient'
+                                else 'hybrid_fit.json')
+                savedatapath = os.path.join(save_path, fit_filename)
 
                 # preprocess the data (remove AB trials for AB-CD sessions)
                 # fit AB and AB-CD sessions only
@@ -1056,8 +1061,17 @@ class BehDataOdor(BehData):
                     # load the existing fit
                     with open(savedatapath, 'r') as f:
                         latent_fit = json.load(f)
+                elif model_name == 'hybrid':
+                    latent_fit = fit_hybrid(data, animalID=animalID,
+                                            savedatapath=savedatapath)
                 else:
                     latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
+
+                if model_name == 'hybrid':
+                    model_label = 'Hybrid RL'
+                    savefigpath = os.path.join(save_path, f'{animalID}_{protocol}_latent_fit')
+                    plot_latent_session(data, latent_fit, model_label,savefigpath)
+                    continue
 
                 weights = latent_fit['weight']
                 opt_vars = latent_fit['args']['optList']
@@ -1145,15 +1159,26 @@ class BehDataOdor(BehData):
                     save_path = os.path.join(self.analysis,animal,self.behavior, 'Behavior', 'Summary')
                     if not os.path.exists(save_path):
                         os.makedirs(save_path)
-                    savedatapath = os.path.join(save_path,
-                                                 f'{animal}_{pp}_fit.json')
+                    fit_filename = (f'{animal}_{pp}_fit.json'
+                                    if model_name == 'policy_gradient'
+                                    else f'{animal}_{pp}_hybrid_fit.json')
+                    savedatapath = os.path.join(save_path, fit_filename)
                     if os.path.exists(savedatapath):
                     # load the existing fit
                         with open(savedatapath, 'r') as f:
                             latent_fit = json.load(f)
+                    elif model_name == 'hybrid':
+                        latent_fit = fit_hybrid(data, animalID=animal,
+                                                savedatapath=savedatapath)
                     else:
                         latent_fit = fit_policy_gradient(data, 
                                                          animalID=animal, savedatapath=savedatapath)
+
+                    if model_name == 'hybrid':
+                        model_label = 'Hybrid RL'
+                        savefigpath = os.path.join(save_path, f'{animal}_{pp}_latent_fit_concat')
+                        plot_latent_session(data, latent_fit, model_label,savefigpath)
+                        continue
                     
                     # load data in dataframe 
                     weights = latent_fit['weight']
@@ -1180,6 +1205,9 @@ class BehDataOdor(BehData):
                     plot_latent_session(data, latent_fit, model_label,savefigpath)
 
         #%% plot summary figures
+
+        if model_name == 'hybrid':
+            return
 
         #%% 1. plot fitted parameters. to do: make this work for both fit_mode
         

@@ -1,13 +1,17 @@
 # utility functions for computational models
+import os
+import json
+
+import matplotlib
+
+matplotlib.use("Agg")
+
 from matplotlib import pyplot as plt
+
 from scipy.optimize import minimize
 from scipy.special import expit
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("QtAgg")
-import os
-import json
 
 import psytrack_learning as psy
 from psytrack_learning.getMAP import getMAP
@@ -172,7 +176,134 @@ def fit_policy_gradient(data, animalID, savedatapath):
 
 
 def fit_hybrid(data, animalID, savedatapath):
-    pass
+    """Fit a basic hybrid RL model to trial-by-trial odor behavior.
+
+    The model combines stimulus-specific Q-learning with side bias,
+    choice stickiness, and a lapse component.
+
+    P(right) = (1 - lapse) * sigmoid(
+        beta * (Q_right - Q_left) + bias + stickiness * previous_choice
+    ) + lapse * 0.5
+    """
+    data = data.copy()
+    data.replace({"actions": ["NAN", "NaN", "nan", "None", ""]}, np.nan, inplace=True)
+    data.replace({"schedule": ["NAN", "NaN", "nan", "None", ""]}, np.nan, inplace=True)
+    data = data.dropna(subset=["actions", "schedule"]).reset_index(drop=True)
+
+    actions = pd.to_numeric(data["actions"], errors="coerce").to_numpy(dtype=float)
+    schedules = pd.to_numeric(data["schedule"], errors="coerce").to_numpy(dtype=float)
+    rewards = pd.to_numeric(data["reward"], errors="coerce").fillna(0).to_numpy(dtype=float)
+    rewards = (rewards > 0).astype(float)
+
+    valid = np.isfinite(actions) & np.isfinite(schedules)
+    actions = actions[valid].astype(int)
+    schedules = schedules[valid].astype(int)
+    rewards = rewards[valid]
+
+    if actions.size == 0:
+        raise ValueError("No valid trials found for hybrid model fitting.")
+    if not np.all(np.isin(actions, [0, 1])):
+        raise ValueError("Hybrid model expects actions coded as 0/1.")
+
+    stimulus_values = np.sort(np.unique(schedules))
+    stim_to_idx = {stim: idx for idx, stim in enumerate(stimulus_values)}
+    stim_idx = np.array([stim_to_idx[stim] for stim in schedules], dtype=int)
+
+    n_stimuli = len(stimulus_values)
+    n_trials = len(actions)
+
+    def simulate(params, return_latents=False):
+        alpha, beta, bias, stickiness, lapse = params
+
+        Q = np.full((n_stimuli, 2), 0.5, dtype=float)
+        prev_choice = 0.0
+
+        pR = np.full(n_trials, np.nan)
+        pChoice = np.full(n_trials, np.nan)
+        q_left = np.full(n_trials, np.nan)
+        q_right = np.full(n_trials, np.nan)
+        q_diff = np.full(n_trials, np.nan)
+        prediction_error = np.full(n_trials, np.nan)
+
+        eps = 1e-12
+        nll = 0.0
+
+        for tt in range(n_trials):
+            ss = stim_idx[tt]
+            choice = actions[tt]
+            reward = rewards[tt]
+
+            q_left[tt] = Q[ss, 0]
+            q_right[tt] = Q[ss, 1]
+            q_diff[tt] = Q[ss, 1] - Q[ss, 0]
+
+            decision_variable = beta * q_diff[tt] + bias + stickiness * prev_choice
+            p_right = (1 - lapse) * expit(decision_variable) + lapse * 0.5
+            p_right = np.clip(p_right, eps, 1 - eps)
+
+            pR[tt] = p_right
+            pChoice[tt] = p_right if choice == 1 else 1 - p_right
+            nll -= np.log(pChoice[tt])
+
+            prediction_error[tt] = reward - Q[ss, choice]
+            Q[ss, choice] += alpha * prediction_error[tt]
+
+            prev_choice = (choice - 0.5) * 2
+
+        if return_latents:
+            return nll, pR, pChoice, q_left, q_right, q_diff, prediction_error
+        return nll
+
+    initial = np.array([0.1, 2.0, 0.0, 0.0, 0.02], dtype=float)
+    bounds = [
+        (1e-4, 0.999),   # alpha
+        (1e-3, 50.0),    # beta
+        (-10.0, 10.0),   # bias
+        (-10.0, 10.0),   # stickiness
+        (1e-6, 0.4),     # lapse
+    ]
+
+    res = minimize(simulate, initial, method="L-BFGS-B", bounds=bounds)
+
+    opt_params = res.x
+    nll, pR, pChoice, q_left, q_right, q_diff, prediction_error = simulate(
+        opt_params,
+        return_latents=True,
+    )
+
+    param_names = ["alpha", "beta", "bias", "stickiness", "lapse"]
+    params = {name: float(value) for name, value in zip(param_names, opt_params)}
+
+    n_params = len(param_names)
+    AIC = 2 * n_params + 2 * nll
+    BIC = n_params * np.log(n_trials) + 2 * nll
+
+    rec_dat = {
+        "model": "hybrid_rl",
+        "animalID": animalID,
+        "params": params,
+        "NLL": float(nll),
+        "AIC": float(AIC),
+        "BIC": float(BIC),
+        "optimizer_success": bool(res.success),
+        "optimizer_message": str(res.message),
+        "stimulus_values": stimulus_values.tolist(),
+        "n_stimuli": int(n_stimuli),
+        "actions": actions.tolist(),
+        "schedule": schedules.tolist(),
+        "reward": rewards.tolist(),
+        "pR_fit": pR.tolist(),
+        "pChoice_fit": pChoice.tolist(),
+        "Q_left": q_left.tolist(),
+        "Q_right": q_right.tolist(),
+        "Q_diff": q_diff.tolist(),
+        "prediction_error": prediction_error.tolist(),
+    }
+
+    with open(savedatapath, "w") as f:
+        json.dump(rec_dat, f, indent=4)
+
+    return rec_dat
 
 
 def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
@@ -221,6 +352,28 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
 
         # calculate the derivative of the fitted weights, looking for peaks
         w_mode_derivative = np.gradient(w_mode, axis=1)
+
+    elif model_label == 'Hybrid RL':
+        q_diff = np.asarray(latent_fit["Q_diff"], dtype=float)
+        bias = float(latent_fit["params"]["bias"])
+        stickiness = float(latent_fit["params"]["stickiness"])
+
+        w_mode = np.vstack([
+            q_diff,
+            np.full_like(q_diff, bias),
+            np.full_like(q_diff, stickiness),
+        ])
+        weights = ["Q_right_minus_left", "bias", "stickiness"]
+
+        pCorrect_fit_smooth = (
+            pd.Series(latent_fit["pChoice_fit"])
+            .rolling(60, center=True, min_periods=1)
+            .mean()
+            .to_numpy()
+        )
+
+    else:
+        raise ValueError(f"Unsupported model_label: {model_label}")
 
     fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
     # first subplot: running reward probability of data and fit
