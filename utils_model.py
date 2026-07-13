@@ -173,8 +173,7 @@ def fit_policy_gradient(data, animalID, savedatapath):
         )
 
     return rec_dat
-
-
+    
 def fit_hybrid(data, animalID, savedatapath):
     """Fit a basic hybrid RL model to trial-by-trial odor behavior.
 
@@ -188,7 +187,7 @@ def fit_hybrid(data, animalID, savedatapath):
     data = data.copy()
     data.replace({"actions": ["NAN", "NaN", "nan", "None", ""]}, np.nan, inplace=True)
     data.replace({"schedule": ["NAN", "NaN", "nan", "None", ""]}, np.nan, inplace=True)
-    data = data.dropna(subset=["actions", "schedule"]).reset_index(drop=True)
+    data = data.dropna(subset=["schedule"]).reset_index(drop=True)
 
     actions = pd.to_numeric(data["actions"], errors="coerce").to_numpy(dtype=float)
     schedules = pd.to_numeric(data["schedule"], errors="coerce").to_numpy(dtype=float)
@@ -212,49 +211,7 @@ def fit_hybrid(data, animalID, savedatapath):
     n_stimuli = len(stimulus_values)
     n_trials = len(actions)
 
-    def simulate(params, return_latents=False):
-        alpha, beta, bias, stickiness, lapse = params
-
-        Q = np.full((n_stimuli, 2), 0.5, dtype=float)
-        prev_choice = 0.0
-
-        pR = np.full(n_trials, np.nan)
-        pChoice = np.full(n_trials, np.nan)
-        q_left = np.full(n_trials, np.nan)
-        q_right = np.full(n_trials, np.nan)
-        q_diff = np.full(n_trials, np.nan)
-        prediction_error = np.full(n_trials, np.nan)
-
-        eps = 1e-12
-        nll = 0.0
-
-        for tt in range(n_trials):
-            ss = stim_idx[tt]
-            choice = actions[tt]
-            reward = rewards[tt]
-
-            q_left[tt] = Q[ss, 0]
-            q_right[tt] = Q[ss, 1]
-            q_diff[tt] = Q[ss, 1] - Q[ss, 0]
-
-            decision_variable = beta * q_diff[tt] + bias + stickiness * prev_choice
-            p_right = (1 - lapse) * expit(decision_variable) + lapse * 0.5
-            p_right = np.clip(p_right, eps, 1 - eps)
-
-            pR[tt] = p_right
-            pChoice[tt] = p_right if choice == 1 else 1 - p_right
-            nll -= np.log(pChoice[tt])
-
-            prediction_error[tt] = reward - Q[ss, choice]
-            Q[ss, choice] += alpha * prediction_error[tt]
-
-            prev_choice = (choice - 0.5) * 2
-
-        if return_latents:
-            return nll, pR, pChoice, q_left, q_right, q_diff, prediction_error
-        return nll
-
-    initial = np.array([0.1, 2.0, 0.0, 0.0, 0.02], dtype=float)
+    initial = np.array([0.1, 5.0, 0.0, 0.0, 0.02], dtype=float)
     bounds = [
         (1e-4, 0.999),   # alpha
         (1e-3, 50.0),    # beta
@@ -263,11 +220,23 @@ def fit_hybrid(data, animalID, savedatapath):
         (1e-6, 0.4),     # lapse
     ]
 
-    res = minimize(simulate, initial, method="L-BFGS-B", bounds=bounds)
+    def negative_log_posterior(params):
+        nll = neg_log_likelihood(
+            params, actions, rewards, stim_idx, n_stimuli,
+        )
+        beta = params[1]
+        beta_prior_penalty = 0.5 * ((beta - 5.0) / 7.0) ** 2
+        return nll + beta_prior_penalty
+
+    res = minimize(negative_log_posterior, initial, method="L-BFGS-B", bounds=bounds)
 
     opt_params = res.x
-    nll, pR, pChoice, q_left, q_right, q_diff, prediction_error = simulate(
+    nll, pR, pChoice, q_left, q_right, q_diff, prediction_error = neg_log_likelihood(
         opt_params,
+        actions,
+        rewards,
+        stim_idx,
+        n_stimuli,
         return_latents=True,
     )
 
@@ -283,6 +252,8 @@ def fit_hybrid(data, animalID, savedatapath):
         "animalID": animalID,
         "params": params,
         "NLL": float(nll),
+        "negative_log_posterior": float(res.fun),
+        "beta_prior": {"distribution": "normal", "mean": 5.0, "std": 7.0},
         "AIC": float(AIC),
         "BIC": float(BIC),
         "optimizer_success": bool(res.success),
@@ -305,6 +276,48 @@ def fit_hybrid(data, animalID, savedatapath):
 
     return rec_dat
 
+def neg_log_likelihood(params, actions, rewards, stim_idx, n_stimuli, return_latents=False):
+    alpha, beta, bias, stickiness, lapse = params
+
+    Q = np.full((n_stimuli, 2), 0.5, dtype=float)
+    prev_choice = 0.0
+
+    n_trials = len(actions)
+    pR = np.full(n_trials, np.nan)
+    pChoice = np.full(n_trials, np.nan)
+    q_left = np.full(n_trials, np.nan)
+    q_right = np.full(n_trials, np.nan)
+    q_diff = np.full(n_trials, np.nan)
+    prediction_error = np.full(n_trials, np.nan)
+
+    eps = 1e-12
+    nll = 0.0
+
+    for tt in range(n_trials):
+        ss = stim_idx[tt]
+        choice = actions[tt]
+        reward = rewards[tt]
+
+        q_left[tt] = Q[ss, 0]
+        q_right[tt] = Q[ss, 1]
+        q_diff[tt] = Q[ss, 1] - Q[ss, 0]
+
+        decision_variable = beta * q_diff[tt] + bias + stickiness * prev_choice
+        p_right = (1 - lapse) * expit(decision_variable) + lapse * 0.5
+        p_right = np.clip(p_right, eps, 1 - eps)
+
+        pR[tt] = p_right
+        pChoice[tt] = p_right if choice == 1 else 1 - p_right
+        nll -= np.log(pChoice[tt])
+
+        prediction_error[tt] = reward - Q[ss, choice]
+        Q[ss, choice] += alpha * prediction_error[tt]
+
+        prev_choice = (choice - 0.5) * 2
+
+    if return_latents:
+        return nll, pR, pChoice, q_left, q_right, q_diff, prediction_error
+    return nll
 
 def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
 

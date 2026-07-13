@@ -1061,13 +1061,15 @@ class BehDataOdor(BehData):
                     with open(savedatapath, 'r') as f:
                         latent_fit = json.load(f)
                 else:
-                    latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
+                    if model_name == 'policy_gradient':
+                        latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
+                    elif model_name == 'hybrid':
+                        latent_fit = fit_hybrid(data,animalID=animalID, savedatapath=savedatapath)
 
-                if model_name == 'hybrid':
-                    model_label = 'Hybrid RL'
-                    savefigpath = os.path.join(save_path, f'{animalID}_{protocol}_latent_fit')
-                    plot_latent_session(data, latent_fit, model_label,savefigpath)
-                    continue
+                # if model_name == 'hybrid':
+                #     model_label = 'Hybrid RL'
+                #     savefigpath = os.path.join(save_path, f'{animalID}_{protocol}_latent_fit')
+                #     plot_latent_session(data, latent_fit, model_label,savefigpath)
                     
                 if model_name == 'policy_gradient':
                     weights = latent_fit['weight']
@@ -1084,7 +1086,7 @@ class BehDataOdor(BehData):
                 temp['weighted_sum'] = latent_fit['weighted_sum']
                 temp['genotype'] = fit_params['genotype'][ss]
                 temp['animal'] = fit_params['animal'][ss]
-                temp['choice'] = latent_fit['args']['dat']['inputs']['cBoth']
+                temp['choice'] = latent_fit['args']['dat']['y']
                 temp['gender'] = fit_params['gender'][ss]
                 fit_psychometric[pp]= pd.concat(
                     (fit_psychometric[pp], temp))
@@ -1408,54 +1410,54 @@ class BehDataOdor(BehData):
         # genders = [g for g in genders if str(g).strip() != '']
         # genotypes = fit_params['genotype'].dropna().unique()
 
-        # max_weight = 5.95
-        # min_weight = -5.95
-        # step_weight = 0.1
+        max_weight = 9.95
+        min_weight = -9.95
+        step_weight = 0.1
 
-        # for protocol in protocols:
-        #     for gender in genders:
-        #         # calculate binned weighted sum
-        #         pR_data = pd.DataFrame() # calculate average right choice percentage for each animal
-        #         pR_geno = []
-        #         animals_plot = np.unique(self.data_index['Animal'][self.data_index['Gender'] == gender])
-        #         bins = np.arange(
-        #             min_weight - step_weight/2,
-        #             max_weight + step_weight,
-        #             step_weight
-        #         )
-        #         # calculate average right choice percentage for each animal
-        #         for animal in animals_plot:
-        #             pR_geno.append(self.Genotypes[np.array(self.Animals)==animal].values[0])
-        #             #pR_data[animals] = np.full(len(bins), np.nan)
-        #             weights = fit_psychometric[protocol].loc[
-        #                     fit_psychometric[protocol]['animal'] == animal,
-        #                     'weighted_sum'
-        #                 ].to_numpy()
-        #             choices = fit_psychometric[protocol].loc[
-        #                     fit_psychometric[protocol]['animal'] == animal,
-        #                     'choice'
-        #                 ].to_numpy()
-        #             choices_clean = np.array([x[0] for x in choices], dtype=float)
-        #             temp = pd.DataFrame({
-        #                 'weight': -weights,
-        #                 'choice_right': np.array(choices_clean) + 0.5   # convert -0.5/0.5 to 0/1
-        #             })
+        for protocol in protocols:
+            for gender in genders:
+                # calculate binned weighted sum
+                pR_data = pd.DataFrame() # calculate average right choice percentage for each animal
+                pR_geno = []
+                animals_plot = np.unique(self.data_index['Animal'][self.data_index['Gender'] == gender])
+                bins = np.arange(
+                    min_weight - step_weight/2,
+                    max_weight + step_weight,
+                    step_weight
+                )
+                # calculate average right choice percentage for each animal
+                for animal in animals_plot:
+                    pR_geno.append(self.Genotypes[np.array(self.Animals)==animal].values[0])
+                    #pR_data[animals] = np.full(len(bins), np.nan)
+                    weights = fit_psychometric[protocol].loc[
+                            fit_psychometric[protocol]['animal'] == animal,
+                            'weighted_sum'
+                        ].to_numpy()
+                    choices = fit_psychometric[protocol].loc[
+                            fit_psychometric[protocol]['animal'] == animal,
+                            'choice'
+                        ].to_numpy()
+                   
+                    temp_psy = pd.DataFrame({
+                        'weight': weights,
+                        'choice_right': np.array(choices)   # convert -0.5/0.5 to 0/1
+                    })
 
-        #             # assign each trial to a bin
-        #             temp['bin'] = pd.cut(
-        #                 temp['weight'],
-        #                 bins=bins,
-        #                 labels=(bins[:-1] + bins[1:]) / 2
-        #             )
+                    # assign each trial to a bin
+                    temp_psy['bin'] = pd.cut(
+                        temp_psy['weight'],
+                        bins=bins,
+                        labels=(bins[:-1] + bins[1:]) / 2
+                    )
 
-        #             # mean choice in each bin = P(right)
-        #             p_right = (
-        #                     temp.groupby('bin', observed=True)['choice_right']
-        #                     .mean()
-        #                     .reindex(
-        #                         (bins[:-1] + bins[1:]) / 2
-        #                     )
-        #                 )
+                    # mean choice in each bin = P(right)
+                    p_right = (
+                            temp_psy.groupby('bin', observed=True)['choice_right']
+                            .mean()
+                            .reindex(
+                                (bins[:-1] + bins[1:]) / 2
+                            )
+                        )
 
         #             # bin centers and corresponding percentages
         #             bin_centers = p_right.index.astype(float)
@@ -1485,22 +1487,22 @@ class BehDataOdor(BehData):
         #         for gidx, geno in enumerate(genotypes):
         #             nGeno = np.sum(np.array(pR_geno) == geno)
 
-        #             # histogram
-        #             ax[gidx].bar(
-        #                 binned_weight_count['Weight'],
-        #                 binned_weight_count[geno],
-        #                 width=step_weight,
-        #                 color='black',
-        #                 align='center'
-        #             )
+                    # histogram
+                    ax[gidx].bar(
+                        binned_weight_count['Weight'],
+                        binned_weight_count[geno]/np.sum(binned_weight_count),
+                        width=step_weight,
+                        color='black',
+                        align='center'
+                    )
 
-        #             # remove top and right spines of main axis
-        #             ax[gidx].spines['top'].set_visible(False)
-        #             ax[gidx].spines['right'].set_visible(False)
-
-        #             # left y-label only on left plot
-        #             if gidx == 0:
-        #                 ax[gidx].set_ylabel('Count')
+                    # remove top and right spines of main axis
+                    ax[gidx].spines['top'].set_visible(False)
+                    ax[gidx].spines['right'].set_visible(False)
+                    ax[gidx].set_ylim([0, 0.025])
+                    # left y-label only on left plot
+                    if gidx == 0:
+                        ax[gidx].set_ylabel('Percentage of trials')
 
         #             # second y-axis
         #             ax2 = ax[gidx].twinx()
@@ -1536,25 +1538,25 @@ class BehDataOdor(BehData):
         #             else:
         #                 ax2.set_yticklabels([])
 
-        #             ax[gidx].set_xlabel('Weighted sum')
-        #             ax[gidx].set_title(geno)
-
-        #         fig.subplots_adjust(top=0.88)
-        #         fig.tight_layout(rect=[0, 0, 1, 0.88])
-        #         fig.suptitle(f'{protocol} psychometric curve {gender}', y=0.95, fontsize=20)
-        #         os.makedirs(f'{self.summary}/latent', exist_ok=True)
-        #         fig.savefig(
-        #             os.path.join(self.summary,'latent', f'{protocol}_psychometric_curve_by_gender_{gender}_{fit_mode}.png'),
-        #             dpi=300,
-        #             bbox_inches='tight',
-        #             pad_inches=0.2
-        #         )
-        #         fig.savefig(
-        #             os.path.join(self.summary,'latent', f'{protocol}_psychometric_curve_by_gender_{gender}_{fit_mode}.svg'),
-        #             bbox_inches='tight',
-        #             pad_inches=0.2
-        #         )
-        #         plt.close(fig)
+                    ax[gidx].set_xlabel('Weighted sum')
+                    ax[gidx].set_title(geno)
+                    
+                fig.subplots_adjust(top=0.88)
+                fig.tight_layout(rect=[0, 0, 1, 0.88])
+                fig.suptitle(f'{protocol} psychometric curve {gender}', y=0.95, fontsize=20)
+                os.makedirs(f'{self.summary}/latent', exist_ok=True)
+                fig.savefig(
+                    os.path.join(self.summary,'latent', f'{protocol}_psychometric_curve_by_gender_{gender}_{fit_mode}.png'),
+                    dpi=300,
+                    bbox_inches='tight',
+                    pad_inches=0.2
+                )
+                fig.savefig(
+                    os.path.join(self.summary,'latent', f'{protocol}_psychometric_curve_by_gender_{gender}_{fit_mode}.svg'),
+                    bbox_inches='tight',
+                    pad_inches=0.2
+                )
+                plt.close(fig)
 
     def model_comparison(self):
         # compare AIC result for hybrid model and policy gradient model
