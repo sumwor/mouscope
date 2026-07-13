@@ -20,7 +20,7 @@ class StartPlots:
 
     # set colormap
     plt.rcParams['image.cmap'] = 'jet'
-    matplotlib.use('QtAgg')
+    matplotlib.use('Agg')
 
     def __init__(self):
 
