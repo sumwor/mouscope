@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 from scipy.signal import butter, filtfilt
 from pygam import LinearGAM, s, f
 from scipy.stats import chi2
+from scipy.io import loadmat
 
 def load_DLC(filepath):
 
@@ -1666,7 +1667,7 @@ def get_RLWM_EventTimes(filename):
         9.01-9.03: Water valve on 1-3 times
     """
     
-    warnings.filterwarnings('ignore')
+    #warnings.filterwarnings('ignore')
     
     out = {}
     

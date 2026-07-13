@@ -8,23 +8,26 @@ import matplotlib.pyplot as plt
 
 plt.ion()
 
-run_odor = False
+run_odor = True
 run_rotarod = True
 
 
 if run_odor:
     #%% for odor behavioral data
     # analyze the TSC2 behavioral recording data
-    strain = 'Scn2A_adol'
+    strain = 'TSC2_adol'
     root_dir = os.path.join(r'Y:\HongliWang\Juvi_ASD Deterministic', strain)
 
     Odor = BehDataOdor(root_dir, strain)
     Odor.load_data()
     #Odor.session_analysis()
-
+    #Odor.plot_performance()
+    
     #%% model fitting (only implemented policy gradient for now)
     Odor.model_fitting(fit_mode='session')
     #Odor.model_fitting(fit_mode='concat')
+    Odor.model_comparison()
+
 
     #Odor.plot_performance()
     #Odor.plot_response_times()
