@@ -24,7 +24,7 @@ if run_odor:
     #Odor.plot_performance()
     
     #%% model fitting (only implemented policy gradient for now)
-    Odor.model_fitting(fit_mode='session')
+    Odor.model_fitting(fit_mode='session', model_name='policy_gradient')
     #Odor.model_fitting(fit_mode='concat')
     Odor.model_comparison()
 

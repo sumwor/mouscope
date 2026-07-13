@@ -3,9 +3,7 @@ import os
 import json
 
 import matplotlib
-
-matplotlib.use("Agg")
-
+matplotlib.use("QtAgg")
 from matplotlib import pyplot as plt
 
 from scipy.optimize import minimize
@@ -308,97 +306,99 @@ def fit_hybrid(data, animalID, savedatapath):
 
 def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
 
-    
-    reward = pd.to_numeric(resultdf["reward"], errors="coerce").fillna(0).to_numpy()
-    
-    # remove miss trials
-    nomiss_trials = ~np.isnan(resultdf['actions'])
-    reward = reward[nomiss_trials]
-    n_trials = len(reward)
-    x_plot = np.arange(1, n_trials + 1)
-    rewarded = (reward > 0).astype(float)
-    window_size = 60
-    running_reward_prob = np.full(n_trials, np.nan)
-    
-    if n_trials >= window_size:
-        csum = np.empty(n_trials + 1, dtype=float)
-        csum[0] = 0.0
-        np.cumsum(rewarded, out=csum[1:])
-        running_reward_prob[:n_trials - window_size + 1] = (
-            csum[window_size:] - csum[:-window_size]
-        ) / window_size
-    pCorrect_data_smooth = pd.Series(running_reward_prob).rolling(60, center=True, min_periods=1).mean().to_numpy()
+    png_figure = savefigpath+'.png'
+    if not os.path.exists(png_figure):
 
-    if model_label == 'Policy Gradient':
-        w_mode = np.asarray(latent_fit["wMode"], dtype=float)
-        if w_mode.ndim == 1:
-            w_mode = w_mode[None, :]
-        weights = latent_fit['weight']
-        # # estimate the probability of correct based on the latent weights
-
-        sti = latent_fit['args']['dat']['inputs']['cBoth']
-        stick = latent_fit['args']['dat']['inputs']['stick']
-        sti = np.asarray(sti, dtype=float).ravel()
-        stick = np.asarray(stick, dtype=float).ravel()
-
-        # x = np.vstack((np.ones(len(sti)), sti, stick))
+        reward = pd.to_numeric(resultdf["reward"], errors="coerce").fillna(0).to_numpy()
         
-        # weighted_sum = np.sum(x * w_mode, axis=0)
-        # estimate the probability to choose right
-        pR = latent_fit['pR_fit']
-        # convert pR to pCorrect_fit
-        pCorrect_fit = [1 - pR[i] if sti[i]<0 else pR[i] for i in range(len(pR))]
-        pCorrect_fit_smooth = pd.Series(pCorrect_fit).rolling(60, center=True, min_periods=1).mean().to_numpy()
+        # remove miss trials
+        nomiss_trials = ~np.isnan(resultdf['actions'])
+        reward = reward[nomiss_trials]
+        n_trials = len(reward)
+        x_plot = np.arange(1, n_trials + 1)
+        rewarded = (reward > 0).astype(float)
+        window_size = 60
+        running_reward_prob = np.full(n_trials, np.nan)
+        
+        if n_trials >= window_size:
+            csum = np.empty(n_trials + 1, dtype=float)
+            csum[0] = 0.0
+            np.cumsum(rewarded, out=csum[1:])
+            running_reward_prob[:n_trials - window_size + 1] = (
+                csum[window_size:] - csum[:-window_size]
+            ) / window_size
+        pCorrect_data_smooth = pd.Series(running_reward_prob).rolling(60, center=True, min_periods=1).mean().to_numpy()
 
-        # calculate the derivative of the fitted weights, looking for peaks
-        w_mode_derivative = np.gradient(w_mode, axis=1)
+        if model_label == 'policy_gradient':
+            w_mode = np.asarray(latent_fit["wMode"], dtype=float)
+            if w_mode.ndim == 1:
+                w_mode = w_mode[None, :]
+            weights = latent_fit['weight']
+            # # estimate the probability of correct based on the latent weights
 
-    elif model_label == 'Hybrid RL':
-        q_diff = np.asarray(latent_fit["Q_diff"], dtype=float)
-        bias = float(latent_fit["params"]["bias"])
-        stickiness = float(latent_fit["params"]["stickiness"])
+            sti = latent_fit['args']['dat']['inputs']['cBoth']
+            stick = latent_fit['args']['dat']['inputs']['stick']
+            sti = np.asarray(sti, dtype=float).ravel()
+            stick = np.asarray(stick, dtype=float).ravel()
 
-        w_mode = np.vstack([
-            q_diff,
-            np.full_like(q_diff, bias),
-            np.full_like(q_diff, stickiness),
-        ])
-        weights = ["Q_right_minus_left", "bias", "stickiness"]
+            # x = np.vstack((np.ones(len(sti)), sti, stick))
+            
+            # weighted_sum = np.sum(x * w_mode, axis=0)
+            # estimate the probability to choose right
+            pR = latent_fit['pR_fit']
+            # convert pR to pCorrect_fit
+            pCorrect_fit = [1 - pR[i] if sti[i]<0 else pR[i] for i in range(len(pR))]
+            pCorrect_fit_smooth = pd.Series(pCorrect_fit).rolling(60, center=True, min_periods=1).mean().to_numpy()
 
-        pCorrect_fit_smooth = (
-            pd.Series(latent_fit["pChoice_fit"])
-            .rolling(60, center=True, min_periods=1)
-            .mean()
-            .to_numpy()
-        )
+            # calculate the derivative of the fitted weights, looking for peaks
+            w_mode_derivative = np.gradient(w_mode, axis=1)
 
-    else:
-        raise ValueError(f"Unsupported model_label: {model_label}")
+        elif model_label == 'hybrid':
+            q_diff = np.asarray(latent_fit["Q_diff"], dtype=float)
+            bias = float(latent_fit["params"]["bias"])
+            stickiness = float(latent_fit["params"]["stickiness"])
 
-    fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    # first subplot: running reward probability of data and fit
-    #axs[0].plot(x, running_reward_prob, color="black", linewidth=2)
-    axs[0].plot(x_plot, pCorrect_data_smooth, color="black", linewidth=4, label="Data")
-    axs[0].plot(x_plot, pCorrect_fit_smooth, color=[0.7, 0.7, 0.7], linestyle="--", linewidth=4, label="Fit")
-    axs[0].set_ylim([0, 1])
-    axs[0].legend(frameon=False)
-    axs[0].set_ylabel("P(reward)")
-    axs[0].set_title("Running reward probability")
-    axs[0].spines["top"].set_visible(False)
-    axs[0].spines["right"].set_visible(False)
+            w_mode = np.vstack([
+                q_diff,
+                np.full_like(q_diff, bias),
+                np.full_like(q_diff, stickiness),
+            ])
+            weights = ["Q_right_minus_left", "bias", "stickiness"]
 
-    latent_x = np.arange(1, w_mode.shape[1] + 1)
-    for ii in range(w_mode.shape[0]):
-        label = weights[ii] if ii < len(weights) else f"weight_{ii + 1}"
-        axs[1].plot(latent_x, w_mode[ii], linewidth=3, label=label)
-    axs[1].set_ylabel("Latent weight")
-    axs[1].set_xlabel("Trial")
-    axs[1].spines["top"].set_visible(False)
-    axs[1].spines["right"].set_visible(False)
-    axs[1].legend(frameon=False)
+            pCorrect_fit_smooth = (
+                pd.Series(latent_fit["pChoice_fit"])
+                .rolling(60, center=True, min_periods=1)
+                .mean()
+                .to_numpy()
+            )
 
-    fig.tight_layout()
-    fig.savefig(savefigpath+'.png', format="png",dpi=300, bbox_inches="tight")
-    fig.savefig(savefigpath+'.svg',  format="svg", bbox_inches="tight")    
-    plt.close(fig)
+        else:
+            raise ValueError(f"Unsupported model_label: {model_label}")
+
+        fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+        # first subplot: running reward probability of data and fit
+        #axs[0].plot(x, running_reward_prob, color="black", linewidth=2)
+        axs[0].plot(x_plot, pCorrect_data_smooth, color="black", linewidth=4, label="Data")
+        axs[0].plot(x_plot, pCorrect_fit_smooth, color=[0.7, 0.7, 0.7], linestyle="--", linewidth=4, label="Fit")
+        axs[0].set_ylim([0, 1])
+        axs[0].legend(frameon=False)
+        axs[0].set_ylabel("P(reward)")
+        axs[0].set_title("Running reward probability")
+        axs[0].spines["top"].set_visible(False)
+        axs[0].spines["right"].set_visible(False)
+
+        latent_x = np.arange(1, w_mode.shape[1] + 1)
+        for ii in range(w_mode.shape[0]):
+            label = weights[ii] if ii < len(weights) else f"weight_{ii + 1}"
+            axs[1].plot(latent_x, w_mode[ii], linewidth=3, label=label)
+        axs[1].set_ylabel("Latent weight")
+        axs[1].set_xlabel("Trial")
+        axs[1].spines["top"].set_visible(False)
+        axs[1].spines["right"].set_visible(False)
+        axs[1].legend(frameon=False)
+
+        fig.tight_layout()
+        fig.savefig(savefigpath+'.png', format="png",dpi=300, bbox_inches="tight")
+        fig.savefig(savefigpath+'.svg',  format="svg", bbox_inches="tight")    
+        plt.close(fig)
     #return fig

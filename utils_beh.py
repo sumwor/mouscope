@@ -11,7 +11,7 @@ import imageio
 from skimage import color
 
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('QtAgg')
 from datetime import datetime, timedelta
 import time
 from gspread.exceptions import APIError

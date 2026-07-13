@@ -10,7 +10,7 @@ from scipy.signal import correlate, find_peaks
 from tqdm import tqdm
 
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
 plt.ion()
 import imageio
