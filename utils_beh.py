@@ -11,7 +11,10 @@ import imageio
 from skimage import color
 
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('QtAgg')
+import matplotlib.pyplot as plt
+plt.ion()
+
 from datetime import datetime, timedelta
 import time
 from gspread.exceptions import APIError
@@ -1483,24 +1486,35 @@ def clean_rotarod_videos(video_folder):
 
     # go through the animalList in root_dir/strains, look for videos in rawvideo files
     
-def organize_beh_videos(root_folders, raw_video_folder, dlc_folder):
+def organize_beh_videos(root_folders, raw_video_folder, dlc_folder, dlc_labeled_folder):
     # move the videos to the corresponding folders in root_dir
     # find the corresponding dlc files from dlc_folder
     # move videos without DLC files to a separate folder for DLC labeling
 
-    strain_folders = os.listdir(root_folders)
+    strain_folders = [
+        f for f in os.listdir(root_folders)
+        if os.path.isdir(os.path.join(root_folders, f))
+    ]
     video_exts = {'.avi', '.mp4', '.mov', '.m4v'}
     dlc_csv_index = []
 
     # look for DLC csv files in dlc_folder and 
     # create an index for them
-    if os.path.isdir(dlc_folder):
-        with os.scandir(dlc_folder) as dlc_entries:
-            dlc_csv_index = sorted(
-                (entry.name.lower(), entry.name, entry.path)
-                for entry in dlc_entries
-                if entry.is_file() and entry.name.lower().endswith('filtered.csv')
-            )
+    if os.path.isdir(dlc_labeled_folder):
+        if 'DLC' in dlc_labeled_folder: # for deeplabcut labels
+            with os.scandir(dlc_labeled_folder) as dlc_entries:
+                dlc_csv_index = sorted(
+                    (entry.name.lower(), entry.name, entry.path)
+                    for entry in dlc_entries
+                    if entry.is_file() and entry.name.lower().endswith('filtered.csv')
+                )
+        elif 'litPose' in dlc_labeled_folder: # for litPose labels
+            with os.scandir(dlc_labeled_folder) as dlc_entries:
+                dlc_csv_index = sorted(
+                    (entry.name.lower(), entry.name, entry.path)
+                    for entry in dlc_entries
+                    if entry.is_file() and not entry.name.lower().endswith('temporal_norm.csv')
+                )
 
     #%% move exising video recordings to destination folders
     for strain_folder in strain_folders:

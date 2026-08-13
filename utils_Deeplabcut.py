@@ -10,7 +10,7 @@ from scipy.signal import correlate, find_peaks
 from tqdm import tqdm
 
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
 plt.ion()
 import imageio
@@ -1225,31 +1225,27 @@ def frame_input(videoPath):
 
     return arena
 
-def map_point(F1, F2, F3, B1, B2):
-    """ utils function used to calculate the points in one view 
-    based on reference points in both views, and the point in the other view"""
+def map_point(F1, F2, T, F3, F4):
+    """Map T from the coordinate frame defined by F1/F2 to F3/F4."""
     F1 = np.array(F1)
     F2 = np.array(F2)
+    T = np.array(T)
+
     F3 = np.array(F3)
+    F4 = np.array(F4)
 
-    B1 = np.array(B1)
-    B2 = np.array(B2)
+    v12 = F2 - F1
+    v34 = F4 - F3
 
-    vF = F2 - F1
-    vB = B2 - B1
+    delta = T - F1
+    scale = np.dot(v12, v12)
+    along = np.dot(delta, v12) / scale
+    perpendicular = np.cross(v12, delta) / scale
 
-    # coordinates in front view
-    u = np.dot(F3-F1, vF) / np.dot(vF, vF)
+    # Preserve T's coordinates along and perpendicular to its reference pair.
+    T_C = F3 + along * v34 - perpendicular * np.array([-v34[1], v34[0]])
 
-    cross = np.cross(vF, F3-F1)
-    w = cross / np.dot(vF, vF)
-
-    # perpendicular direction in back view
-    perpB = np.array([-vB[1], vB[0]])
-
-    B3 = B1 + u*vB + w*perpB
-
-    return B3
+    return T_C
 
 def correct_bodyparts(df, 
                       ref_bp = ['rod_left_back', 'rod_right_back', 'rod_left_front', 'rod_right_front'],
@@ -1278,8 +1274,8 @@ def correct_bodyparts(df,
         ref[bp]['y'] = np.mean(y[np.logical_and(y >= np.percentile(y, 10), y <= np.percentile(y, 90))])
 
         #%% for test
-        videofilePath = r'Y:\HongliWang\Rotarod\ASD_strains\TSC2_adol\DLCforMoseq\ASD578_251217_trial12025-12-17T14_41_40DLC_resnet50_rotarodNov5shuffle1_300000_filtered_clip3.mp4'
-        image = read_video(videofilePath, 0, ifgray=True)
+        #videofilePath = r'Y:\HongliWang\Rotarod\ASD_strains\TSC2_adol\DLCforMoseq\ASD578_251217_trial12025-12-17T14_41_40DLC_resnet50_rotarodNov5shuffle1_300000_filtered_clip3.mp4'
+        #image = read_video(videofilePath, 0, ifgray=True)
     
     # for all other bodyparts, look for outliers that is in another half of the frame
     bodyparts = np.unique(df.iloc[0,1:].tolist())
@@ -1317,7 +1313,7 @@ def correct_bodyparts(df,
             for oidx in outlier_index:
                 target_point = [x[oidx], y[oidx]]
                 corrected_point = map_point(ref1, ref2, target_point, ref3, ref4)
-                df_corrected.loc[2 + oidx, x_col] = str(corrected_point[0])
-                df_corrected.loc[2 + oidx, y_col] = str(corrected_point[1])
+                df_corrected.iloc[2 + oidx, df_corrected.columns.get_loc(x_col)] = str(corrected_point[0])
+                df_corrected.iloc[2 + oidx, df_corrected.columns.get_loc(y_col)] = str(corrected_point[1])
 
     return df_corrected

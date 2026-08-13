@@ -4,7 +4,9 @@ import json
 
 import matplotlib
 
-matplotlib.use("Agg")
+matplotlib.use("QtAgg")
+import matplotlib.pyplot as plt
+plt.ion()
 
 from matplotlib import pyplot as plt
 

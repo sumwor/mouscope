@@ -55,6 +55,8 @@ class BehData:
             self.Gender = self.AnimalInfo['Gender']
         else:
             self.Gender = ['M']*len(self.Animals)
+        if 'Session_length' in self.AnimalInfo.columns:
+            self.SessionLength = self.AnimalInfo['Session_length']
         if 'Cells' in self.AnimalInfo.columns:
             self.ImageCell = self.AnimalInfo['Cells']
         else:
@@ -709,7 +711,8 @@ class BehDataOdor(BehData):
                 row_dict = {
                     'Animal': a,
                     'Genotype': self.Genotypes[aIdx],
-                    'Gender': self.Gender[aIdx],
+                    'Gender': self.Gender[aIdx] if hasattr(self, 'Gender') else None,
+                    'Session_length': self.SessionLength[aIdx] if hasattr(self, 'SessionLength') else None,
                     'Date': date,
                     'Protocol': protocol,
                     'ProtocolDay': pDay,
@@ -1077,7 +1080,8 @@ class BehDataOdor(BehData):
                     for widx, ww in enumerate(weights):
                         for vv in opt_vars:
                             fit_params.loc[ss, f'{ww}_{vv}'] = latent_fit['opt_hyper'][vv][widx]
-                elif model_name == 'hybrid_mod'
+                elif model_name == 'hybrid_mod':
+                    pass
                 fit_params.loc[ss, f'AIC'] = latent_fit['AIC']
                 fit_params.loc[ss, f'BIC'] = latent_fit['BIC']
 
@@ -2340,7 +2344,9 @@ class BehDataOdor(BehData):
     def plot_performance(self):
         # call matlab function to plot the performance
 
-        perf_df = pd.DataFrame(columns=['Animal','Gender', 'Genotype', 'Date', 'Protocol', 'ProtocolDay', 'RewardRate', 'd'])
+        perf_df = pd.DataFrame(columns=['Animal','Gender', 'Genotype', 'Date', 'Protocol', 'ProtocolDay','TrlalNum', 'RewardRate', 'd'])
+        # for 6-hour sessions, cut the time to 3 hours and calculate the performance
+        perf_df_3h = pd.DataFrame(columns=['Animal','Gender', 'Genotype', 'Date', 'Protocol', 'ProtocolDay','TrialNum', 'RewardRate', 'd'])
         for bIdx, behFiles in enumerate(self.data_index['BehCSV']):
             # load the files, calculate performance in 100-trial blocks
             resultdf = pd.read_csv(behFiles)
@@ -2352,29 +2358,62 @@ class BehDataOdor(BehData):
             perf_df.loc[bIdx, 'RewardRate'] = np.full((25,1), np.nan)
             perf_df.loc[bIdx, 'd'] = np.full((25,1), np.nan)
             perf_df.loc[bIdx, 'Gender'] = self.data_index['Gender'][bIdx]
+            perf_df.loc[bIdx, 'Session_length'] = self.data_index['Session_length'][bIdx]
+            perf_df.loc[bIdx, 'TrialNum'] = np.nan
+
+            resultdf_3h = resultdf[resultdf['side_in'] < (60*60*3 + resultdf['center_in'][0])]
+            perf_df_3h.loc[bIdx, 'Animal'] = self.data_index['Animal'][bIdx]
+            perf_df_3h.loc[bIdx, 'Genotype'] = self.data_index['Genotype'][bIdx]
+            perf_df_3h.loc[bIdx, 'Date'] = self.data_index['Date'][bIdx]
+            perf_df_3h.loc[bIdx, 'Protocol'] = self.data_index['Protocol'][bIdx]
+            perf_df_3h.loc[bIdx, 'ProtocolDay'] = self.data_index['ProtocolDay'][bIdx]
+            perf_df_3h.loc[bIdx, 'RewardRate'] = np.full((25,1), np.nan)
+            perf_df_3h.loc[bIdx, 'd'] = np.full((25,1), np.nan)
+            perf_df_3h.loc[bIdx, 'Gender'] = self.data_index['Gender'][bIdx]
+            perf_df_3h.loc[bIdx, 'Session_length'] = self.data_index['Session_length'][bIdx]
+            perf_df_3h.loc[bIdx, 'TrialNum'] = np.nan
 
             nTrials = resultdf.shape[0]
+            nTrials_3h = resultdf_3h.shape[0]
             tBlocks = 100
             
             protocol = self.data_index['Protocol'][bIdx]
             # determine the session length
             if protocol == 'AB':
                 startTrial = 0
+                startTrial_3h = 0
                 sti_A = 1
                 sti_B = 2
             elif protocol == 'AB-CD':
                 # look for the first trial with schedule 3 or 4
                 startTrial = np.where(resultdf['schedule']>=3)[0][0]
+                if 3 in resultdf_3h['schedule'].values or 4 in resultdf_3h['schedule'].values:
+                    startTrial_3h = np.where(resultdf_3h['schedule']>=3)[0][0]
+                else:
+                    startTrial_3h = np.nan
                 sti_A = 3
                 sti_B = 4
             elif protocol == 'AB-DC' or protocol == 'AB-CD-DC':
                 startTrial = np.where(resultdf['schedule']>=5)[0][0]
+                #startTrial_3h = np.where(resultdf_3h['schedule']>=5)[0][0]
+                startTrial_3h = 0
                 sti_A = 5
                 sti_B = 6
             endTrial = nTrials
+            endTrial_3h = nTrials_3h
+
+            perf_df.loc[bIdx, 'TrialNum'] = endTrial-startTrial+1
+            
+
             result = resultdf.iloc[startTrial:endTrial,:].reset_index(drop=True)
+            if not np.isnan(startTrial_3h):
+                result_3h = resultdf_3h.iloc[startTrial_3h:endTrial_3h,:].reset_index(drop=True)
+                perf_df_3h.loc[bIdx, 'TrialNum'] = endTrial_3h-startTrial_3h+1
+            else:
+                result_3h = None
+                
             nBlocks = result.shape[0] // tBlocks
-                # look for the first trial with schedule 3 or 4, and the first trial with schedule 2 or 4
+            
 
             for bb in range(nBlocks):
 
@@ -2400,6 +2439,34 @@ class BehDataOdor(BehData):
                 d_prime = norm.ppf(hit_rate) - norm.ppf(false_alarm_rate)
                 perf_df.loc[bIdx, 'd'][bb] = d_prime
 
+            # for 3h-cut
+            if not np.isnan(startTrial_3h):
+                for bb in range(nBlocks):
+                    block_df_3h = result_3h.iloc[bb*tBlocks:(bb+1)*tBlocks,:]
+                    # average reward rate
+                    if len(block_df_3h) > 60:  # need to have at least 60 trials
+                        perf_3h = np.sum(block_df_3h['reward']>0)/tBlocks
+                        perf_df_3h.loc[bIdx, 'RewardRate'][bb] = perf_3h
+                    else:
+                        perf_df_3h.loc[bIdx, 'RewardRate'][bb] = np.nan
+
+                    # d_prime 
+                    # hit rate P(right | B)
+                    # false alarm rate P(right | A)
+
+                    hit_rate_3h = np.sum((block_df_3h['actions']==1) & (block_df_3h['schedule']==sti_B))/np.sum(block_df_3h['schedule']==sti_B)
+                    false_alarm_rate_3h = np.sum((block_df_3h['actions']==1) & (block_df_3h['schedule']==sti_A))/np.sum(block_df_3h['schedule']==sti_A)
+                    if hit_rate_3h == 1:
+                        hit_rate_3h = 0.99999
+                    if false_alarm_rate_3h == 1:
+                        false_alarm_rate_3h = 0.99999
+                    if hit_rate_3h == 0:
+                        hit_rate_3h = 0.00001
+                    if false_alarm_rate_3h == 0:
+                        false_alarm_rate_3h = 0.00001
+                    d_prime_3h = norm.ppf(hit_rate_3h) - norm.ppf(false_alarm_rate_3h)
+                    perf_df_3h.loc[bIdx, 'd'][bb] = d_prime_3h
+
         # plot average performance for AB1, AB2, AB3
         # CD1, CD2, and CD3. and run stats
         # rebuild performance dataframe for plotting
@@ -2412,24 +2479,74 @@ class BehDataOdor(BehData):
         perf_plot_CD1 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
         perf_plot_CD2 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
         perf_plot_CD3 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        trials_AB1 = []
+        trials_AB2 = []
+        trials_AB3 = []
+        trials_CD1 = []
+        trials_CD2 = []
+        trials_CD3 = []
         for idx, row in perf_df.iterrows():
             for bb in range(10):
                 if not np.isnan(row['RewardRate'][bb]):
                     if row['Protocol'] == 'AB':
                         if row['ProtocolDay'] == 1:   
                             perf_plot_AB1 = pd.concat([perf_plot_AB1, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_AB1.append(row['TrialNum'])
                         elif row['ProtocolDay'] == 2:
                             perf_plot_AB2 = pd.concat([perf_plot_AB2, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_AB2.append(row['TrialNum'])
                         elif row['ProtocolDay'] == 3:
                             perf_plot_AB3 = pd.concat([perf_plot_AB3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_AB3.append(row['TrialNum'])
                     elif row['Protocol'] == 'AB-CD':
                         if row['ProtocolDay'] == 1:   
                             perf_plot_CD1 = pd.concat([perf_plot_CD1, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_CD1.append(row['TrialNum'])
                         elif row['ProtocolDay'] == 2:
                             perf_plot_CD2 = pd.concat([perf_plot_CD2, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_CD2.append(row['TrialNum'])
                         elif row['ProtocolDay'] == 3:
                             perf_plot_CD3 = pd.concat([perf_plot_CD3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
-            
+                            trials_CD3.append(row['TrialNum'])
+
+        # for 3h
+        perf_plot_3h_AB1 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_3h_AB2 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_3h_AB3 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_3h_CD1 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_3h_CD2 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_3h_CD3 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        trials_3h_AB1 = []
+        trials_3h_AB2 = []
+        trials_3h_AB3 = []
+        trials_3h_CD1 = []
+        trials_3h_CD2 = []
+        trials_3h_CD3 = []
+
+        for idx, row in perf_df_3h.iterrows():
+            for bb in range(10):
+                if not np.isnan(row['RewardRate'][bb]):
+                    if row['Protocol'] == 'AB':
+                        if row['ProtocolDay'] == 1:   
+                            perf_plot_3h_AB1 = pd.concat([perf_plot_3h_AB1, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_AB1.append(row['TrialNum'])
+                        elif row['ProtocolDay'] == 2:
+                            perf_plot_3h_AB2 = pd.concat([perf_plot_3h_AB2, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_AB2.append(row['TrialNum'])
+                        elif row['ProtocolDay'] == 3:
+                            perf_plot_3h_AB3 = pd.concat([perf_plot_3h_AB3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_AB3.append(row['TrialNum'])
+                    elif row['Protocol'] == 'AB-CD':
+                        if row['ProtocolDay'] == 1:   
+                            perf_plot_3h_CD1 = pd.concat([perf_plot_3h_CD1, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_CD1.append(row['TrialNum'])
+                        elif row['ProtocolDay'] == 2:
+                            perf_plot_3h_CD2 = pd.concat([perf_plot_3h_CD2, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_CD2.append(row['TrialNum'])
+                        elif row['ProtocolDay'] == 3:
+                            perf_plot_3h_CD3 = pd.concat([perf_plot_3h_CD3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_CD3.append(row['TrialNum'])
+
         for sex in Sexes:
             plot_learning_curve(perf_plot_AB1[perf_plot_AB1['Gender'] == sex], save_name = 'AB1_rewardrate_' + sex, 
                                 value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
@@ -2449,6 +2566,109 @@ class BehDataOdor(BehData):
             plot_learning_curve(perf_plot_CD3[perf_plot_CD3['Gender'] == sex], save_name = 'CD3_rewardrate_' + sex,
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
                                 title = 'CD3 Reward Rate '+ sex + ' ' + self.strain)
+
+            # 3h performance
+            plot_learning_curve(perf_plot_3h_AB1[perf_plot_3h_AB1['Gender'] == sex], save_name = '3h_AB1_rewardrate_' + sex, 
+                                value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h AB1 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_3h_AB2[perf_plot_3h_AB2['Gender'] == sex], save_name = '3h_AB2_rewardrate_' + sex, 
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h AB2 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_3h_AB3[perf_plot_3h_AB3['Gender'] == sex], save_name = '3h_AB3_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h AB3 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_3h_CD1[perf_plot_3h_CD1['Gender'] == sex], save_name = '3h_CD1_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h CD1 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_3h_CD2[perf_plot_3h_CD2['Gender'] == sex], save_name = '3h_CD2_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h CD2 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_3h_CD3[perf_plot_3h_CD3['Gender'] == sex], save_name = '3h_CD3_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h CD3 Reward Rate '+ sex + ' ' + self.strain)
+
+
+        trial_sets = [
+            ('AB1', trials_AB1, trials_3h_AB1),
+            ('AB2', trials_AB2, trials_3h_AB2),
+            ('AB3', trials_AB3, trials_3h_AB3),
+            ('CD1', trials_CD1, trials_3h_CD1),
+            ('CD2', trials_CD2, trials_3h_CD2),
+            ('CD3', trials_CD3, trials_3h_CD3),
+        ]
+        trial_stats = []
+        for session, regular_trials, short_trials in trial_sets:
+            regular_trials = np.asarray(regular_trials, dtype=float)
+            short_trials = np.asarray(short_trials, dtype=float)
+            n_pairs = min(regular_trials.size, short_trials.size)
+            regular_trials = regular_trials[:n_pairs]
+            short_trials = short_trials[:n_pairs]
+            valid_subjects = np.isfinite(regular_trials) & np.isfinite(short_trials)
+            regular_trials = regular_trials[valid_subjects]
+            short_trials = short_trials[valid_subjects]
+            nonzero_regular = regular_trials != 0
+            if regular_trials.size:
+                try:
+                    statistic, p_value = wilcoxon(regular_trials, short_trials)
+                except ValueError:
+                    statistic, p_value = np.nan, np.nan
+            else:
+                statistic, p_value = np.nan, np.nan
+            trial_stats.append({
+                'Session': session,
+                'RegularTrials': regular_trials,
+                'ThreeHourTrials': short_trials,
+                'WilcoxonStatistic': statistic,
+                'PValue': p_value,
+                'MeanThreeHourPercent': (
+                    np.mean(short_trials[nonzero_regular] / regular_trials[nonzero_regular] * 100)
+                    if np.any(nonzero_regular) else np.nan
+                ),
+            })
+
+        valid_p_values = [row['PValue'] for row in trial_stats if np.isfinite(row['PValue'])]
+        adjusted_p_values = iter(
+            multipletests(valid_p_values, method='fdr_bh')[1] if valid_p_values else []
+        )
+        for row in trial_stats:
+            row['AdjustedPValue'] = next(adjusted_p_values) if np.isfinite(row['PValue']) else np.nan
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 9), sharey=True)
+        for ax, row in zip(axes.flat, trial_stats):
+            data = [row['RegularTrials'], row['ThreeHourTrials']]
+            if all(values.size > 1 for values in data):
+                violin = ax.violinplot(data, positions=[1, 2], showmedians=True)
+                for body, color in zip(violin['bodies'], ['tab:blue', 'tab:orange']):
+                    body.set_facecolor(color)
+                    body.set_edgecolor(color)
+                    body.set_alpha(0.3)
+                violin['cmedians'].set_color('black')
+            for regular, short in zip(row['RegularTrials'], row['ThreeHourTrials']):
+                ax.plot([1, 2], [regular, short], color='0.55', linewidth=0.8, zorder=2)
+            for position, values in enumerate(data, start=1):
+                if values.size:
+                    color = 'tab:blue' if position == 1 else 'tab:orange'
+                    ax.scatter(np.full(values.size, position), values, color=color, s=24,
+                               alpha=0.55, zorder=3)
+            ax.set_xticks([1, 2], ['6h', '3h'])
+            p_label = (f"FDR p={row['AdjustedPValue']:.3g}"
+                       if np.isfinite(row['AdjustedPValue']) else 'FDR p=nan')
+            percentage_label = (f"3h / 6h = {row['MeanThreeHourPercent']:.1f}%"
+                                if np.isfinite(row['MeanThreeHourPercent']) else '3h / 6h = nan')
+            ax.set_title(row['Session'])
+            ax.text(0.5, 0.95, f'{p_label}\n{percentage_label}', transform=ax.transAxes, ha='center', va='top',
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.8))
+            ax.set_ylabel('Trials performed')
+            ax.set_ylim(0, 2000)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+        fig.suptitle('Trials performed: 6h vs 3h condition')
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.summary, 'trials_6h_vs_3h.png'), dpi=300,
+                    bbox_inches='tight')
+        plt.close(fig)
+
+
 
         # plot_learning_curve(perf_plot_AB1, save_name = 'AB1_dprime', 
         #     value_col = 'd', trial_col = 'Block')
@@ -2887,22 +3107,23 @@ class BehDataRotarod(BehData):
                 trialNum = self.data_index['Trial'][aidx]
                 if os.path.exists(dataFolder):
                     filePatternSpeed = aa + '*speed*.csv'
-                    filePatternDLC = aa + '*DLC_resnet*.csv'
+                    #filePatternDLC = aa + '*DLC_resnet*.csv'
+                    filePatternLitPose = aa+f'*trial{trialNum}????-??-??T??_??_??.csv'
                     filePatternVideo = aa + '*.avi'
                     filePatternTimestamp = aa + '*timeStamp*.csv'
 
                     speedCSV = glob.glob(os.path.join(dataFolder, filePatternSpeed))
                     timeStampCSV = glob.glob(os.path.join(dataFolder, filePatternTimestamp))
                     videoFiles = glob.glob(os.path.join(dataFolder, filePatternVideo))
-                    DLCFiles = glob.glob(os.path.join(dataFolder, filePatternDLC))
+                    LitPoseFiles = glob.glob(os.path.join(dataFolder, filePatternLitPose))
                     num_files = len(videoFiles)
 
                     if num_files>0:
                         # match the sessions: ASDxxx followed by optional middle part, 
                         # then trial(trialNum), optional underscore, and date YYYY-MM-DDTHH...
-                        DLC_ID = [ID for ID in range(len(DLCFiles)) if aa in DLCFiles[ID] and 'trial'+str(trialNum) in DLCFiles[ID]]
-                        if len(DLC_ID)>0:
-                            DLC_results[aidx] = DLCFiles[DLC_ID[0]]
+                        #LitPose_ID = [ID for ID in range(len(LitPoseFiles)) if aa in LitPoseFiles[ID] and 'trial'+str(trialNum) in LitPoseFiles[ID]]
+                        if len(LitPoseFiles)>0:
+                            DLC_results[aidx] = LitPoseFiles[0]
                         else:
                             DLC_results[aidx] = None
                         speed_ID = [ID for ID in range(len(speedCSV)) if aa in speedCSV[ID] and 'trial'+str(trialNum) in speedCSV[ID]]
@@ -3276,34 +3497,34 @@ class BehDataRotarod(BehData):
 
                 if self.data_index['DLC'][ss] is not None:
                     tempData = self.data_index['DLC_obj'][ss].data
-                    ave_left_rod_back = np.array([np.mean(np.array(tempData['rod_left_back']['x'])[np.array(tempData['rod_left_back']['p'])>0.95]),
-                                    np.mean(np.array(tempData['rod_left_back']['y'])[np.array(tempData['rod_left_back']['p'])>0.95])])
-                    ave_right_rod_back = np.array([np.mean(np.array(tempData['rod_right_back']['x'])[np.array(tempData['rod_right_back']['p'])>0.95]),
-                                    np.mean(np.array(tempData['rod_right_back']['y'])[np.array(tempData['rod_right_back']['p'])>0.95])])
-                    ave_center_rod_back = (ave_left_rod_back+ave_right_rod_back)/2
-                    self.data_index['DLC_obj'][ss].data['left_rod_back'] = ave_left_rod_back
-                    self.data_index['DLC_obj'][ss].data['right_rod_back'] = ave_right_rod_back
-                    self.data_index['DLC_obj'][ss].data['center_rod_back'] = ave_center_rod_back
+                    #ave_left_rod_back = np.array([np.mean(np.array(tempData['rod_left_back']['x'])[np.array(tempData['rod_left_back']['p'])>0.95]),
+                    #                 np.mean(np.array(tempData['rod_left_back']['y'])[np.array(tempData['rod_left_back']['p'])>0.95])])
+                    # ave_right_rod_back = np.array([np.mean(np.array(tempData['rod_right_back']['x'])[np.array(tempData['rod_right_back']['p'])>0.95]),
+                    #                 np.mean(np.array(tempData['rod_right_back']['y'])[np.array(tempData['rod_right_back']['p'])>0.95])])
+                    # ave_center_rod_back = (ave_left_rod_back+ave_right_rod_back)/2
+                    # self.data_index['DLC_obj'][ss].data['left_rod_back'] = ave_left_rod_back
+                    # self.data_index['DLC_obj'][ss].data['right_rod_back'] = ave_right_rod_back
+                    # self.data_index['DLC_obj'][ss].data['center_rod_back'] = ave_center_rod_back
 
-                    ave_left_rod_front = np.array([np.mean(np.array(tempData['rod_left_front']['x'])[np.array(tempData['rod_left_front']['p'])>0.95]),
-                                    np.mean(np.array(tempData['rod_left_front']['y'])[np.array(tempData['rod_left_front']['p'])>0.95])])
-                    ave_right_rod_front = np.array([np.mean(np.array(tempData['rod_right_front']['x'])[np.array(tempData['rod_right_front']['p'])>0.95]),
-                                    np.mean(np.array(tempData['rod_right_front']['y'])[np.array(tempData['rod_right_front']['p'])>0.95])])
-                    ave_center_rod_front = (ave_left_rod_front+ave_right_rod_front)/2
+                    # ave_left_rod_front = np.array([np.mean(np.array(tempData['rod_left_front']['x'])[np.array(tempData['rod_left_front']['p'])>0.95]),
+                    #                 np.mean(np.array(tempData['rod_left_front']['y'])[np.array(tempData['rod_left_front']['p'])>0.95])])
+                    # ave_right_rod_front = np.array([np.mean(np.array(tempData['rod_right_front']['x'])[np.array(tempData['rod_right_front']['p'])>0.95]),
+                    #                 np.mean(np.array(tempData['rod_right_front']['y'])[np.array(tempData['rod_right_front']['p'])>0.95])])
+                    # ave_center_rod_front = (ave_left_rod_front+ave_right_rod_front)/2
 
-                    self.data_index['DLC_obj'][ss].data['left_rod_front'] = ave_left_rod_front
-                    self.data_index['DLC_obj'][ss].data['right_rod_front'] = ave_right_rod_front
-                    self.data_index['DLC_obj'][ss].data['center_rod_front'] = ave_center_rod_front
+                    # self.data_index['DLC_obj'][ss].data['left_rod_front'] = ave_left_rod_front
+                    # self.data_index['DLC_obj'][ss].data['right_rod_front'] = ave_right_rod_front
+                    # self.data_index['DLC_obj'][ss].data['center_rod_front'] = ave_center_rod_front
 
                     # estimations on the left of 'right_rod_back' is in back area
                     # on the right of 'right rod front' is in front area
                     # plot a 1/0 mask to show each keypoints where they belong
                     kp_list = tempData['bodyparts']
-                    viewMask = np.zeros((len(kp_list), len(tempData['rod_right_back']['x'])))
+                    viewMask = np.zeros((len(kp_list), len(tempData['spine3']['x'])))
                     # 1 for back 0 for front
                     for idx,kp in enumerate(kp_list):
                     # on the left of
-                        viewMask[idx,:] = np.array(tempData[kp]['x']) < ave_right_rod_back[0]
+                        viewMask[idx,:] = np.array(tempData[kp]['x']) < 798  # half frame width
 
                     # plot frame with keypoints
                     # frame_num = 6180
@@ -3317,9 +3538,12 @@ class BehDataRotarod(BehData):
                     # plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
 
                     # plot number of back/front keypoints that is actually in back/front view
-                    back_kp = ['spine 3', 'tail 1', 'tail 2', 'tail 3', 'left foot', 'right foot']
-                    front_kp = ['spine 1', 'left ear', 'right ear', 'nose', 'left hand', 'right hand']
-                    viewNumber = np.zeros((3, len(tempData['rod_right_back']['x'])))
+                    #back_kp = ['spine 3', 'tail 1', 'tail 2', 'tail 3', 'left foot', 'right foot']
+                    #front_kp = ['spine 1', 'left ear', 'right ear', 'nose', 'left hand', 'right hand']
+                    back_kp = ['spine3', 'tail1', 'tail2', 'tail3', 'leftfoot', 'rightfoot']
+                    front_kp = ['spine1', 'leftear', 'rightear', 'nose', 'lefthand', 'righthand']
+
+                    viewNumber = np.zeros((3, len(tempData['spine3']['x'])))
                     for kp in kp_list:
                         if kp in back_kp:
                             viewNumber[0,:] = viewNumber[0,:] + viewMask[kp_list.index(kp),:]
@@ -4177,8 +4401,8 @@ class BehDataRotarod(BehData):
         # infer the coordinate with previous and post frames
         # also remove the part when animal turns around
 
-        savefilefolder = os.path.join(self.root_path,'DLCforMoseq')
-        saveorigfolder = os.path.join(self.root_path, 'DLCforMoseq_origTS')
+        savefilefolder = os.path.join(self.root_path,'LPforMoseq')
+        saveorigfolder = os.path.join(self.root_path, 'LPforMoseq_origTS')
         if not os.path.exists(savefilefolder):
             os.makedirs(savefilefolder)
         if not os.path.exists(saveorigfolder):
@@ -4254,9 +4478,11 @@ class BehDataRotarod(BehData):
 
                         # go over the bodyparts in the df_segment, if the bodypart jumped to far a way 
                         # to the other half of the frame, move it back 
-                        correct_bodyparts(df_segment)
+                        #df_segment_corrected = correct_bodyparts(df_segment)
+                        df_segment_corrected = df_segment
                         savefilepath = os.path.join(savefilefolder, filename+f"_clip{turnIdx}.csv")
-                        df_segment.to_csv(savefilepath, index=False)
+                        df_segment_corrected.to_csv(savefilepath, index=False)
+                        #image = read_video(videoPath, 0, ifgray=True)
                         savetimeStamp = os.path.join(saveorigfolder, filename+f"origIndex_clip{turnIdx}.csv")
                         orig_index.to_csv(savetimeStamp, index=False)
                         # save the video segment
@@ -4316,20 +4542,20 @@ class BehDataRotarod(BehData):
                                 verify_idx += 1
 
                             verify_cap.release()
-                            if verify_idx < (end_write - start_write + 1):
-                                nonTurningMask = np.zeros(len(obj.data['time']), dtype=bool)
-                                nonTurningMask[start_write:start_write+verify_idx] = True
-                                nonTurningMask = [True, True]+ list(nonTurningMask)
-                                saveMask = np.logical_and(tempMask, nonTurningMask)
-                                df_segment = df[saveMask]
-                                orig_index = df_segment.iloc[:,0].copy()
-                                # renumber it
-                                df_segment.iloc[2:,0] = np.arange(len(df_segment)-2)
+                            # if verify_idx < (end_write - start_write + 1):
+                            #     nonTurningMask = np.zeros(len(obj.data['time']), dtype=bool)
+                            #     nonTurningMask[start_write:start_write+verify_idx] = True
+                            #     nonTurningMask = [True, True]+ list(nonTurningMask)
+                            #     saveMask = np.logical_and(tempMask, nonTurningMask)
+                            #     df_segment = df[saveMask]
+                            #     orig_index = df_segment.iloc[:,0].copy()
+                            #     # renumber it
+                            #     df_segment.iloc[2:,0] = np.arange(len(df_segment)-2)
 
-                                savefilepath = os.path.join(savefilefolder, filename+f"_clip{turnIdx}.csv")
-                                df_segment.to_csv(savefilepath, index=False)
-                                savetimeStamp = os.path.join(saveorigfolder, filename+f"origIndex_clip{turnIdx}.csv")
-                                orig_index.to_csv(savetimeStamp, index=False)
+                            #     savefilepath = os.path.join(savefilefolder, filename+f"_clip{turnIdx}.csv")
+                            #     df_segment.to_csv(savefilepath, index=False)
+                            #     savetimeStamp = os.path.join(saveorigfolder, filename+f"origIndex_clip{turnIdx}.csv")
+                            #     orig_index.to_csv(savetimeStamp, index=False)
                                 # if frames is corrupted, rewrite orig TS and DLC file to match the non-currupted video
 
 
