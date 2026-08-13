@@ -73,7 +73,7 @@ if run_odor:
     Odor = BehDataOdor(root_dir, strain)
     Odor.load_data()
     #Odor.session_analysis()
-    Odor.plot_performance()
+    #Odor.plot_performance()
     
     #%% model fitting (only implemented policy gradient for now)
     #Odor.model_fitting(fit_mode='session', model_name='policy_gradient')

@@ -1067,7 +1067,9 @@ class BehDataOdor(BehData):
                     if model_name == 'policy_gradient':
                         latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
                     elif model_name == 'hybrid':
-                        latent_fit = fit_hybrid(data,animalID=animalID, savedatapath=savedatapath)
+                        #latent_fit = fit_hybrid(data,animalID=animalID, savedatapath=savedatapath)
+                        latent_fit = fit_hybrid_bias_model(data,animalID=animalID, 
+                                                           savedatapath=savedatapath, n_starts=20)
 
                 # if model_name == 'hybrid':
                 #     model_label = 'Hybrid RL'
