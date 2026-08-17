@@ -25,7 +25,6 @@ from psytrack_learning.learning_rules import RewardMax, PredictMax, REINFORCE, R
 from psytrack_learning.simulate_learning import reward_max, predict_max, reinforce, reinforce_base
 from psytrack_learning.simulate_learning import simulate_learning
 
-plt.ion()
 
 
 def fit_policy_gradient(data, animalID, savedatapath):
@@ -176,10 +175,6 @@ def fit_policy_gradient(data, animalID, savedatapath):
 
     return rec_dat
     
-import numpy as np
-from scipy.optimize import minimize
-
-
 def fit_hybrid_bias_model(
     data,
     animalID=None,
@@ -264,16 +259,13 @@ def fit_hybrid_bias_model(
 
     choices = actions.astype(int) + 1
 
-
     valid = np.isfinite(schedules)
 
     schedules = schedules[valid]
     choices = choices[valid]
     rewards = rewards[valid]
 
-    stimulus_values = np.sort(
-        np.unique(schedules)
-    )
+    stimulus_values = np.sort(np.unique(schedules))
 
     stim_to_idx = {
         stim: idx
@@ -355,9 +347,6 @@ def fit_hybrid_bias_model(
             },
         )
 
-        # --------------------------------------------------------
-        # Keep the best successful solution
-        # --------------------------------------------------------
 
         if (
             best_result is None
@@ -373,14 +362,12 @@ def fit_hybrid_bias_model(
 
     opt_params = best_result.x
 
-    beta, alpha, stick, lapse, ret, bias = opt_params
-
+    #beta, alpha, stick, lapse, ret, bias = opt_params
 
     (
         nll,
-        p_rl,
-        p_random,
-        p_choice,
+        p_right,
+        p_correct,
         Q_history,
         state_prob,
         stick_history,
@@ -396,28 +383,11 @@ def fit_hybrid_bias_model(
 
     n_params = len(opt_params)
 
-    AIC = (
-        2.0 * nll
-        + 2.0 * n_params
-    )
-
-    BIC = (
-        2.0 * nll
-        + np.log(n_trials) * n_params
-    )
-
-
-    AIC0 = (
-        -2.0
-        * np.log(1.0 / 3.0)
-        * n_trials
-    )
-
-    psr2 = (
-        (AIC0 - AIC)
-        / AIC0
-    )
-
+    AIC = 2.0 * nll+ 2.0 * n_params
+    BIC = 2.0 * nll+ np.log(n_trials) * n_params
+    AIC0 = -2.0* np.log(1.0 / 3.0)* n_trials
+    psr2 = (AIC0 - AIC)/ AIC0
+    
     # ============================================================
     # Store results
     # ============================================================
@@ -430,258 +400,44 @@ def fit_hybrid_bias_model(
 
     fit_result = {
         "model": "a0b1s_hybrid",
-
         "animalID": animalID,
-
         "params": params,
-
         "NLL": float(nll),
-
         # MATLAB optimizes posterior, not just likelihood
         "negative_log_posterior": float(
             best_result.fun
         ),
 
-        "beta_prior": {
-            "distribution": "normal",
-            "mean": beta_mu,
-            "std": beta_sigma,
-        },
-
         "AIC": float(AIC),
-
         "BIC": float(BIC),
-
         "AIC0": float(AIC0),
-
         "psr2": float(psr2),
-
-        "optimizer_success": bool(
-            best_result.success
-        ),
-
-        "optimizer_message": str(
-            best_result.message
-        ),
-
-        "optimizer_nit": int(
-            best_result.nit
-        ),
-
-        "stimulus_values": (
-            stimulus_values.tolist()
-        ),
-
-        "n_stimuli": int(n_stimuli),
-
-        "n_trials": int(n_trials),
-
-        "actions_python": (
-            (choices - 1).tolist()
-        ),
-
-        "choices_matlab": (
-            choices.tolist()
-        ),
-
-        "schedule": (
-            schedules.tolist()
-        ),
-
-        "reward": (
-            rewards.tolist()
-        ),
-
-        "pRL_fit": p_rl.tolist(),
-
-        "pRandom_fit": p_random.tolist(),
-
-        "pChoice_fit": p_choice.tolist(),
-
+        "optimizer_success": bool(best_result.success),
+        "optimizer_message": str(best_result.message),
+        "optimizer_nit": int(best_result.nit),
+        "stimulus_values": (stimulus_values.tolist()),
+        "pRight_fit": p_right.tolist(),
+        "pCorrect_fit": p_correct.tolist(),
         "Q_history": Q_history.tolist(),
-
-        "state_probability": (
-            state_prob.tolist()
-        ),
-
-        "stickiness": (
-            stick_history.tolist()
-        ),
-
-        "prediction_error": (
-            prediction_error.tolist()
-        ),
+        "state_probability": state_prob.tolist(),
+        "stickiness": stick_history.tolist(),
+        "prediction_error":  prediction_error.tolist(),
     }
+
+
+    with open(savedatapath, 'w') as f:
+        json.dump(
+            fit_result,
+            f,
+            indent=4,
+            default= lambda o: o.tolist() if isinstance(o, np.ndarray)
+                            else int(o) if isinstance(o, np.integer)
+                            else float(o) if isinstance(o, np.floating)
+                            else str(o)
+        )
+
 
     return fit_result
-
-def fit_hybrid(data, animalID, savedatapath):
-    """Fit a basic hybrid RL model to trial-by-trial odor behavior.
-
-    The model combines stimulus-specific Q-learning with side bias,
-    choice stickiness, and a lapse component.
-
-    P(right) = (1 - lapse) * sigmoid(
-        beta * (Q_right - Q_left) + bias + stickiness * previous_choice
-    ) + lapse * 0.5
-    """
-    data = data.copy()
-    data.replace({"actions": ["NAN", "NaN", "nan", "None", ""]}, np.nan, inplace=True)
-    data.replace({"schedule": ["NAN", "NaN", "nan", "None", ""]}, np.nan, inplace=True)
-    data = data.dropna(subset=["schedule"]).reset_index(drop=True)
-
-    actions = pd.to_numeric(data["actions"], errors="coerce").to_numpy(dtype=float)
-    schedules = pd.to_numeric(data["schedule"], errors="coerce").to_numpy(dtype=float)
-    rewards = pd.to_numeric(data["reward"], errors="coerce").fillna(0).to_numpy(dtype=float)
-    rewards = (rewards > 0).astype(float)
-
-    valid = np.isfinite(actions) & np.isfinite(schedules)
-    actions = actions[valid].astype(int)
-    choices = actions.astype(int) + 1
-    schedules = schedules[valid].astype(int)
-    rewards = rewards[valid]
-
-    if actions.size == 0:
-        raise ValueError("No valid trials found for hybrid model fitting.")
-    if not np.all(np.isin(actions, [0, 1])):
-        raise ValueError("Hybrid model expects actions coded as 0/1.")
-
-    stimulus_values = np.sort(np.unique(schedules))
-    stim_to_idx = {stim: idx for idx, stim in enumerate(stimulus_values)}
-    stim_idx = np.array([stim_to_idx[stim] for stim in schedules], dtype=int)
-
-    n_stimuli = len(stimulus_values)
-    n_trials = len(actions)
-
-    # CHANGED:
-    # MATLAB parameter order:
-    # [beta, alpha, stick, lapse, ret, bias]
-
-    bounds = [
-        (1e-6, 20.0),   # beta       <-- CHANGED
-        (1e-6, 1.0),    # alpha      <-- CHANGED
-        (-1.0, 1.0),    # stick      <-- CHANGED
-        (1e-6, 1.0),    # lapse      <-- SAME RANGE AS MATLAB
-        (1e-6, 1.0),    # ret        <-- NEW
-        (1e-6, 1.0),    # bias       <-- NEW
-    ]
-
-    pnames = [
-        "beta",
-        "alpha",
-        "stick",
-        "lapse",
-        "ret",
-        "bias",
-    ]
-
-
-    def negative_log_posterior(theta):
-
-        # CHANGED:
-        # The likelihood now uses the MATLAB 6-parameter model.
-        nll = a0b1s_hybrid_neg_log_likelihood(
-            theta,
-            stim_idx,
-            choices,
-            rewards,
-            initial_Q=initial_Q,
-        )
-
-        # CHANGED:
-        # beta is theta[0], not theta[1]
-        beta = theta[0]
-
-        # Same MATLAB beta prior
-        beta_prior_penalty = (
-            (beta - 5.0) ** 2
-            / (2.0 * 7.0 ** 2)
-        )
-
-        return nll + beta_prior_penalty
-
-
-    # CHANGED:
-    # MATLAB GlobalSearch does not use one fixed starting point.
-    # Use multiple starting points.
-
-    best_result = None
-
-    for start_idx in range(n_starts):
-
-        x0 = np.array([
-            rng.uniform(low, high)
-            for low, high in bounds
-        ])
-
-        # CHANGED:
-        # SLSQP is the scipy equivalent closest to MATLAB fmincon
-        # with Algorithm='sqp'.
-        result = minimize(
-            negative_log_posterior,
-            x0,
-            method="SLSQP",
-            bounds=bounds,
-            options={
-                "maxiter": 2000,
-                "ftol": 1e-10,
-            },
-        )
-
-        if (
-            best_result is None
-            or result.fun < best_result.fun
-        ):
-            best_result = result
-
-    opt_params = best_result.x
-    nll, pR, pChoice, q_left, q_right, q_diff, prediction_error = neg_log_likelihood(
-        opt_params,
-        actions,
-        rewards,
-        stim_idx,
-        n_stimuli,
-        return_latents=True,
-    )
-
-    param_names = ["alpha", "beta", "bias", "stickiness", "lapse"]
-    params = {name: float(value) for name, value in zip(param_names, opt_params)}
-
-    n_params = len(param_names)
-    AIC = 2 * n_params + 2 * nll
-    BIC = n_params * np.log(n_trials) + 2 * nll
-
-    rec_dat = {
-        "model": "hybrid_rl",
-        "animalID": animalID,
-        "params": params,
-        "NLL": float(nll),
-        "negative_log_posterior": float(res.fun),
-        "beta_prior": {"distribution": "normal", "mean": 5.0, "std": 7.0},
-        "AIC": float(AIC),
-        "BIC": float(BIC),
-        "optimizer_success": bool(res.success),
-        "optimizer_message": str(res.message),
-        "stimulus_values": stimulus_values.tolist(),
-        "n_stimuli": int(n_stimuli),
-        "actions": actions.tolist(),
-        "schedule": schedules.tolist(),
-        "reward": rewards.tolist(),
-        "pR_fit": pR.tolist(),
-        "pChoice_fit": pChoice.tolist(),
-        "Q_left": q_left.tolist(),
-        "Q_right": q_right.tolist(),
-        "Q_diff": q_diff.tolist(),
-        "prediction_error": prediction_error.tolist(),
-    }
-
-    with open(savedatapath, "w") as f:
-        json.dump(rec_dat, f, indent=4)
-
-    return rec_dat
-
-import numpy as np
-
 
 def a0b1s_hybrid_neg_log_likelihood(
     theta,
@@ -782,10 +538,8 @@ def a0b1s_hybrid_neg_log_likelihood(
         dtype=float
     )
 
-    p_rl = np.full(n_trials, np.nan)
-    p_random = np.full(n_trials, np.nan)
-    p_choice = np.full(n_trials, np.nan)
-
+    p_right = np.full(n_trials, np.nan)
+    p_correct = np.full(n_trials, np.nan)
     # Probability of the two latent states:
     # state 1 = random
     # state 2 = RL
@@ -820,29 +574,35 @@ def a0b1s_hybrid_neg_log_likelihood(
     b1 = np.array([1.0 - bias,bias])
 
     # Store first-trial latent variables
-    p_rl[0] = b[1]
-    p_random[0] = b1[1]
+    p_right[0] = (b1[1] * p[0]+ b[1] * p[1])
+    if stimuli[0] == 1:
+        p_correct[0] = p_right[0]
+    else:
+        p_correct[0] = 1 - p_right[0]
     state_prob[0] = p
     Q_history[0] = Q
-    lt_list = []
-    lt_list.append(llh)
+    #lt_list = []
+    #lt_list.append(llh)
 
     # ------------------------------------------------------------
     for k in range(1, n_trials):
         prev_s = stim_idx[k - 1]
         prev_choice = choices[k - 1]
         prev_reward = rewards[k - 1]
-
+        prev_choice_idx = choices[k - 1] - 1
+    
         p = (
-            b1[prev_choice - 1] * p[0] * T[:, 0]
-            + b[prev_choice - 1] * p[1] * T[:, 1]
+            b1[prev_choice_idx] * p[0] * T[:, 0]
+            + b[prev_choice_idx] * p[1] * T[:, 1]
         ) / np.exp(lt)
 
-        q_before = Q[prev_s, prev_choice - 1]
+        current_choice_idx = choices[k] - 1
+
+        q_before = Q[prev_s, prev_choice_idx]
 
         prediction_error[k - 1] = prev_reward - q_before
 
-        Q[prev_s, prev_choice - 1] += (
+        Q[prev_s, prev_choice_idx] += (
             alpha[int(prev_reward > 0)]
             * (prev_reward - q_before)
         )
@@ -871,6 +631,7 @@ def a0b1s_hybrid_neg_log_likelihood(
 
         stick_history[k] = stick_effect
 
+        # current trial
         current_s = stim_idx[k]
 
         q_left = Q[current_s, 0]
@@ -895,30 +656,21 @@ def a0b1s_hybrid_neg_log_likelihood(
 
         b1[1] = bias
         b1[0] = 1.0 - bias
+        current_p_choice = b1[current_choice_idx] * p[0] + b[current_choice_idx] * p[1]
 
-        choice_idx = choices[k] - 1
-
-        current_p_choice = (
-            b1[choice_idx] * p[0]
-            + b[choice_idx] * p[1]
-        )
-
-        # Numerical protection
-        current_p_choice = np.clip(
-            current_p_choice,
-            1e-12,
-            1.0
-        )
+        p_right[k] = (b1[1] * p[0]+ b[1] * p[1])
 
         lt = np.log(current_p_choice)
 
         llh += lt
-        lt_list.append(lt)
+        #lt_list.append(lt)
 
         # Store
-        p_rl[k] = b[1]
-        p_random[k] = b1[1]
-        p_choice[k] = current_p_choice
+
+        if stimuli[k] == 1:
+            p_correct[k] = p_right[k]
+        else:
+            p_correct[k] = 1-p_right[k]
         state_prob[k] = p
         Q_history[k] = Q
 
@@ -927,14 +679,14 @@ def a0b1s_hybrid_neg_log_likelihood(
     if return_latents:
         return (
             nll,
-            p_rl,
-            p_random,
-            p_choice,
+            p_right,
+            p_correct,
             Q_history,
             state_prob,
             stick_history,
             prediction_error,
         )
+
 
     return nll
 
@@ -985,10 +737,12 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
         # calculate the derivative of the fitted weights, looking for peaks
         w_mode_derivative = np.gradient(w_mode, axis=1)
 
-    elif model_label == 'Hybrid RL':
-        q_diff = np.asarray(latent_fit["Q_diff"], dtype=float)
+    elif model_label == 'hybrid_Q':
+        q_history = np.asarray(latent_fit["Q_history"], dtype=float)
+        q_diff = np.squeeze(np.diff(q_history, axis=1))
+        p_engaged = np.asarray(latent_fit["state_probability"], dtype=float)
         bias = float(latent_fit["params"]["bias"])
-        stickiness = float(latent_fit["params"]["stickiness"])
+        stickiness = float(latent_fit["params"]["stick"])
 
         w_mode = np.vstack([
             q_diff,
@@ -998,7 +752,7 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
         weights = ["Q_right_minus_left", "bias", "stickiness"]
 
         pCorrect_fit_smooth = (
-            pd.Series(latent_fit["pChoice_fit"])
+            pd.Series(latent_fit["pCorrect_fit"])
             .rolling(60, center=True, min_periods=1)
             .mean()
             .to_numpy()
@@ -1007,7 +761,7 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
     else:
         raise ValueError(f"Unsupported model_label: {model_label}")
 
-    fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    fig, axs = plt.subplots(3, 1, figsize=(10, 6), sharex=True)
     # first subplot: running reward probability of data and fit
     #axs[0].plot(x, running_reward_prob, color="black", linewidth=2)
     axs[0].plot(x_plot, pCorrect_data_smooth, color="black", linewidth=4, label="Data")
@@ -1019,15 +773,34 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
     axs[0].spines["top"].set_visible(False)
     axs[0].spines["right"].set_visible(False)
 
-    latent_x = np.arange(1, w_mode.shape[1] + 1)
-    for ii in range(w_mode.shape[0]):
-        label = weights[ii] if ii < len(weights) else f"weight_{ii + 1}"
-        axs[1].plot(latent_x, w_mode[ii], linewidth=3, label=label)
-    axs[1].set_ylabel("Latent weight")
-    axs[1].set_xlabel("Trial")
-    axs[1].spines["top"].set_visible(False)
-    axs[1].spines["right"].set_visible(False)
-    axs[1].legend(frameon=False)
+    if model_label == 'policy_gradient':
+        latent_x = np.arange(1, w_mode.shape[1] + 1)
+        for ii in range(w_mode.shape[0]):
+            label = weights[ii] if ii < len(weights) else f"weight_{ii + 1}"
+            axs[1].plot(latent_x, w_mode[ii], linewidth=3, label=label)
+        axs[1].set_ylabel("Latent weight")
+        axs[1].set_xlabel("Trial")
+        axs[1].spines["top"].set_visible(False)
+        axs[1].spines["right"].set_visible(False)
+        axs[1].legend(frameon=False)
+    elif model_label == 'hybrid_Q':
+        latent_x = np.arange(1, q_diff.shape[0] + 1)
+        axs[1].plot(latent_x, q_diff[:,0], linewidth=3)
+        axs[1].plot(latent_x, q_diff[:,1], linewidth=3)
+        axs[1].set_ylabel("Delta Q")
+        axs[1].set_xlabel("Trial")
+        axs[1].set_ylim([-0.5, 0.5])
+        axs[1].spines["top"].set_visible(False)
+        axs[1].spines["right"].set_visible(False)
+        #axs[1].legend(frameon=False)
+
+        # plot p_engaged
+        axs[2].plot(latent_x, p_engaged[:,1], linewidth=3)
+        axs[2].set_ylabel("P(engaged)")
+        axs[2].set_xlabel("Trial")
+        axs[2].set_ylim([0, 1])
+        axs[2].spines["top"].set_visible(False)
+        axs[2].spines["right"].set_visible(False)
 
     fig.tight_layout()
     fig.savefig(savefigpath+'.png', format="png",dpi=300, bbox_inches="tight")

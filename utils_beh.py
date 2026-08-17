@@ -26,8 +26,13 @@ import matplotlib.pyplot as plt
 # Deeplabcut related, and MotionSequence related functions
 from scipy.signal import butter, filtfilt
 from pygam import LinearGAM, s, f
-from scipy.stats import chi2
 from scipy.io import loadmat
+import statsmodels.api as sm
+from scipy.stats import chi2, shapiro
+from rpy2 import robjects as ro
+from rpy2.robjects import default_converter, pandas2ri
+from rpy2.robjects.conversion import localconverter
+from rpy2.robjects.packages import importr
 
 def load_DLC(filepath):
 
@@ -520,7 +525,104 @@ def run_learning_gam(perf_df, summary_path):
         })
 
         return stats_df, None, None
-    
+
+def run_learning_glmm(perf_df, behavior, save_name, summary_path):
+    """Fit frequentist lme4 learning models with a subject random intercept."""
+
+
+    data = perf_df.copy()
+    if 'trial' not in data.columns:
+        data.rename(columns={'block': 'trial', 'trial/block': 'trial'}, inplace=True)
+    is_rotarod = ('time_on_rod' in data.columns or
+                  'rotarod' in str(behavior).lower())
+    outcome = 'time_on_rod' if 'time_on_rod' in data.columns else 'performance'
+    required = ['subject', 'genotype', 'trial', outcome]
+    missing = [column for column in required if column not in data]
+    if missing:
+        raise ValueError('Missing required columns: ' + ', '.join(missing))
+    data[outcome] = pd.to_numeric(data[outcome], errors='coerce')
+    data['trial'] = pd.to_numeric(data['trial'], errors='coerce')
+    data = data.dropna(subset=required).copy()
+    if data['genotype'].nunique() < 2 or data['trial'].nunique() < 2:
+        return pd.DataFrame({'error': ['Insufficient genotype or trial variation']}), None, None
+
+    levels = sorted(data['genotype'].astype(str).unique())
+    reference = 'WT' if 'WT' in levels else levels[0]
+    if is_rotarod:
+        if (data[outcome] > 0).all() and len(data) >= 3:
+            sample = data[outcome].sample(min(len(data), 5000), random_state=0)
+            if shapiro(np.log(sample)).pvalue > shapiro(sample).pvalue:
+                data['_model_performance'] = np.log(data[outcome])
+                distribution = 'lognormal'
+            else:
+                data['_model_performance'] = data[outcome]
+                distribution = 'gaussian'
+        else:
+            data['_model_performance'] = data[outcome]
+            distribution = 'gaussian'
+        response = '_model_performance'
+    else:
+        successes = np.rint(data[outcome] * 100).astype(int)
+        if ((data[outcome] < 0) | (data[outcome] > 1) |
+                ~np.isclose(data[outcome] * 100, successes)).any():
+            raise ValueError('Odor-task performance must be a 0--1 rate from 100 trials.')
+        data['_successes'] = successes
+        data['_failures'] = 100 - successes
+        response = 'cbind(_successes, _failures)'
+        distribution = 'binomial'
+
+    fixed = {
+        'no_genotype_model': f'{response} ~ trial',
+        'genotype_model': f'{response} ~ genotype + trial',
+        'no_learning_model': f'{response} ~ genotype',
+        'full_model': f'{response} ~ genotype * trial',
+    }
+    formulas = {key: value + ' + (1 | subject)' for key, value in fixed.items()}
+    lme4 = importr('lme4')
+    stats = importr('stats')
+    with localconverter(default_converter + pandas2ri.converter):
+        r_data = ro.conversion.py2rpy(data)
+    ro.globalenv['_learning_glmm_data'] = r_data
+    ro.globalenv['_learning_glmm_reference'] = reference
+    ro.r('''
+        _learning_glmm_data$subject <- factor(_learning_glmm_data$subject)
+        _learning_glmm_data$genotype <- relevel(
+            factor(_learning_glmm_data$genotype), ref = _learning_glmm_reference
+        )
+    ''')
+    r_data = ro.globalenv['_learning_glmm_data']
+
+    def fit(formula):
+        if distribution == 'binomial':
+            return lme4.glmer(ro.Formula(formula), data=r_data, family=stats.binomial())
+        return lme4.lmer(ro.Formula(formula), data=r_data, REML=False)
+
+    models = {key: fit(formula) for key, formula in formulas.items()}
+
+    def lr_test(reduced, full, term):
+        comparison = ro.r['anova'](reduced, full, test='Chisq')
+        with localconverter(default_converter + pandas2ri.converter):
+            comparison = ro.conversion.rpy2py(comparison)
+        row = comparison.iloc[-1]
+        return {'term': term, 'lr_stat': float(row['Chisq']),
+                'df': int(row['Chi Df']), 'p_value': float(row['Pr(>Chisq)'])}
+
+    stats_df = pd.DataFrame([
+        lr_test(models['no_genotype_model'], models['genotype_model'], 'genotype'),
+        lr_test(models['no_learning_model'], models['genotype_model'], 'trial'),
+        lr_test(models['genotype_model'], models['full_model'], 'genotype:trial'),
+    ])
+    stats_df['distribution'] = distribution
+    stats_df['n_observations'] = len(data)
+    stats_df['n_subjects'] = data['subject'].nunique()
+    stats_df['n_trials'] = data['trial'].nunique()
+    stats_df['genotype_reference'] = reference
+    stats_df['genotype_levels'] = ','.join(levels)
+    stats_df['repeated_measure_term'] = 'subject_random_intercept'
+    if summary_path is not None:
+        os.makedirs(summary_path, exist_ok=True)
+        stats_df.to_csv(os.path.join(summary_path, f'{save_name} performance glmm.csv'), index=False)
+    return stats_df, models, data
 
 def run_learning_gamm(perf_df, summary_path):
 
@@ -877,7 +979,11 @@ def plot_learning_curve(
     ax=None,
     show_raw=True,
 ):
-   
+
+    if trial_col == 'Block':
+        beh = 'odor'
+    elif trial_col == 'Trial':
+        beh = 'rotarod'
 
     plot_df = perf_df.copy()
     plot_df.rename(
@@ -930,8 +1036,8 @@ def plot_learning_curve(
         ordered=True
     )
 
-
-    stats_df, _, _ = run_learning_FDA(clean_df, save_name=save_name,summary_path=summary_path)
+    stats_df, _, _ = run_learning_glmm(clean_df, beh, save_name=save_name,summary_path=summary_path)
+    #stats_df, _, _ = run_learning_FDA(clean_df, save_name=save_name,summary_path=summary_path)
 
     summary_df = clean_df.groupby(
         ['genotype', 'trial'],

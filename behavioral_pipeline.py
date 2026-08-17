@@ -1003,7 +1003,7 @@ class BehDataOdor(BehData):
         #          'session': fit model to each session separately
         #          'concat': fit model to the concatenated data of all sessions
 
-        if model_name not in ('policy_gradient', 'hybrid'):
+        if model_name not in ('policy_gradient', 'hybrid_Q'):
             raise ValueError(f"Unsupported model_name: {model_name}")
 
         if fit_mode == 'session':
@@ -1066,10 +1066,10 @@ class BehDataOdor(BehData):
                 else:
                     if model_name == 'policy_gradient':
                         latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
-                    elif model_name == 'hybrid':
+                    elif model_name == 'hybrid_Q':
                         #latent_fit = fit_hybrid(data,animalID=animalID, savedatapath=savedatapath)
                         latent_fit = fit_hybrid_bias_model(data,animalID=animalID, 
-                                                           savedatapath=savedatapath, n_starts=20)
+                                                           savedatapath=savedatapath, n_starts=1)
 
                 # if model_name == 'hybrid':
                 #     model_label = 'Hybrid RL'
@@ -1082,26 +1082,28 @@ class BehDataOdor(BehData):
                     for widx, ww in enumerate(weights):
                         for vv in opt_vars:
                             fit_params.loc[ss, f'{ww}_{vv}'] = latent_fit['opt_hyper'][vv][widx]
-                elif model_name == 'hybrid_mod':
+                    
+                                    # for psychometric plot
+                    temp = pd.DataFrame()
+                    temp['weighted_sum'] = latent_fit['weighted_sum']
+                    temp['genotype'] = fit_params['genotype'][ss]
+                    temp['animal'] = fit_params['animal'][ss]
+                    temp['choice'] = latent_fit['args']['dat']['y']
+                    temp['gender'] = fit_params['gender'][ss]
+                    fit_psychometric[pp]= pd.concat(
+                        (fit_psychometric[pp], temp))
+                        
+                    #model_label = 'Policy Gradient'
+                    
+
+                elif model_name == 'hybrid_Q':
                     pass
+
                 fit_params.loc[ss, f'AIC'] = latent_fit['AIC']
                 fit_params.loc[ss, f'BIC'] = latent_fit['BIC']
 
-                # for psychometric plot
-                temp = pd.DataFrame()
-                temp['weighted_sum'] = latent_fit['weighted_sum']
-                temp['genotype'] = fit_params['genotype'][ss]
-                temp['animal'] = fit_params['animal'][ss]
-                temp['choice'] = latent_fit['args']['dat']['y']
-                temp['gender'] = fit_params['gender'][ss]
-                fit_psychometric[pp]= pd.concat(
-                    (fit_psychometric[pp], temp))
-                    
-                model_label = 'Policy Gradient'
-                savefigpath = os.path.join(save_path, f'{animalID}_{protocol}_latent_fit')
-                plot_latent_session(data, latent_fit, model_label,savefigpath)
-
-                
+                savefigpath = os.path.join(save_path, f'{animalID}_{protocol}_{model_name}_latent_fit')
+                plot_latent_session(data, latent_fit, model_name,savefigpath)
 
         elif fit_mode == 'concat':
             protocols = ['AB', 'CD']

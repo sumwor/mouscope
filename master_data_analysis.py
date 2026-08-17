@@ -3,6 +3,9 @@
 # todo:
 # 1. check if there is missing sessions by date
 # 2. cross compare performance with digitized record
+# 3. check performance plot
+# 4. check FDA stats
+
 
 from sqlite3 import Time
 
@@ -67,18 +70,20 @@ if run_odor:
 
     #%% for odor behavioral data
     # analyze the TSC2 behavioral recording data
+    #strain_list = ['TSC2_adol', 'TSC2_adult', 'ChD8_adol', 'Cntnap2_adol', 'Scn2A_adol']
+    #for strain in strain_list:
     strain = 'TSC2_adol'
     root_dir = os.path.join(r'Y:\HongliWang\Odor', strain)
 
     Odor = BehDataOdor(root_dir, strain)
     Odor.load_data()
     #Odor.session_analysis()
-    #Odor.plot_performance()
+    Odor.plot_performance()
     
     #%% model fitting (only implemented policy gradient for now)
     #Odor.model_fitting(fit_mode='session', model_name='policy_gradient')
 
-    Odor.model_fitting(fit_mode='session', model_name='hybrid')
+    Odor.model_fitting(fit_mode='session', model_name='hybrid_Q')
     #Odor.model_fitting(fit_mode='concat')
     Odor.model_comparison()
 
