@@ -531,11 +531,8 @@ def run_learning_glmm(perf_df, behavior, save_name, summary_path):
 
 
     data = perf_df.copy()
-    if 'trial' not in data.columns:
-        data.rename(columns={'block': 'trial', 'trial/block': 'trial'}, inplace=True)
-    is_rotarod = ('time_on_rod' in data.columns or
-                  'rotarod' in str(behavior).lower())
-    outcome = 'time_on_rod' if 'time_on_rod' in data.columns else 'performance'
+    is_rotarod = behavior=='rotarod'
+    outcome = 'performance'
     required = ['subject', 'genotype', 'trial', outcome]
     missing = [column for column in required if column not in data]
     if missing:
@@ -566,9 +563,9 @@ def run_learning_glmm(perf_df, behavior, save_name, summary_path):
         if ((data[outcome] < 0) | (data[outcome] > 1) |
                 ~np.isclose(data[outcome] * 100, successes)).any():
             raise ValueError('Odor-task performance must be a 0--1 rate from 100 trials.')
-        data['_successes'] = successes
-        data['_failures'] = 100 - successes
-        response = 'cbind(_successes, _failures)'
+        data['successes'] = successes
+        data['failures'] = 100 - successes
+        response = 'cbind(successes, failures)'
         distribution = 'binomial'
 
     fixed = {
@@ -582,15 +579,20 @@ def run_learning_glmm(perf_df, behavior, save_name, summary_path):
     stats = importr('stats')
     with localconverter(default_converter + pandas2ri.converter):
         r_data = ro.conversion.py2rpy(data)
-    ro.globalenv['_learning_glmm_data'] = r_data
-    ro.globalenv['_learning_glmm_reference'] = reference
+    ro.globalenv['learning_glmm_data'] = r_data
+    ro.globalenv['learning_glmm_reference'] = reference
     ro.r('''
-        _learning_glmm_data$subject <- factor(_learning_glmm_data$subject)
-        _learning_glmm_data$genotype <- relevel(
-            factor(_learning_glmm_data$genotype), ref = _learning_glmm_reference
+        learning_glmm_data$subject <- factor(learning_glmm_data$subject)
+
+        learning_glmm_data$genotype <- relevel(
+            factor(
+                as.character(learning_glmm_data$genotype),
+                ordered = FALSE
+            ),
+            ref = learning_glmm_reference
         )
     ''')
-    r_data = ro.globalenv['_learning_glmm_data']
+    r_data = ro.globalenv['learning_glmm_data']
 
     def fit(formula):
         if distribution == 'binomial':
@@ -605,20 +607,57 @@ def run_learning_glmm(perf_df, behavior, save_name, summary_path):
             comparison = ro.conversion.rpy2py(comparison)
         row = comparison.iloc[-1]
         return {'term': term, 'lr_stat': float(row['Chisq']),
-                'df': int(row['Chi Df']), 'p_value': float(row['Pr(>Chisq)'])}
+                'df': int(row['Df']), 'p_value': float(row['Pr(>Chisq)'])}
+
+    # do one full model only
+    full_model_fit = lme4.glmer(
+        formulas['full_model'],
+        data=r_data,
+        family=stats.binomial()
+    )
+    summary = ro.r['summary'](full_model_fit)
+    #print(summary)
+
+    coef_table = summary.rx2('coefficients')
+
+    with localconverter(default_converter + pandas2ri.converter):
+        coef_table = ro.conversion.rpy2py(coef_table)
+
+    coef_table = pd.DataFrame(
+        coef_table,
+            index=list(summary.rx2('coefficients').rownames),
+            columns=list(summary.rx2('coefficients').colnames)
+        )
 
     stats_df = pd.DataFrame([
-        lr_test(models['no_genotype_model'], models['genotype_model'], 'genotype'),
-        lr_test(models['no_learning_model'], models['genotype_model'], 'trial'),
-        lr_test(models['genotype_model'], models['full_model'], 'genotype:trial'),
+        {
+            'term': 'genotype',
+            'estimate': coef_table.loc['genotypeHET', 'Estimate'],
+            'p_value': coef_table.loc['genotypeHET', 'Pr(>|z|)']
+        },
+        {
+            'term': 'trial',
+            'estimate': coef_table.loc['trial', 'Estimate'],
+            'p_value': coef_table.loc['trial', 'Pr(>|z|)']
+        },
+        {
+            'term': 'genotype:trial',
+            'estimate': coef_table.loc['genotypeHET:trial', 'Estimate'],
+            'p_value': coef_table.loc['genotypeHET:trial', 'Pr(>|z|)']
+        }
     ])
-    stats_df['distribution'] = distribution
-    stats_df['n_observations'] = len(data)
-    stats_df['n_subjects'] = data['subject'].nunique()
-    stats_df['n_trials'] = data['trial'].nunique()
-    stats_df['genotype_reference'] = reference
-    stats_df['genotype_levels'] = ','.join(levels)
-    stats_df['repeated_measure_term'] = 'subject_random_intercept'
+    # stats_df = pd.DataFrame([
+    #     lr_test(models['no_genotype_model'], models['genotype_model'], 'genotype'),
+    #     lr_test(models['no_learning_model'], models['genotype_model'], 'trial'),
+    #     lr_test(models['genotype_model'], models['full_model'], 'genotype:trial'),
+    # ])
+    # stats_df['distribution'] = distribution
+    # stats_df['n_observations'] = len(data)
+    # stats_df['n_subjects'] = data['subject'].nunique()
+    # stats_df['n_trials'] = data['trial'].nunique()
+    # stats_df['genotype_reference'] = reference
+    # stats_df['genotype_levels'] = ','.join(levels)
+    # stats_df['repeated_measure_term'] = 'subject_random_intercept'
     if summary_path is not None:
         os.makedirs(summary_path, exist_ok=True)
         stats_df.to_csv(os.path.join(summary_path, f'{save_name} performance glmm.csv'), index=False)
@@ -1099,9 +1138,9 @@ def plot_learning_curve(
     if not stats_df.empty and 'p_value' in stats_df.columns:
         p_values = stats_df.set_index('term')['p_value']
         stats_text = (
-            f"FDA p genotype = {p_values.get('genotype', np.nan):.3g}\n"
-            f"FDA p learning = {p_values.get('learning', np.nan):.3g}\n"
-            f"FDA p interaction = {p_values.get('genotype:learning', np.nan):.3g}"
+            f"GLMM p genotype = {p_values.get('genotype', np.nan):.3g}\n"
+            f"GLMM p learning = {p_values.get('learning', np.nan):.3g}\n"
+            f"GLMM p interaction = {p_values.get('genotype:learning', np.nan):.3g}"
         )
         ax.text(
             0.98, 0.98, stats_text,

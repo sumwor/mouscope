@@ -1,11 +1,6 @@
 # master script for analyzing behavioral and imaging data
 
 # todo:
-# 1. check if there is missing sessions by date
-# 2. cross compare performance with digitized record
-# 3. check performance plot
-# 4. check FDA stats
-
 
 from sqlite3 import Time
 
@@ -20,6 +15,9 @@ plt.ion()
 run_odor = True
 run_rotarod = True
 count_animals = False
+if_QC = True
+
+notebook_url_path = r'Y:\HongliWang\Odor\url_individual_notebook.csv'
 
 if run_odor:
 
@@ -77,6 +75,13 @@ if run_odor:
 
     Odor = BehDataOdor(root_dir, strain)
     Odor.load_data()
+
+    # QC: compare loaded data with notebook data (saved in google sheet url)
+    if if_QC:
+        url = pd.read_csv(notebook_url_path)
+        strain_url = url['Url'][url['Strain']==strain].values
+        Odor.compare_notebook(strain_url[0])
+
     #Odor.session_analysis()
     Odor.plot_performance()
     

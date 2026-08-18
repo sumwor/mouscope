@@ -7,6 +7,9 @@ import re
 from collections import defaultdict
 from datetime import datetime
 
+import gspread
+
+
 import imageio.v3 as iio
 import cv2
 
@@ -705,7 +708,11 @@ class BehDataOdor(BehData):
                     'ImgTimeStamp': '',                # list or array
                     'ifCalImg': False,                 # boolean
                     'ifBehRecording': ifRec,            # boolean
-                    'BehCSV': []
+                    'BehCSV': [],
+                    'perf_AB': [],                     # average performance of AB
+                    'perf_CD': [],                     # average performance of CD
+                    'perf_DC': [],                     # average performance of DC reversal
+                    'odor_presented': []               # actual odor presented in the raw behavior file
                 }
                 
                 row_dict = {
@@ -755,9 +762,129 @@ class BehDataOdor(BehData):
                     os.makedirs(self.data_index['AnalysisPath'][bIdx], exist_ok = True)
 
                 final_df.to_csv(csvPath)
-            
+
+            else:
+                # load the csv file
+                resultdf = pd.read_csv(csvPath)
+
             self.data_index.loc[bIdx, 'BehCSV'] = csvPath
 
+            # calculate AB and CD average performance
+            self.data_index.at[bIdx, 'odor_presented'] = np.unique(resultdf['schedule'])
+
+            perf_A = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==1]))
+            perf_B = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==2]))
+            perf_C = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==3]))
+            perf_D = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==4]))
+            perf_rev_C = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==6]))
+            perf_rev_D = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==5]))
+            self.data_index.at[bIdx, 'perf_AB'] = [perf_A, perf_B]
+            self.data_index.at[bIdx, 'perf_CD'] = [perf_C, perf_D]
+            self.data_index.at[bIdx, 'perf_DC'] = [perf_rev_C, perf_rev_D]
+
+        # Check for missing sessions based on date.
+        session_dates = pd.to_datetime(self.data_index['Date'], format='%Y%m%d')
+        for animal, dates in session_dates.groupby(self.data_index['Animal'], sort=False):
+            missing_dates = pd.date_range(dates.min(), dates.max()).difference(dates)
+            for missing_date in missing_dates:
+                print(f'{animal}: missing session on {missing_date:%Y%m%d}')
+
+    def compare_notebook(self, url_address):
+        # compare the performance on .mat file with the digitized notebook info
+        # identify any mismatching sessions
+        
+        gc = gspread.service_account(filename="credentials/rotarod_reader.json")
+        sh = gc.open_by_url(url_address)
+        comparisons = pd.DataFrame()
+
+        for worksheet in sh.worksheets():
+            animal = worksheet.title.strip()
+            animal = animal[3:]
+            pipeline_data = self.data_index.loc[
+                self.data_index['Animal'].astype(str).str.strip() == animal,
+                ['Date', 'odor_presented', 'perf_AB', 'perf_CD'],
+            ].copy()
+            if pipeline_data.empty:
+                continue
+
+            notebook_data = pd.DataFrame(worksheet.get_all_records(head=2))
+            notebook_columns = {
+                str(column).strip().lower(): column for column in notebook_data.columns
+            }
+            if 'schedule' in notebook_columns:
+                notebook_data = notebook_data.loc[
+                    notebook_data[notebook_columns['schedule']].isin(['AB_rwdsz3','AB_rwdsz2', 'AB_retrain','AB-CD','AB-CD-DC', 'AB-DC'])
+                ].copy()
+
+            def pair_value(performance, index):
+                return performance[index] if isinstance(performance, (list, tuple, np.ndarray)) else np.nan
+
+            pipeline_data['perf_A'] = pipeline_data['perf_AB'].map(lambda value: pair_value(value, 0))
+            pipeline_data['perf_B'] = pipeline_data['perf_AB'].map(lambda value: pair_value(value, 1))
+            pipeline_data['perf_C'] = pipeline_data['perf_CD'].map(lambda value: pair_value(value, 0))
+            pipeline_data['perf_D'] = pipeline_data['perf_CD'].map(lambda value: pair_value(value, 1))
+            #pipeline_data['perf_C_rev'] = pipeline_data['perf_DC'].map(lambda value: pair_value(value, 0))
+            #pipeline_data['perf_D_rev'] = pipeline_data['perf_DC'].map(lambda value: pair_value(value, 1))
+
+            pipeline_data.rename(columns={'odor_presented': 'protocol_pipeline'}, inplace=True)
+            pipeline_data = pipeline_data[
+                ['Date', 'protocol_pipeline', 'perf_A', 'perf_B', 'perf_C', 'perf_D']
+            ]
+
+            comparison = pd.DataFrame({
+                'Date': notebook_data[notebook_columns['date']]
+                if 'date' in notebook_columns else np.nan,
+                'protocol_notebook': notebook_data[
+                    notebook_columns.get('protocol', notebook_columns.get('schedule'))
+                ] if ('protocol' in notebook_columns or 'schedule' in notebook_columns) else np.nan,
+                'A': notebook_data[notebook_columns['a']] if 'a' in notebook_columns else np.nan,
+                'B': notebook_data[notebook_columns['b']] if 'b' in notebook_columns else np.nan,
+                'C': notebook_data[notebook_columns['c']] if 'c' in notebook_columns else np.nan,
+                'D': notebook_data[notebook_columns['d']] if 'd' in notebook_columns else np.nan,
+            })
+            comparison['Date'] = pd.to_datetime(
+                comparison['Date'], format='%m/%d/%y', errors='coerce'
+            ).dt.normalize()
+            pipeline_data['Date'] = pd.to_datetime(
+                pipeline_data['Date'].astype(str).str.replace(r'\.0$', '', regex=True),
+                format='%Y%m%d',
+                errors='coerce',
+            ).dt.normalize()
+
+            def first_value(values):
+                values = values.dropna()
+                return values.iloc[0] if not values.empty else np.nan
+
+            comparison = comparison.groupby('Date', as_index=False).agg({
+                'protocol_notebook': lambda values: ', '.join(map(str, values.dropna().unique())),
+                'A': first_value,
+                'B': first_value,
+                'C': first_value,
+                'D': first_value,
+            })
+            pipeline_data = pipeline_data.groupby('Date', as_index=False).agg({
+                'protocol_pipeline': first_value,
+                'perf_A': first_value,
+                'perf_B': first_value,
+                'perf_C': first_value,
+                'perf_D': first_value,
+            })
+            comparison = pipeline_data.merge(comparison, on='Date', how='outer')
+            for odor in 'ABCD':
+                comparison[f'diff_{odor}'] = (
+                    comparison[f'perf_{odor}']
+                    - pd.to_numeric(comparison[odor], errors='coerce')
+                )
+            comparison.insert(0, 'Animal', animal)
+            comparison = comparison[
+                ['Animal', 'Date', 'protocol_pipeline', 'protocol_notebook',
+                 'perf_A', 'A', 'diff_A', 'perf_B', 'B', 'diff_B',
+                 'perf_C', 'C', 'diff_C', 'perf_D', 'D', 'diff_D']
+            ]
+            comparisons = pd.concat([comparisons, comparison], ignore_index=True)
+
+        #self.notebook_comparison = comparisons
+        return self.notebook_comparison
 
     def align_timeStamps(self):
         # align timestamps between behavior log and recording
