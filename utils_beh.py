@@ -3,15 +3,18 @@ import csv
 import gspread
 import numpy as np
 import pandas as pd
-from pygam import LinearGAM, s, f
-from scipy.stats import chi2
+
 import os
 import shutil
+from bisect import bisect_left, bisect_right
 import imageio
 from skimage import color
 
 import matplotlib
-matplotlib.use('QtAgg') 
+#matplotlib.use('QtAgg')
+import matplotlib.pyplot as plt
+plt.ion()
+
 from datetime import datetime, timedelta
 import time
 from gspread.exceptions import APIError
@@ -22,6 +25,14 @@ plt.ion()
 import matplotlib.pyplot as plt
 # Deeplabcut related, and MotionSequence related functions
 from scipy.signal import butter, filtfilt
+from pygam import LinearGAM, s, f
+from scipy.io import loadmat
+import statsmodels.api as sm
+from scipy.stats import chi2, shapiro
+from rpy2 import robjects as ro
+from rpy2.robjects import default_converter, pandas2ri
+from rpy2.robjects.conversion import localconverter
+from rpy2.robjects.packages import importr
 
 def load_DLC(filepath):
 
@@ -514,7 +525,143 @@ def run_learning_gam(perf_df, summary_path):
         })
 
         return stats_df, None, None
-    
+
+def run_learning_glmm(perf_df, behavior, save_name, summary_path):
+    """Fit frequentist lme4 learning models with a subject random intercept."""
+
+
+    data = perf_df.copy()
+    is_rotarod = behavior=='rotarod'
+    outcome = 'performance'
+    required = ['subject', 'genotype', 'trial', outcome]
+    missing = [column for column in required if column not in data]
+    if missing:
+        raise ValueError('Missing required columns: ' + ', '.join(missing))
+    data[outcome] = pd.to_numeric(data[outcome], errors='coerce')
+    data['trial'] = pd.to_numeric(data['trial'], errors='coerce')
+    data = data.dropna(subset=required).copy()
+    if data['genotype'].nunique() < 2 or data['trial'].nunique() < 2:
+        return pd.DataFrame({'error': ['Insufficient genotype or trial variation']}), None, None
+
+    levels = sorted(data['genotype'].astype(str).unique())
+    reference = 'WT' if 'WT' in levels else levels[0]
+    if is_rotarod:
+        if (data[outcome] > 0).all() and len(data) >= 3:
+            sample = data[outcome].sample(min(len(data), 5000), random_state=0)
+            if shapiro(np.log(sample)).pvalue > shapiro(sample).pvalue:
+                data['_model_performance'] = np.log(data[outcome])
+                distribution = 'lognormal'
+            else:
+                data['_model_performance'] = data[outcome]
+                distribution = 'gaussian'
+        else:
+            data['_model_performance'] = data[outcome]
+            distribution = 'gaussian'
+        response = '_model_performance'
+    else:
+        successes = np.rint(data[outcome] * 100).astype(int)
+        if ((data[outcome] < 0) | (data[outcome] > 1) |
+                ~np.isclose(data[outcome] * 100, successes)).any():
+            raise ValueError('Odor-task performance must be a 0--1 rate from 100 trials.')
+        data['successes'] = successes
+        data['failures'] = 100 - successes
+        response = 'cbind(successes, failures)'
+        distribution = 'binomial'
+
+    fixed = {
+        'no_genotype_model': f'{response} ~ trial',
+        'genotype_model': f'{response} ~ genotype + trial',
+        'no_learning_model': f'{response} ~ genotype',
+        'full_model': f'{response} ~ genotype * trial',
+    }
+    formulas = {key: value + ' + (1 | subject)' for key, value in fixed.items()}
+    lme4 = importr('lme4')
+    stats = importr('stats')
+    with localconverter(default_converter + pandas2ri.converter):
+        r_data = ro.conversion.py2rpy(data)
+    ro.globalenv['learning_glmm_data'] = r_data
+    ro.globalenv['learning_glmm_reference'] = reference
+    ro.r('''
+        learning_glmm_data$subject <- factor(learning_glmm_data$subject)
+
+        learning_glmm_data$genotype <- relevel(
+            factor(
+                as.character(learning_glmm_data$genotype),
+                ordered = FALSE
+            ),
+            ref = learning_glmm_reference
+        )
+    ''')
+    r_data = ro.globalenv['learning_glmm_data']
+
+    def fit(formula):
+        if distribution == 'binomial':
+            return lme4.glmer(ro.Formula(formula), data=r_data, family=stats.binomial())
+        return lme4.lmer(ro.Formula(formula), data=r_data, REML=False)
+
+    models = {key: fit(formula) for key, formula in formulas.items()}
+
+    def lr_test(reduced, full, term):
+        comparison = ro.r['anova'](reduced, full, test='Chisq')
+        with localconverter(default_converter + pandas2ri.converter):
+            comparison = ro.conversion.rpy2py(comparison)
+        row = comparison.iloc[-1]
+        return {'term': term, 'lr_stat': float(row['Chisq']),
+                'df': int(row['Df']), 'p_value': float(row['Pr(>Chisq)'])}
+
+    # do one full model only
+    full_model_fit = lme4.glmer(
+        formulas['full_model'],
+        data=r_data,
+        family=stats.binomial()
+    )
+    summary = ro.r['summary'](full_model_fit)
+    #print(summary)
+
+    coef_table = summary.rx2('coefficients')
+
+    with localconverter(default_converter + pandas2ri.converter):
+        coef_table = ro.conversion.rpy2py(coef_table)
+
+    coef_table = pd.DataFrame(
+        coef_table,
+            index=list(summary.rx2('coefficients').rownames),
+            columns=list(summary.rx2('coefficients').colnames)
+        )
+
+    stats_df = pd.DataFrame([
+        {
+            'term': 'genotype',
+            'estimate': coef_table.loc['genotypeHET', 'Estimate'],
+            'p_value': coef_table.loc['genotypeHET', 'Pr(>|z|)']
+        },
+        {
+            'term': 'trial',
+            'estimate': coef_table.loc['trial', 'Estimate'],
+            'p_value': coef_table.loc['trial', 'Pr(>|z|)']
+        },
+        {
+            'term': 'genotype:trial',
+            'estimate': coef_table.loc['genotypeHET:trial', 'Estimate'],
+            'p_value': coef_table.loc['genotypeHET:trial', 'Pr(>|z|)']
+        }
+    ])
+    # stats_df = pd.DataFrame([
+    #     lr_test(models['no_genotype_model'], models['genotype_model'], 'genotype'),
+    #     lr_test(models['no_learning_model'], models['genotype_model'], 'trial'),
+    #     lr_test(models['genotype_model'], models['full_model'], 'genotype:trial'),
+    # ])
+    # stats_df['distribution'] = distribution
+    # stats_df['n_observations'] = len(data)
+    # stats_df['n_subjects'] = data['subject'].nunique()
+    # stats_df['n_trials'] = data['trial'].nunique()
+    # stats_df['genotype_reference'] = reference
+    # stats_df['genotype_levels'] = ','.join(levels)
+    # stats_df['repeated_measure_term'] = 'subject_random_intercept'
+    if summary_path is not None:
+        os.makedirs(summary_path, exist_ok=True)
+        stats_df.to_csv(os.path.join(summary_path, f'{save_name} performance glmm.csv'), index=False)
+    return stats_df, models, data
 
 def run_learning_gamm(perf_df, summary_path):
 
@@ -871,7 +1018,11 @@ def plot_learning_curve(
     ax=None,
     show_raw=True,
 ):
-   
+
+    if trial_col == 'Block':
+        beh = 'odor'
+    elif trial_col == 'Trial':
+        beh = 'rotarod'
 
     plot_df = perf_df.copy()
     plot_df.rename(
@@ -924,8 +1075,8 @@ def plot_learning_curve(
         ordered=True
     )
 
-
-    stats_df, _, _ = run_learning_FDA(clean_df, save_name=save_name,summary_path=summary_path)
+    stats_df, _, _ = run_learning_glmm(clean_df, beh, save_name=save_name,summary_path=summary_path)
+    #stats_df, _, _ = run_learning_FDA(clean_df, save_name=save_name,summary_path=summary_path)
 
     summary_df = clean_df.groupby(
         ['genotype', 'trial'],
@@ -987,9 +1138,9 @@ def plot_learning_curve(
     if not stats_df.empty and 'p_value' in stats_df.columns:
         p_values = stats_df.set_index('term')['p_value']
         stats_text = (
-            f"FDA p genotype = {p_values.get('genotype', np.nan):.3g}\n"
-            f"FDA p learning = {p_values.get('learning', np.nan):.3g}\n"
-            f"FDA p interaction = {p_values.get('genotype:learning', np.nan):.3g}"
+            f"GLMM p genotype = {p_values.get('genotype', np.nan):.3g}\n"
+            f"GLMM p learning = {p_values.get('trial', np.nan):.3g}\n"
+            f"GLMM p interaction = {p_values.get('genotype:trial', np.nan):.3g}"
         )
         ax.text(
             0.98, 0.98, stats_text,
@@ -1448,26 +1599,689 @@ def fetch_rotarod(google_url, root_dir, strains, ages):
                                         })
             performance_df.to_csv(RR_file, index=False)
 
+def clean_rotarod_videos(video_folder):
+    # input
+    # video_folder: the folder where the raw videos are stored
+    # root_dir: the root directory where the rotarod data is stored
+    # strains: list of strains to fetch
+    # ages: list of ages to fetch
 
-#%%
-if __name__ == '__main__':
+    # clean up raw files
+    # 1. remove size 0 files
+    # 2. remove extra spaces in filenames
 
-    #Example usage
-    root_dir = r'Y:\HongliWang\Juvi_ASD Deterministic\TSC2\Analysis'
-    # find the folder in the root_dir
-    folders = [f for f in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, f))]
-    for f in folders:
-        #if not os.path.exists(os.path.join(root_dir, f, 'Odor')):
-        #os.makedirs(os.path.join(root_dir, f, 'Odor'), exist_ok=True)
-        # move behavior directory and every file inside in to the Odor folder
-        # remove .csv files in the folder
-        sub_root = os.path.join(root_dir, f, 'Odor','Behavior')
-        sub_folders = [ff for ff in os.listdir(sub_root) if os.path.isdir(os.path.join(sub_root, ff))]
-        for folder in sub_folders:
-            for file in os.listdir(os.path.join(sub_root, folder)):
-                if file.endswith('.csv'):
-                    os.remove(os.path.join(sub_root, folder, file))
+    video_sessions = os.listdir(video_folder)
+    for video_session in video_sessions:
+        session_path = os.path.join(video_folder, video_session)
+        if not os.path.isdir(session_path):
+            continue
 
+        with os.scandir(session_path) as files:
+            for file_entry in files:
+                if not file_entry.is_file():
+                    continue
+
+                file_path = file_entry.path
+                if file_entry.stat().st_size == 0:
+                    os.remove(file_path)
+                    continue
+
+                if ' ' in file_entry.name:
+                    os.rename(file_path, os.path.join(session_path, file_entry.name.replace(' ', '')))
+
+    # go through the animalList in root_dir/strains, look for videos in rawvideo files
+    
+def organize_beh_videos(root_folders, raw_video_folder, dlc_folder, dlc_labeled_folder):
+    # move the videos to the corresponding folders in root_dir
+    # find the corresponding dlc files from dlc_folder
+    # move videos without DLC files to a separate folder for DLC labeling
+
+    strain_folders = [
+        f for f in os.listdir(root_folders)
+        if os.path.isdir(os.path.join(root_folders, f))
+    ]
+    video_exts = {'.avi', '.mp4', '.mov', '.m4v'}
+    dlc_csv_index = []
+
+    # look for DLC csv files in dlc_folder and 
+    # create an index for them
+    if os.path.isdir(dlc_labeled_folder):
+        if 'DLC' in dlc_labeled_folder: # for deeplabcut labels
+            with os.scandir(dlc_labeled_folder) as dlc_entries:
+                dlc_csv_index = sorted(
+                    (entry.name.lower(), entry.name, entry.path)
+                    for entry in dlc_entries
+                    if entry.is_file() and entry.name.lower().endswith('filtered.csv')
+                )
+        elif 'litPose' in dlc_labeled_folder: # for litPose labels
+            with os.scandir(dlc_labeled_folder) as dlc_entries:
+                dlc_csv_index = sorted(
+                    (entry.name.lower(), entry.name, entry.path)
+                    for entry in dlc_entries
+                    if entry.is_file() and not entry.name.lower().endswith('temporal_norm.csv')
+                )
+
+    #%% move exising video recordings to destination folders
+    for strain_folder in strain_folders:
+        data_folder = os.path.join(root_folders, strain_folder, 'Data')
+        # load animalCSV
+        animalList = pd.read_csv(os.path.join(data_folder, 'AnimalList.csv'))
+
+        animal_ids = tuple(animalList['AnimalID'].dropna().astype(str).unique())
+        for aID in animal_ids:
+            behavioral_recordings_folder = os.path.join(data_folder, aID,'Rotarod', 'BehavioralRecording')
+            
+
+            with os.scandir(raw_video_folder) as raw_entries:
+                for raw_entry in raw_entries:
+                    if not raw_entry.is_dir() or not raw_entry.name.startswith(aID):
+                        continue
+
+                    destination_path = os.path.join(behavioral_recordings_folder, raw_entry.name)
+                    if os.path.exists(destination_path):
+                        print(f"Destination already exists, skipping {raw_entry.path}")
+                        continue
+
+                    os.makedirs(behavioral_recordings_folder, exist_ok=True)
+                    if not move_directory_safely(raw_entry.path, destination_path):
+                        continue
+
+    #%% move DLC labels to folders containing matching videos
+    for strain_folder in strain_folders:
+        data_folder = os.path.join(root_folders, strain_folder, 'Data')
+        if not os.path.isdir(data_folder):
+            continue
+
+        with os.scandir(data_folder) as animal_entries:
+            for animal_entry in animal_entries:
+                if not animal_entry.is_dir():
+                    continue
+
+                behavioral_recordings_folder = os.path.join(
+                    animal_entry.path, 'Rotarod', 'BehavioralRecording'
+                )
+                if not os.path.isdir(behavioral_recordings_folder):
+                    continue
+
+                for folder_path, _, filenames in os.walk(behavioral_recordings_folder):
+                    for filename in filenames:
+                        video_stem, video_ext = os.path.splitext(filename)
+                        if video_ext.lower() not in video_exts:
+                            continue
+
+                        prefix = video_stem.lower()
+                        start = bisect_left(dlc_csv_index, (prefix, '', ''))
+                        end = bisect_right(dlc_csv_index, (prefix + '\uffff', '', ''))
+
+                        for _, dlc_name, dlc_path in dlc_csv_index[start:end]:
+                            if not os.path.exists(dlc_path):
+                                continue
+
+                            destination_path = os.path.join(folder_path, dlc_name)
+                            if os.path.exists(destination_path):
+                                print(f"Destination already exists, skipping {dlc_path}")
+                                continue
+
+                            shutil.move(dlc_path, destination_path)
+
+    #%% copy videos withoug DLC labeling to a separate folder 
+    # for DLC labeling
+    forDLCfolder = r'Y:\HongliWang\Rotarod\DLC_training'
+    os.makedirs(forDLCfolder, exist_ok=True)
+
+    for strain_folder in strain_folders:
+        data_folder = os.path.join(root_folders, strain_folder, 'Data')
+        if not os.path.isdir(data_folder):
+            continue
+
+        with os.scandir(data_folder) as animal_entries:
+            for animal_entry in animal_entries:
+                if not animal_entry.is_dir():
+                    continue
+
+                behavioral_recordings_folder = os.path.join(
+                    animal_entry.path, 'Rotarod', 'BehavioralRecording'
+                )
+                if not os.path.isdir(behavioral_recordings_folder):
+                    continue
+
+                for folder_path, _, filenames in os.walk(behavioral_recordings_folder):
+                    csv_names = sorted(
+                        filename.lower()
+                        for filename in filenames
+                        if filename.lower().endswith('.csv')
+                    )
+
+                    for filename in filenames:
+                        video_stem, video_ext = os.path.splitext(filename)
+                        if video_ext.lower() not in video_exts:
+                            continue
+
+                        prefix = video_stem.lower()
+                        start = bisect_left(csv_names, prefix)
+                        has_matching_csv = (
+                            start < len(csv_names)
+                            and csv_names[start].startswith(prefix)
+                        )
+                        if has_matching_csv:
+                            continue
+
+                        source_path = os.path.join(folder_path, filename)
+                        destination_path = os.path.join(forDLCfolder, filename)
+                        if os.path.exists(destination_path):
+                            print(f"Destination already exists, skipping {source_path}")
+                            continue
+
+                        shutil.copy2(source_path, destination_path)
+
+
+def move_directory_safely(source_path, destination_path):
+    """Move a directory to the destination, skipping it if access is denied."""
+    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+    try:
+        shutil.move(source_path, destination_path)
+        return True
+    except (PermissionError, shutil.Error, OSError) as exc:
+        print(f"Skipping {source_path}: {exc}")
+        return False
+
+#%% code for extracting odor behavior
+def get_RLWM_EventTimes(filename):
+    """
+    Get RLWM event times and metadata from a MATLAB data file.
+    
+    Parameters
+    ----------
+    filename : str or dict
+        Either a string path to a .mat file or a dictionary containing 'exper' field
+    
+    Returns
+    -------
+    dict
+        Dictionary containing:
+        - RLWM_EventTimes: 3xN array [eventID, eventTime, trial]
+        - odor_name: odor names for each trial
+        - odor_dur: odor duration for each trial
+        - schedule: stimulus schedule for each trial
+        - portside: port side schedule for each trial
+        - result: result for each trial
+        - startTime: absolute start time
+    
+    Event ID mappings:
+        1: center port in
+        2: center port out
+        3: left port in
+        4: left port out
+        44: last left port out
+        5: right port in
+        6: right port out
+        66: last right port out
+        7.01-7.16: new trial, odor 1-16 ON
+        81.0: Correct response, withdraw too early
+        81.2: Correct response, 2 drops rewarded
+        81.3: Correct response, 3 drops rewarded
+        82: False Go (lick), white noise on
+        83: Missed to respond
+        84: Aborted outcome
+        9.01-9.03: Water valve on 1-3 times
+    """
+    
+    #warnings.filterwarnings('ignore')
+    
+    out = {}
+    
+    # Load data
+    if isinstance(filename, str):
+        if not os.path.exists(filename):
+            raise FileNotFoundError(f"File not found: {filename}")
+        data = loadmat(filename, struct_as_record=False, squeeze_me=True)
+    elif isinstance(filename, dict):
+        if 'exper' not in filename:
+            raise ValueError("Dictionary must contain 'exper' field")
+        data = filename
+    else:
+        raise ValueError("filename must be a string path or dictionary with 'exper' field")
+    
+    if not data:
+        print("File not found or empty")
+        return out
+    
+    exper = data['exper']
+    
+    # Determine which field to use
+    has_odor_rlwm = hasattr(exper, 'odor_rlwm') and exper.odor_rlwm is not None
+    has_odor_rlwm_automatic = hasattr(exper, 'odor_rlwm_automatic') and exper.odor_rlwm_automatic is not None
+    
+    if has_odor_rlwm_automatic and not has_odor_rlwm:
+        useField = 'odor_rlwm_automatic'
+    elif has_odor_rlwm and not has_odor_rlwm_automatic:
+        useField = 'odor_rlwm'
+    elif has_odor_rlwm and has_odor_rlwm_automatic:
+        # Both exist, choose based on CountedTrial
+        counted_trial_1 = int(exper.odor_rlwm.param.countedtrial.value)
+        counted_trial_2 = int(exper.odor_rlwm_automatic.param.countedtrial.value)
         
+        if counted_trial_1 > 0 and counted_trial_2 == 0:
+            useField = 'odor_rlwm'
+        elif counted_trial_2 > 0 and counted_trial_1 == 0:
+            useField = 'odor_rlwm_automatic'
+        else:
+            useField = 'odor_rlwm_automatic'
+    else:
+        os.error('no Odor_RLWM session found')
+    
+    # Extract main data
+    trial_events = exper.rpbox.param.trial_events.value
+    rlwm_module = getattr(exper, useField)
+    
+    counted_trial = int(rlwm_module.param.countedtrial.value)
+    result = np.array(rlwm_module.param.result.value[:counted_trial])
+    portside = np.array(rlwm_module.param.port_side.value[:counted_trial])
+    schedule = np.array(rlwm_module.param.schedule.value[:counted_trial])
+    odor_channel_schedule = np.array(rlwm_module.param.odorchannel.value[:counted_trial])
+    odor_name = np.array(rlwm_module.param.odorname.value[:counted_trial])
+    
+    stim_param = rlwm_module.param.stimparam.value
+    param_string = rlwm_module.param.stimparam.user
+    
+    # Extract left and right reward ratios
+    left_p_idx = np.where(np.array(param_string) == 'left reward ratio')[0][0]
+    right_p_idx = np.where(np.array(param_string) == 'right reward ratio')[0][0]
+    left_p = np.array([float(x) for x in stim_param[:, left_p_idx]])
+    right_p = np.array([float(x) for x in stim_param[:, right_p_idx]])
+    
+    left_reward_p = left_p[schedule - 1]
+    right_reward_p = right_p[schedule - 1]
+    
+    # Process trials
+    rlwm_event_times = []
+    valid_trials = np.zeros(counted_trial, dtype=bool)
+    kk = 0
+    
+    for k in range(counted_trial):
+        trial_idx = k + 1  # MATLAB uses 1-based indexing
+        
+        if k == 0:
+            tt1 = 0
+            try:
+                trial_events_k = np.array(rlwm_module.param.trial_events.trial[k])
+                if len(trial_events_k.shape) == 1:
+                    trial_events_k = trial_events_k.reshape(1, -1)
+                
+                if result[k] in [1.2, 1.3]:
+                    tt2 = trial_events_k[-1, 2]
+                else:
+                    tt2 = trial_events_k[0, 2] if len(trial_events_k) > 0 else 0
+                kk += 1
+            except:
+                tt2 = 0
+        else:
+            tt1 = tt2
+            try:
+                trial_events_k = np.array(rlwm_module.param.trial_events.trial[k])
+                if len(trial_events_k.shape) == 1:
+                    trial_events_k = trial_events_k.reshape(1, -1)
+                
+                if len(trial_events_k) > 0:
+                    if result[k] in [1.2, 1.3]:
+                        tt2 = trial_events_k[-1, 2]
+                    else:
+                        tt2 = trial_events_k[0, 2] if len(trial_events_k) > 0 else 0
+                    kk += 1
+                else:
+                    # Handle missing trial events
+                    if result[k] == 0 and k < counted_trial - 1:
+                        tt2 = 0
+                    else:
+                        raise ValueError(f"No trial events for trial {k}")
+            except Exception as e:
+                # Skip trials with missing events
+                continue
+        
+        # Get events for current trial
+        # time, state, channel
+        current_te = trial_events[
+            (trial_events[:, 1] > tt1) & (trial_events[:, 1] <= tt2),1:4
+        ]
+        
+        if len(current_te) == 0:
+            continue 
+        
+        # Find ITI events
+        c1in_time = current_te[
+            (np.isin(current_te[:, 1], [9, 19, 512, 0, 1, 11])) & 
+            (np.isin(current_te[:, 2], [1])),0
+        ]
+        
+        # Find odor on time
+        delay_odor = int(rlwm_module.param.delayodor.value)
+        if delay_odor == 1:
+            new_trial_odor_on_time = current_te[
+                (np.isin(current_te[:, 1], [2, 12, 22])) & 
+                (np.isin(current_te[:, 2], [8])),0
+            ]
+        else:
+            new_trial_odor_on_time = current_te[
+                (np.isin(current_te[:, 1], [1, 11, 21])) & 
+                (np.isin(current_te[:, 2], [8])),0
+            ]
+        
+        if len(new_trial_odor_on_time) == 0:
+            continue
+        
+        # Extract scalar value from array
+        if len(new_trial_odor_on_time) >= 2:
+            new_trial_odor_on_time = float(new_trial_odor_on_time[-1])
+        else:
+            new_trial_odor_on_time = float(new_trial_odor_on_time[0])
+        
+        valid_trials[k] = True
+        
+        # ITI events
+        iti_te = trial_events[
+            (trial_events[:, 1] > tt1) & (trial_events[:, 1] < new_trial_odor_on_time) & 
+            np.isin(trial_events[:, 3], [1, 2, 3, 4, 5, 6])
+        ][:, [1, 2, 3]]
+        
+        # Process last poke out
+        last_poke_out_mask = np.isin(iti_te[:, 2], [4, 6])
+        if np.any(last_poke_out_mask):
+            last_idx = np.where(last_poke_out_mask)[0][-1]
+            iti_te[last_idx, 2] = iti_te[last_idx, 2] * 10 + iti_te[last_idx, 2]
+        
+        for row in iti_te:
+            rlwm_event_times.append([float(row[2]), float(row[0]), float(kk - 0.5)])
+        
+        # New trial odor on event
+        odor_id = float(odor_channel_schedule[k]) / 100
+        rlwm_event_times.append([float(7 + odor_id), float(new_trial_odor_on_time), float(kk)])
+        
+        # Trial events
+        tk_te = trial_events[
+            (trial_events[:, 1] > new_trial_odor_on_time) & (trial_events[:, 1] <= tt2) & 
+            np.isin(trial_events[:, 3], [1, 2, 3, 4, 5, 6])
+        ][:, [1, 2, 3]]
+        
+        tk_te1 = trial_events[
+            (trial_events[:, 1] > new_trial_odor_on_time) & (trial_events[:, 1] <= tt2) & 
+            (trial_events[:, 2] == 45) & (trial_events[:, 3] == 8)
+        ][:, [1, 2, 3]]
+        tk_te1[:, 2] = 9.01
+        
+        tk_te2 = trial_events[
+            (trial_events[:, 1] > new_trial_odor_on_time) & (trial_events[:, 1] <= tt2) & 
+            (trial_events[:, 2] == 44) & (trial_events[:, 3] == 8)
+        ][:, [1, 2, 3]]
+        tk_te2[:, 2] = 9.02
+        
+        tk_te3 = trial_events[
+            (trial_events[:, 1] > new_trial_odor_on_time) & (trial_events[:, 1] <= tt2) & 
+            (trial_events[:, 2] == 43) & (trial_events[:, 3] == 8)
+        ][:, [1, 2, 3]]
+        tk_te3[:, 2] = 9.03
+        
+        tk_te_combined = np.vstack([tk_te, tk_te1, tk_te2, tk_te3]) if len(tk_te) > 0 or len(tk_te1) > 0 or len(tk_te2) > 0 or len(tk_te3) > 0 else np.empty((0, 3))
+        
+        if len(tk_te_combined) > 0:
+            sort_idx = np.argsort(tk_te_combined[:, 0])
+            tk_te_combined = tk_te_combined[sort_idx]
+            
+            for row in tk_te_combined:
+                rlwm_event_times.append([float(row[2]), float(row[0]), float(kk)])
+        
+        # Outcome event
+        rlwm_event_times.append([float(80 + result[k]), float(tt2), float(kk)])
+    
+    # Convert to array
+    if rlwm_event_times:
+        rlwm_event_times = np.array(rlwm_event_times, dtype=float).T
+    else:
+        rlwm_event_times = np.empty((3, 0))
+    
+    # Filter by valid trials
+    out['RLWM_EventTimes'] = rlwm_event_times
+    out['odor_name'] = odor_name[valid_trials]
+    out['schedule'] = schedule[valid_trials]
+    
+    # Filter portside with filtered reward parameters
+    left_reward_p_filtered = left_reward_p[valid_trials]
+    right_reward_p_filtered = right_reward_p[valid_trials]
+    portside_filtered = portside[valid_trials].astype(float)
+    portside_filtered[(left_reward_p_filtered == -1) & (right_reward_p_filtered == -1)] = -1
+    out['portside'] = portside_filtered
+    
+    out['result'] = result[valid_trials]
+    
+    # Get start time
+    try:
+        start_time_val = exper.control.param.trialstart.value
+        start_seconds = start_time_val[3] * 3600 + start_time_val[4] * 60 + start_time_val[5]
+        out['startTime'] = start_seconds
+    except:
+        out['startTime'] = 0
+    
+    # Get odor duration
+    try:
+        stim_param = rlwm_module.param.stimparam.value
+        odor_dur = stim_param[schedule[valid_trials] - 1, 5]
+        out['odor_dur'] = np.array([float(x) for x in odor_dur])
+    except:
+        out['odor_dur'] = np.zeros(np.sum(valid_trials))
+    
+    return out
+
+
+def backward_times(dmat, outcome_inds, region_func):
+    """
+    Helper function to extract event times backward in time from outcome events.
+    
+    Parameters
+    ----------
+    dmat : np.ndarray
+        Event matrix with columns [eventID, eventTime, trial]
+    outcome_inds : np.ndarray
+        Indices of outcome events
+    region_func : callable
+        Function that takes a region and returns boolean mask for selection
+    
+    Returns
+    -------
+    np.ndarray
+        Array of times for each outcome
+    """
+    result = np.full(len(outcome_inds), np.nan)
+    
+    for i, outcome_idx in enumerate(outcome_inds):
+        start_idx = 0 if i == 0 else outcome_inds[i - 1]
+        end_idx = outcome_idx
+        
+        region = dmat[start_idx:end_idx + 1, :]
+        mask = region_func(region)
+        times = region[mask, 1]
+        
+        if len(times) > 0:
+            result[i] = times[-1]
+    
+    return result
+
+
+def extract_behavior_df(filename):
+    """
+    Extract behavioral features from RLWM experimental data.
+    
+    Parameters
+    ----------
+    filename : str
+        Path to a .mat file containing RLWM experimental data
+    
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing behavioral features for each trial:
+        - trial: trial number
+        - outcome: trial outcome
+        - center_in: center port entry time
+        - center_out: center port exit time
+        - side_in: side port entry time
+        - last_side_out: last side port exit time
+        - actions: choice side (3=left, 5=right)
+        - reward: water reward amount
+        - trial_types: trial type
+        - odors: odor identity
+        - port_side: scheduled port side
+        - schedule: stimulus schedule
+        - odor_name: odor name (ASCII)
+        - odor_dur: odor duration
+        - start_time: session start time
+    """
+    
+    # Load data
+    data = get_RLWM_EventTimes(filename)
+    
+    if not data or len(data.get('RLWM_EventTimes', [])) == 0:
+        print("No event data found")
+        return pd.DataFrame()
+    
+    dmat = data['RLWM_EventTimes'].T
+    
+    # Get basic event time features
+    outcome_inds = np.where(dmat[:, 0] > 80)[0]
+    n_trials = len(outcome_inds)
+    
+    result_dict = {}
+    result_dict['trial'] = np.arange(1, n_trials + 1)
+    result_dict['outcome'] = dmat[outcome_inds, 1]
+    
+    # Identify odor events
+    odor_inds = np.where(np.floor(dmat[:, 0]) == 7)[0]
+    
+    # Center in times (looking backward from outcome)
+    result_dict['center_in'] = backward_times(
+        dmat, outcome_inds, 
+        lambda region: region[:, 0] == 1
+    )
+    
+    # Center out times
+    result_dict['center_out'] = backward_times(
+        dmat, outcome_inds,
+        lambda region: region[:, 0] == 2
+    )
+    
+    # Side in times
+    side_in_times = backward_times(
+        dmat, outcome_inds,
+        lambda region: np.isin(region[:, 0], [3, 5])
+    )
+    # Mark as NaN if side_in is before center_in (miss trial)
+    side_in_times[side_in_times < result_dict['center_in']] = np.nan
+    result_dict['side_in'] = side_in_times
+    
+    # Last side out times (looking forward)
+    last_side_out = np.full(n_trials, np.nan)
+    for i in range(n_trials):
+        start_idx = outcome_inds[i]
+        if i < n_trials - 1:
+            end_idx = odor_inds[i + 1] if i + 1 < len(odor_inds) else len(dmat)
+        else:
+            end_idx = len(dmat)
+        
+        region = dmat[start_idx:end_idx, :]
+        so_times = region[(np.isin(region[:, 0], [44, 66])), 1]
+        if len(so_times) > 0:
+            last_side_out[i] = so_times[-1]
+    
+    result_dict['last_side_out'] = last_side_out
+    
+    # Get task features
+    # Actions (choice side)
+    trial_sel = np.isin(dmat[:, 1], side_in_times) & (dmat[:, 0] < 80)
+    actions = np.full(n_trials, np.nan)
+    if np.any(trial_sel):
+        choice_trials = dmat[trial_sel, 2].astype(int)
+        # Only update actions where choice_trials is within valid range
+        valid_idx = (choice_trials - 1 >= 0) & (choice_trials - 1 < n_trials)
+        actions[choice_trials[valid_idx] - 1] = (dmat[trial_sel, 0][valid_idx] - 3) / 2
+    result_dict['actions'] = actions
+    
+    # Water rewards
+    waters = np.full(n_trials, np.nan)
+    water_sel = np.floor(dmat[:, 0]) == 9
+    if np.any(water_sel):
+        water_given = dmat[water_sel, 2].astype(int)
+        # Only update waters where water_given is within valid range
+        valid_idx = (water_given - 1 >= 0) & (water_given - 1 < n_trials)
+        waters[water_given[valid_idx] - 1] = (dmat[water_sel, 0][valid_idx] % 1) * 100
+    result_dict['reward'] = waters
+    
+    # Trial types
+    trial_types_mask = np.floor(dmat[:, 0]) > 80
+    if np.any(trial_types_mask):
+        trial_types = (dmat[trial_types_mask, 0] % 1) / 10
+        result_dict['trial_types'] = trial_types
+    else:
+        result_dict['trial_types'] = np.full(n_trials, np.nan)
+    
+    # Odor identity
+    odor_mask = np.floor(dmat[:, 0]) == 7
+    if np.any(odor_mask):
+        odors = (dmat[odor_mask, 0] % 1) * 100
+        result_dict['odors'] = odors
+    else:
+        result_dict['odors'] = np.full(n_trials, np.nan)
+    
+    # Add metadata
+    result_dict['port_side'] = data['portside']
+    result_dict['schedule'] = data['schedule']
+    result_dict['odor_name'] = data['odor_name']
+    result_dict['odor_dur'] = data['odor_dur']
+    result_dict['start_time'] = np.full(n_trials, data.get('startTime', 0))
+    
+    # Create DataFrame
+    df = pd.DataFrame(result_dict)
+    
+    return df
+
+
+def save_behavior_df(filename, output_csv=None):
+    """
+    Extract behavioral DataFrame and save as CSV.
+    
+    Parameters
+    ----------
+    filename : str
+        Path to input .mat file
+    output_csv : str, optional
+        Path for output CSV file. If None, saves as filename_behavior.csv
+    
+    Returns
+    -------
+    pd.DataFrame
+        The extracted behavioral DataFrame
+    """
+    df = extract_behavior_df(filename)
+    
+    if output_csv is None:
+        base_name = os.path.splitext(filename)[0]
+        output_csv = f"{base_name}_behavior.csv"
+    
+    df.to_csv(output_csv, index=False)
+    print(f"Saved behavioral DataFrame to {output_csv}")
+    
+    return df
+
+#%% test script
+if __name__ == '__main__':
+    root_dir = r'Y:\HongliWang\Rotarod\ASD_strains'
+    #strains = 'TSC2_adol'
+    video_folder = r'Y:\HongliWang\Rotarod\rawRecordings_260622'
+    dlc_folder = r'Y:\HongliWang\Rotarod\Filtered_DLC'
+
+    # remove size 0 files and clean the filenames
+    clean_rotarod_videos(video_folder)
+
+    # move the videos to the corresponding folders in root_dir
+    # find the corresponding dlc files from dlc_folder
+    # move videos without DLC files to a separate folder for DLC labeling
+    organize_beh_videos(root_dir, video_folder, dlc_folder)   
 # %%
  

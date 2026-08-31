@@ -10,7 +10,7 @@ plt.ion()
 # root directory
 # change this variable to analyze one strain at a time, e.g. 'Syngap' or 'Scn2A'
 strain = 'Scn2A'
-root_dir = os.path.join(r'Z:\HongliWang\Openfield_ASD', strain)
+root_dir = os.path.join(r'Y:\HongliWang\Openfield_ASD', strain)
 
 # initialize the openfield instance
 # create a attribute 

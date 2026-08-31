@@ -1,44 +1,47 @@
 # code to process behavior files and align calcium data with behavior timestamps
-import os
-import cv2
-import numpy as np
-import pandas as pd
+import copy
 import glob
+import os
+import pickle
+import re
 from collections import defaultdict
 from datetime import datetime
-import re
-from utils_imaging import *
-from utils_beh import *
+
+import gspread
+
+
+import imageio.v3 as iio
+import cv2
+
+# matplotlib
 import matplotlib
-matplotlib.use('QtAgg') 
+#matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
+plt.ion()
 import seaborn as sns
+
 from matplotlib.collections import LineCollection
-import pickle
-import copy
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.patches import Patch
-import imageio.v3 as iio
+
+import numpy as np
+import pandas as pd
 import ruptures as rpt
 import statsmodels.stats.api as smf
-from scipy.signal import spectrogram,hilbert,correlate, find_peaks
-from scipy.stats import pearsonr, mannwhitneyu
-from statsmodels.stats.multitest import multipletests
+
 from scipy.optimize import minimize
-try:
-    import matlab.engine
-except ModuleNotFoundError:
-    matlab = None
-
-if matlab is not None:
-    eng = matlab.engine.start_matlab()
-else:
-    eng = None
-
+from scipy.signal import correlate, find_peaks, hilbert, spectrogram
 from scipy.special import expit
-from utils_model import *
+from scipy.stats import mannwhitneyu, pearsonr, wilcoxon
+from statsmodels.stats.multitest import multipletests
+
+# Project-local utilities
 from pyPlotHW import StartPlots
+from utils_beh import *
+from utils_imaging import *
+from utils_model import *
+from utils_Deeplabcut import *
 # add matlab code into the path
 #eng.addpath(r'C:\Users\Linda\Documents\GitHub\ASD_RLWM\Behavior', nargout=0)
 
@@ -116,6 +119,8 @@ class BehData:
             self.Gender = self.AnimalInfo['Gender']
         else:
             self.Gender = ['M']*len(self.Animals)
+        if 'Session_length' in self.AnimalInfo.columns:
+            self.SessionLength = self.AnimalInfo['Session_length']
         if 'Cells' in self.AnimalInfo.columns:
             self.ImageCell = self.AnimalInfo['Cells']
         else:
@@ -3487,13 +3492,22 @@ class BehDataOdor(BehData):
                     'ImgTimeStamp': '',                # list or array
                     'ifCalImg': False,                 # boolean
                     'ifBehRecording': ifRec,            # boolean
-                    'BehCSV': []
+                    'BehCSV': [],
+                    'perf_AB': [],                     # average performance of AB
+                    'perf_CD': [],                     # average performance of CD
+                    'perf_DC': [],                     # average performance of DC reversal
+                    'water_left': np.nan,              # water dispensed from left port
+                    'water_right': np.nan,             # water dispensed from right port
+                    'odor_presented': [],               # actual odor presented in the raw behavior file
+                    'n_trials': np.nan,                     # total number of trials in the session
+
                 }
                 
                 row_dict = {
                     'Animal': a,
                     'Genotype': self.Genotypes[aIdx],
-                    'Gender': self.Gender[aIdx],
+                    'Gender': self.Gender[aIdx] if hasattr(self, 'Gender') else None,
+                    'Session_length': self.SessionLength[aIdx] if hasattr(self, 'SessionLength') else None,
                     'Date': date,
                     'Protocol': protocol,
                     'ProtocolDay': pDay,
@@ -3521,7 +3535,7 @@ class BehDataOdor(BehData):
 
                 results = []
                 for beh in behFiles:
-                    resultdf = eng.extract_behavior_df(beh)
+                    resultdf = extract_behavior_df(beh)
 
                     # deal with float precision problem
                     resultdf['reward'] = resultdf['reward'].round(0)
@@ -3536,9 +3550,157 @@ class BehDataOdor(BehData):
                     os.makedirs(self.data_index['AnalysisPath'][bIdx], exist_ok = True)
 
                 final_df.to_csv(csvPath)
-            
+
+            else:
+                # load the csv file
+                resultdf = pd.read_csv(csvPath)
+
             self.data_index.loc[bIdx, 'BehCSV'] = csvPath
 
+            # calculate AB and CD average performance
+            self.data_index.at[bIdx, 'odor_presented'] = np.unique(resultdf['schedule'])
+
+            perf_A = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==1]))
+            perf_B = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==2]))
+            perf_C = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==3]))
+            perf_D = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==4]))
+            perf_rev_C = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==6]))
+            perf_rev_D = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==5]))
+            water_left = np.sum(resultdf['reward'][resultdf['schedule'].isin([1, 3, 6])])
+            water_right = np.sum(resultdf['reward'][resultdf['schedule'].isin([2, 4, 5])])
+            nTrials = resultdf.shape[0]
+            self.data_index.at[bIdx, 'perf_AB'] = [perf_A, perf_B]
+            self.data_index.at[bIdx, 'perf_CD'] = [perf_C, perf_D]
+            self.data_index.at[bIdx, 'perf_DC'] = [perf_rev_C, perf_rev_D]
+            self.data_index.at[bIdx, 'water_left'] = water_left
+            self.data_index.at[bIdx, 'water_right'] = water_right
+            self.data_index.at[bIdx, 'nTrials'] = nTrials
+
+        # Check for missing sessions based on date.
+        session_dates = pd.to_datetime(self.data_index['Date'], format='%Y%m%d')
+        for animal, dates in session_dates.groupby(self.data_index['Animal'], sort=False):
+            missing_dates = pd.date_range(dates.min(), dates.max()).difference(dates)
+            for missing_date in missing_dates:
+                print(f'{animal}: missing session on {missing_date:%Y%m%d}')
+
+    def compare_notebook(self, url_address):
+        # compare the performance on .mat file with the digitized notebook info
+        # identify any mismatching sessions
+        
+        gc = gspread.service_account(filename="credentials/rotarod_reader.json")
+        sh_google = gc.open_by_url(url_address)
+        comparisons = pd.DataFrame()
+
+        for worksheet in sh_google.worksheets():
+            animal = worksheet.title.strip()
+            animal = animal[3:]
+            pipeline_data = self.data_index.loc[
+                self.data_index['Animal'].astype(str).str.strip() == animal,
+                ['Date', 'odor_presented', 'perf_AB', 'perf_CD', 'perf_DC', 'water_left', 'water_right', 'nTrials'],
+            ].copy()
+            if pipeline_data.empty:
+                continue
+
+            notebook_data = pd.DataFrame(worksheet.get_all_records(head=2))
+            notebook_columns = {
+                str(column).strip().lower(): column for column in notebook_data.columns
+            }
+            if 'schedule' in notebook_columns:
+                notebook_data = notebook_data.loc[
+                    notebook_data[notebook_columns['schedule']].isin(['AB_rwdsz3','AB_rwdsz2', 'AB_retrain','AB-CD','AB-CD_retrain','AB-CD-DC', 'AB-DC'])
+                ].copy()
+
+            def pair_value(performance, index):
+                return performance[index] if isinstance(performance, (list, tuple, np.ndarray)) else np.nan
+
+            pipeline_data['perf_A'] = pipeline_data['perf_AB'].map(lambda value: pair_value(value, 0))
+            pipeline_data['perf_B'] = pipeline_data['perf_AB'].map(lambda value: pair_value(value, 1))
+            pipeline_data['perf_C'] = pipeline_data['perf_CD'].map(lambda value: pair_value(value, 0))
+            pipeline_data['perf_D'] = pipeline_data['perf_CD'].map(lambda value: pair_value(value, 1))
+            pipeline_data['perf_C_rev'] = pipeline_data['perf_DC'].map(lambda value: pair_value(value, 0))
+            pipeline_data['perf_D_rev'] = pipeline_data['perf_DC'].map(lambda value: pair_value(value, 1))
+
+            pipeline_data.rename(columns={'odor_presented': 'protocol_pipeline'}, inplace=True)
+            pipeline_data = pipeline_data[
+                ['Date', 'protocol_pipeline', 
+                 'perf_A', 'perf_B', 'perf_C', 'perf_D', 
+                 'perf_C_rev', 'perf_D_rev',
+                 'water_left', 'water_right', 'nTrials']
+            ]
+
+            comparison = pd.DataFrame({
+                'Date': notebook_data[notebook_columns['date']]
+                if 'date' in notebook_columns else np.nan,
+                'protocol_notebook': notebook_data[
+                    notebook_columns.get('protocol', notebook_columns.get('schedule'))
+                ] if ('protocol' in notebook_columns or 'schedule' in notebook_columns) else np.nan,
+                'A': notebook_data[notebook_columns['a']] if 'a' in notebook_columns else np.nan,
+                'B': notebook_data[notebook_columns['b']] if 'b' in notebook_columns else np.nan,
+                'C': notebook_data[notebook_columns['c']] if 'c' in notebook_columns else np.nan,
+                'D': notebook_data[notebook_columns['d']] if 'd' in notebook_columns else np.nan,
+                'L_H2O': notebook_data[notebook_columns['l_h2o']] if 'l_h2o' in notebook_columns else np.nan,
+                'R_H2O': notebook_data[notebook_columns['r_h2o']] if 'r_h2o' in notebook_columns else np.nan
+            })
+            comparison['Date'] = pd.to_datetime(
+                comparison['Date'], format='%m/%d/%y', errors='coerce'
+            ).dt.normalize()
+            pipeline_data['Date'] = pd.to_datetime(
+                pipeline_data['Date'].astype(str).str.replace(r'\.0$', '', regex=True),
+                format='%Y%m%d',
+                errors='coerce',
+            ).dt.normalize()
+
+            def first_value(values):
+                values = values.dropna()
+                return values.iloc[0] if not values.empty else np.nan
+
+            comparison = comparison.groupby('Date', as_index=False).agg({
+                'protocol_notebook': lambda values: ', '.join(map(str, values.dropna().unique())),
+                'A': first_value,
+                'B': first_value,
+                'C': first_value,
+                'D': first_value,
+                'L_H2O': first_value,
+                'R_H2O': first_value
+            })
+            pipeline_data = pipeline_data.groupby('Date', as_index=False).agg({
+                'protocol_pipeline': first_value,
+                'perf_A': first_value,
+                'perf_B': first_value,
+                'perf_C': first_value,
+                'perf_D': first_value,
+                'water_left': first_value,
+                'water_right': first_value
+            })
+            comparison = pipeline_data.merge(comparison, on='Date', how='outer')
+            for odor in 'ABCD':
+                comparison[f'diff_{odor}'] = (
+                    comparison[f'perf_{odor}']
+                    - pd.to_numeric(comparison[odor], errors='coerce')
+                )
+            comparison[f'diff_L_H2O'] = (
+                    comparison[f'water_left']
+                    - pd.to_numeric(comparison['L_H2O'], errors='coerce')
+                )
+            comparison[f'diff_R_H2O'] = (
+                    comparison[f'water_right']
+                    - pd.to_numeric(comparison['R_H2O'], errors='coerce')
+                )
+            comparison.insert(0, 'Animal', animal)
+            comparison = comparison[
+                ['Animal', 'Date', 'protocol_pipeline', 'protocol_notebook',
+                 'perf_A', 'A', 'diff_A', 'perf_B', 'B', 'diff_B',
+                 'perf_C', 'C', 'diff_C', 'perf_D', 'D', 'diff_D', 
+                 'water_left', 'L_H2O', 'diff_L_H2O', 
+                 'water_right', 'R_H2O', 'diff_R_H2O']
+            ]
+            comparisons = pd.concat([comparisons, comparison], ignore_index=True)
+
+        #self.notebook_comparison = comparisons
+        #return self.notebook_comparison
+        # save the dataframe to a csv file
+        saveQCpath = os.path.join(self.root_path,'notebook_matlab_comparison.csv')
+        comparisons.to_csv(saveQCpath, index=False)
 
     def align_timeStamps(self):
         # align timestamps between behavior log and recording
@@ -3750,8 +3912,8 @@ class BehDataOdor(BehData):
             #resultdf = resultdf.drop(columns=['Unnamed: 0'], errors='ignore')
             #data_dict = resultdf.to_dict(orient='list')
             
-            eng.ASD_session(resultdf_path,self.data_index['Protocol'][ss],self.data_index['Animal'][ss], 
-                            self.data_index['Date'][ss],self.data_index['AnalysisPath'][ss],nargout=0)
+            #eng.ASD_session(resultdf_path,self.data_index['Protocol'][ss],self.data_index['Animal'][ss], 
+            #                self.data_index['Date'][ss],self.data_index['AnalysisPath'][ss],nargout=0)
             
     def session_analysis(self):
         # session-wise anlaysis
@@ -3778,12 +3940,14 @@ class BehDataOdor(BehData):
 
             # model fitting!
     
-    def model_fitting(self, fit_mode):
+    def model_fitting(self, fit_mode, model_name="policy_gradient"):
         # fit computational models to the behavioral data
         # fit mode: 'session' or 'concat'
         #          'session': fit model to each session separately
         #          'concat': fit model to the concatenated data of all sessions
-        
+
+        if model_name not in ('policy_gradient', 'hybrid_Q'):
+            raise ValueError(f"Unsupported model_name: {model_name}")
 
         if fit_mode == 'session':
             nSessions = self.data_index.shape[0]
@@ -3814,14 +3978,16 @@ class BehDataOdor(BehData):
                 protocolDay = self.data_index['ProtocolDay'][ss]
                 animalID = self.data_index['Animal'][ss]
                 save_path = os.path.join(self.data_index['AnalysisPath'][ss], 'latent')
-                
+                os.makedirs(save_path, exist_ok=True)
                 fit_params.loc[ss, 'protocol'] = f'{protocol}{protocolDay}'
 
-                savedatapath = os.path.join(save_path,'policy_gradient_fit.json')
+                fit_filename = f'{model_name}_fit.json'
+
+                savedatapath = os.path.join(save_path, fit_filename)
 
                 # preprocess the data (remove AB trials for AB-CD sessions)
                 # fit AB and AB-CD sessions only
-                if protocol == 'AB-CD-DC' or protocol=='AB-DC':
+                if protocol == 'AB-CD-DC' or protocol=='AB-DC' or protocolDay > 3:
                     continue
                 resultdf.replace({"actions": ["NAN","NaN", "nan", "None", ""]}, np.nan, inplace=True)
                 resultdf.replace({"schedule": ["NAN", "NaN", "nan", "None", ""]}, np.nan, inplace=True)
@@ -3841,31 +4007,46 @@ class BehDataOdor(BehData):
                     with open(savedatapath, 'r') as f:
                         latent_fit = json.load(f)
                 else:
-                    latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
+                    if model_name == 'policy_gradient':
+                        latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
+                    elif model_name == 'hybrid_Q':
+                        #latent_fit = fit_hybrid(data,animalID=animalID, savedatapath=savedatapath)
+                        latent_fit = fit_hybrid_bias_model(data,animalID=animalID, 
+                                                           savedatapath=savedatapath, n_starts=1)
 
-                weights = latent_fit['weight']
-                opt_vars = latent_fit['args']['optList']
-                for widx, ww in enumerate(weights):
-                    for vv in opt_vars:
-                        fit_params.loc[ss, f'{ww}_{vv}'] = latent_fit['opt_hyper'][vv][widx]
+                # if model_name == 'hybrid':
+                #     model_label = 'Hybrid RL'
+                #     savefigpath = os.path.join(save_path, f'{animalID}_{protocol}_latent_fit')
+                #     plot_latent_session(data, latent_fit, model_label,savefigpath)
+                    
+                if model_name == 'policy_gradient':
+                    weights = latent_fit['weight']
+                    opt_vars = latent_fit['args']['optList']
+                    for widx, ww in enumerate(weights):
+                        for vv in opt_vars:
+                            fit_params.loc[ss, f'{ww}_{vv}'] = latent_fit['opt_hyper'][vv][widx]
+                    
+                                    # for psychometric plot
+                    temp = pd.DataFrame()
+                    temp['weighted_sum'] = latent_fit['weighted_sum']
+                    temp['genotype'] = fit_params['genotype'][ss]
+                    temp['animal'] = fit_params['animal'][ss]
+                    temp['choice'] = latent_fit['args']['dat']['y']
+                    temp['gender'] = fit_params['gender'][ss]
+                    fit_psychometric[pp]= pd.concat(
+                        (fit_psychometric[pp], temp))
+                        
+                    #model_label = 'Policy Gradient'
+                    
+
+                elif model_name == 'hybrid_Q':
+                    pass
+
                 fit_params.loc[ss, f'AIC'] = latent_fit['AIC']
                 fit_params.loc[ss, f'BIC'] = latent_fit['BIC']
 
-                # for psychometric plot
-                temp = pd.DataFrame()
-                temp['weighted_sum'] = latent_fit['weighted_sum']
-                temp['genotype'] = fit_params['genotype'][ss]
-                temp['animal'] = fit_params['animal'][ss]
-                temp['choice'] = latent_fit['args']['dat']['inputs']['cBoth']
-                temp['gender'] = fit_params['gender'][ss]
-                fit_psychometric[pp]= pd.concat(
-                    (fit_psychometric[pp], temp))
-                    
-                model_label = 'Policy Gradient'
-                savefigpath = os.path.join(save_path, f'{animalID}_{protocol}_latent_fit')
-                plot_latent_session(data, latent_fit, model_label,savefigpath)
-
-                
+                savefigpath = os.path.join(save_path, f'{animalID}_{protocol}_{model_name}_latent_fit')
+                plot_latent_session(data, latent_fit, model_name,savefigpath)
 
         elif fit_mode == 'concat':
             protocols = ['AB', 'CD']
@@ -3929,22 +4110,38 @@ class BehDataOdor(BehData):
                     save_path = os.path.join(self.analysis,animal,self.behavior, 'Behavior', 'Summary')
                     if not os.path.exists(save_path):
                         os.makedirs(save_path)
-                    savedatapath = os.path.join(save_path,
-                                                 f'{animal}_{pp}_fit.json')
+                    fit_filename = (f'{animal}_{pp}_fit.json'
+                                    if model_name == 'policy_gradient'
+                                    else f'{animal}_{pp}_hybrid_fit.json')
+                    savedatapath = os.path.join(save_path, fit_filename)
                     if os.path.exists(savedatapath):
                     # load the existing fit
                         with open(savedatapath, 'r') as f:
                             latent_fit = json.load(f)
+                    elif model_name == 'hybrid':
+                        latent_fit = fit_hybrid(data, animalID=animal,
+                                                savedatapath=savedatapath)
                     else:
                         latent_fit = fit_policy_gradient(data, 
                                                          animalID=animal, savedatapath=savedatapath)
+
+                    # if model_name == 'hybrid':
+                    #     model_label = 'Hybrid RL'
+                    #     savefigpath = os.path.join(save_path, f'{animal}_{pp}_latent_fit_concat')
+                    #     plot_latent_session(data, latent_fit, model_label,savefigpath)
+                    #     continue
                     
                     # load data in dataframe 
-                    weights = latent_fit['weight']
-                    opt_vars = latent_fit['args']['optList']
-                    for widx, ww in enumerate(weights):
-                        for vv in opt_vars:
-                            fit_params.loc[aidx, f'{ww}_{vv}_{pp}'] = latent_fit['opt_hyper'][vv][widx]
+                    if model_name == 'policy_gradient':
+                        weights = latent_fit['weight']
+                        opt_vars = latent_fit['args']['optList']
+                        for widx, ww in enumerate(weights):
+                            for vv in opt_vars:
+                                fit_params.loc[aidx, f'{ww}_{vv}_{pp}'] = latent_fit['opt_hyper'][vv][widx]
+                    elif model_name == 'hybrid':
+                        # to do: load hybrid latent variables if needed
+                        pass
+
                     fit_params.loc[aidx, f'AIC_{pp}'] = latent_fit['AIC']
                     fit_params.loc[aidx, f'BIC_{pp}'] = latent_fit['BIC']
 
@@ -3959,11 +4156,13 @@ class BehDataOdor(BehData):
                         (fit_psychometric[pp], temp))
 
 
-                    model_label = 'Policy Gradient'
-                    savefigpath = os.path.join(save_path, f'{animal}_{pp}_latent_fit_concat')
+                    savefigpath = os.path.join(save_path, f'{animal}_{pp}_{model_name}_latent_fit_concat')
                     plot_latent_session(data, latent_fit, model_label,savefigpath)
 
         #%% plot summary figures
+        # to do: make this work for hybrid also
+        # if model_name == 'hybrid':
+        #     return
 
         #%% 1. plot fitted parameters. to do: make this work for both fit_mode
         
@@ -3983,6 +4182,8 @@ class BehDataOdor(BehData):
             genders = [g for g in genders if str(g).strip() != '']
 
             for protocol in protocols:
+                if 'CD' in protocol and 'AB' not in protocol:
+                    protocol = 'AB-'+protocol
                 for gender in genders:
                     gender_df = fit_params[fit_params['gender'] == gender]
                     if fit_mode == 'session':
@@ -4153,15 +4354,15 @@ class BehDataOdor(BehData):
                 )
 
         # 2. plot psychometric curves
-        protocols = ['AB', 'CD']
-        all_stats = []
+        # protocols = ['AB', 'CD']
+        # all_stats = []
 
-        genders = fit_params['gender'].dropna().unique()
-        genders = [g for g in genders if str(g).strip() != '']
-        genotypes = fit_params['genotype'].dropna().unique()
+        # genders = fit_params['gender'].dropna().unique()
+        # genders = [g for g in genders if str(g).strip() != '']
+        # genotypes = fit_params['genotype'].dropna().unique()
 
-        max_weight = 5.95
-        min_weight = -5.95
+        max_weight = 9.95
+        min_weight = -9.95
         step_weight = 0.1
 
         for protocol in protocols:
@@ -4187,60 +4388,60 @@ class BehDataOdor(BehData):
                             fit_psychometric[protocol]['animal'] == animal,
                             'choice'
                         ].to_numpy()
-                    choices_clean = np.array([x[0] for x in choices], dtype=float)
-                    temp = pd.DataFrame({
-                        'weight': -weights,
-                        'choice_right': np.array(choices_clean) + 0.5   # convert -0.5/0.5 to 0/1
+                   
+                    temp_psy = pd.DataFrame({
+                        'weight': weights,
+                        'choice_right': np.array(choices)   # convert -0.5/0.5 to 0/1
                     })
 
                     # assign each trial to a bin
-                    temp['bin'] = pd.cut(
-                        temp['weight'],
+                    temp_psy['bin'] = pd.cut(
+                        temp_psy['weight'],
                         bins=bins,
                         labels=(bins[:-1] + bins[1:]) / 2
                     )
 
                     # mean choice in each bin = P(right)
                     p_right = (
-                            temp.groupby('bin', observed=True)['choice_right']
+                            temp_psy.groupby('bin', observed=True)['choice_right']
                             .mean()
                             .reindex(
                                 (bins[:-1] + bins[1:]) / 2
                             )
                         )
 
-                    # bin centers and corresponding percentages
-                    bin_centers = p_right.index.astype(float)
-                    p_right = p_right.to_numpy()
-                    pR_data[animal] = p_right
+        #             # bin centers and corresponding percentages
+        #             bin_centers = p_right.index.astype(float)
+        #             p_right = p_right.to_numpy()
+        #             pR_data[animal] = p_right
 
-                plotMask = fit_psychometric[protocol]['gender'] == gender
-                temp = fit_psychometric[protocol].loc[plotMask].copy()
+        #         plotMask = fit_psychometric[protocol]['gender'] == gender
+        #         temp = fit_psychometric[protocol].loc[plotMask].copy()
 
-                temp['Weight'] = pd.cut(
-                    temp['weighted_sum'],
-                    bins=bins,
-                    labels=np.arange(min_weight, max_weight + step_weight, step_weight)
-                )
+        #         temp['Weight'] = pd.cut(
+        #             temp['weighted_sum'],
+        #             bins=bins,
+        #             labels=np.arange(min_weight, max_weight + step_weight, step_weight)
+        #         )
 
-                binned_weight_count = (
-                    temp.groupby(['Weight', 'genotype'])
-                        .size()
-                        .unstack(fill_value=0)
-                        .reset_index()
-                )
+        #         binned_weight_count = (
+        #             temp.groupby(['Weight', 'genotype'])
+        #                 .size()
+        #                 .unstack(fill_value=0)
+        #                 .reset_index()
+        #         )
 
-                # calculate average reward to choose right 
-                # calculate average reward to choose right
-                fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        #         # calculate average reward to choose right 
+        #         # calculate average reward to choose right
+        #         fig, ax = plt.subplots(1, 2, figsize=(12, 5))
 
-                for gidx, geno in enumerate(genotypes):
-                    nGeno = np.sum(np.array(pR_geno) == geno)
+        #         for gidx, geno in enumerate(genotypes):
+        #             nGeno = np.sum(np.array(pR_geno) == geno)
 
                     # histogram
                     ax[gidx].bar(
                         binned_weight_count['Weight'],
-                        binned_weight_count[geno],
+                        binned_weight_count[geno]/np.sum(binned_weight_count),
                         width=step_weight,
                         color='black',
                         align='center'
@@ -4249,48 +4450,48 @@ class BehDataOdor(BehData):
                     # remove top and right spines of main axis
                     ax[gidx].spines['top'].set_visible(False)
                     ax[gidx].spines['right'].set_visible(False)
-
+                    ax[gidx].set_ylim([0, 0.025])
                     # left y-label only on left plot
                     if gidx == 0:
-                        ax[gidx].set_ylabel('Count')
+                        ax[gidx].set_ylabel('Percentage of trials')
 
-                    # second y-axis
-                    ax2 = ax[gidx].twinx()
+        #             # second y-axis
+        #             ax2 = ax[gidx].twinx()
 
-                    mean_pR = np.nanmean(
-                        pR_data.loc[:, np.array(pR_geno) == geno],
-                        axis=1
-                    )
-                    ste_pR = (
-                        np.nanstd(
-                            pR_data.loc[:, np.array(pR_geno) == geno],
-                            axis=1
-                        ) / np.sqrt(nGeno)
-                    )
+        #             mean_pR = np.nanmean(
+        #                 pR_data.loc[:, np.array(pR_geno) == geno],
+        #                 axis=1
+        #             )
+        #             ste_pR = (
+        #                 np.nanstd(
+        #                     pR_data.loc[:, np.array(pR_geno) == geno],
+        #                     axis=1
+        #                 ) / np.sqrt(nGeno)
+        #             )
 
-                    ax2.errorbar(
-                        bin_centers,
-                        mean_pR,
-                        yerr=ste_pR,
-                        fmt='o',
-                        color='C0'
-                    )
+        #             ax2.errorbar(
+        #                 bin_centers,
+        #                 mean_pR,
+        #                 yerr=ste_pR,
+        #                 fmt='o',
+        #                 color='C0'
+        #             )
 
-                    # theoretical probability (softmax)
-                    ax2.plot(bin_centers, expit(bin_centers), 'r-')
+        #             # theoretical probability (softmax)
+        #             ax2.plot(bin_centers, expit(bin_centers), 'r-')
 
-                    # remove top spine of right axis
-                    ax2.spines['top'].set_visible(False)
+        #             # remove top spine of right axis
+        #             ax2.spines['top'].set_visible(False)
 
-                    # show right y-label only on right plot
-                    if gidx == 1:
-                        ax2.set_ylabel('P(choice right)')
-                    else:
-                        ax2.set_yticklabels([])
+        #             # show right y-label only on right plot
+        #             if gidx == 1:
+        #                 ax2.set_ylabel('P(choice right)')
+        #             else:
+        #                 ax2.set_yticklabels([])
 
                     ax[gidx].set_xlabel('Weighted sum')
                     ax[gidx].set_title(geno)
-
+                    
                 fig.subplots_adjust(top=0.88)
                 fig.tight_layout(rect=[0, 0, 1, 0.88])
                 fig.suptitle(f'{protocol} psychometric curve {gender}', y=0.95, fontsize=20)
@@ -4308,6 +4509,176 @@ class BehDataOdor(BehData):
                 )
                 plt.close(fig)
 
+    def model_comparison(self):
+        # compare AIC result for hybrid model and policy gradient model
+        
+        session_to_compare = ['AB1', 'AB2', 'AB3', 'CD1', 'CD2', 'CD3']
+        mAIC_hybrid = {}
+        mAIC_policy = {}
+        delta_AIC = {} # policy - hybrid
+        subject_ID = {}
+        genotypes = {}
+
+        genders = ['M', 'F']
+        for gender in genders:
+            genderIDs = np.array(self.Animals)[np.array(self.Gender) == gender]
+
+            for ses in session_to_compare:
+                # load hybrid model results
+                from scipy.io import loadmat
+                hybrid_name = os.path.join(self.summary, 'Results', 'hybrid_fit_' + ses + '.mat')
+                mat = loadmat(hybrid_name)
+                fit_result = mat['fit_result']
+                subjects = fit_result['subjects'][0][0]
+                tempSub = []
+                tempAIC = []
+                tempGeno = []
+                for sub in subjects:
+                    if str(sub[0]) in genderIDs:
+                        tempSub.append(sub)
+                        tempAIC.append(fit_result['All_fits'][0][0][np.where(fit_result['subjects'][0][0] == sub)[0][0], 2])
+                        tempGeno.append(fit_result['genotypes'][0][0][np.where(fit_result['subjects'][0][0] == sub)[0][0]])
+
+                subject_ID[ses] = tempSub
+                genotypes[ses] = tempGeno
+                AIC_hybrid = np.array(tempAIC)
+                #all_params = fit_result['All_params']
+
+                # load policy gradient model results
+                if 'AB' in ses:
+                    target_ses = ses[0:2]
+                elif 'CD' in ses:
+                    target_ses = 'AB-' + ses[0:2]
+
+
+                AIC_policy = []
+                subject_policy = []
+                for sub in tempSub:
+                    
+                    animal_mask = self.data_index['Animal'] == str(sub[0])
+                    protocol_mask = self.data_index['Protocol'] == target_ses
+                    day_mask = self.data_index['ProtocolDay'] == int(ses[2])
+                    match_idx = self.data_index.index[animal_mask & protocol_mask & day_mask]
+
+                    if len(match_idx) == 0:
+                        continue
+                    subject_policy.append(str(sub[0]))
+                    ss = match_idx[0]
+                    save_path = os.path.join(self.data_index.loc[ss, 'AnalysisPath'], 'latent')
+
+                    savedatapath = os.path.join(save_path, 'policy_gradient_fit.json')
+                    # load json file
+                    with open(savedatapath, 'r') as f:
+                        policy_gradient_fit = json.load(f)
+                        AIC_policy.append(policy_gradient_fit['AIC'])
+                        # animal_PG.append(self.data_index['Animal'][ss])
+                mAIC_policy[ses] = np.array(AIC_policy) - (np.array(AIC_policy) + np.array(AIC_hybrid))/2
+                mAIC_hybrid[ses] = np.array(AIC_hybrid) - (np.array(AIC_hybrid) + np.array(AIC_policy))/2
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            x = np.arange(len(session_to_compare))
+            offset = 0.18
+            colors = {'Policy gradient': 'C0', 'Hybrid': 'C1'}
+
+            for idx, ses in enumerate(session_to_compare):
+                policy_values = mAIC_policy[ses][np.isfinite(mAIC_policy[ses])]
+                hybrid_values = mAIC_hybrid[ses][np.isfinite(mAIC_hybrid[ses])]
+
+                for values, label, position in (
+                    (policy_values, 'Policy gradient', x[idx] - offset),
+                    (hybrid_values, 'Hybrid', x[idx] + offset),
+                ):
+                    if values.size:
+                        box = ax.boxplot(
+                            values, positions=[position], widths=0.3, patch_artist=True,
+                            showfliers=False,
+                        )
+                        for element in ('boxes', 'whiskers', 'caps', 'medians'):
+                            plt.setp(box[element], color=colors[label])
+                        box['boxes'][0].set_facecolor(colors[label])
+                        box['boxes'][0].set_alpha(0.35)
+                        jitter = np.linspace(-0.06, 0.06, values.size) if values.size > 1 else [0]
+                        ax.scatter(
+                            position + jitter, values, color=colors[label], s=25,
+                            alpha=0.8, zorder=3,
+                            label=label if idx == 0 else None,
+                        )
+
+                if policy_values.size and hybrid_values.size:
+                    _, p_value = wilcoxon(policy_values, hybrid_values, alternative='two-sided')
+                else:
+                    p_value = np.nan
+                y_max = max(
+                    np.max(policy_values) if policy_values.size else -np.inf,
+                    np.max(hybrid_values) if hybrid_values.size else -np.inf,
+                )
+                if np.isfinite(y_max):
+                    ax.annotate(
+                        f'p = {p_value:.3g}' if np.isfinite(p_value) else 'p = n/a',
+                        (x[idx], y_max), xytext=(0, 10), textcoords='offset points',
+                        ha='center', va='bottom', fontsize=9,
+                    )
+
+            raw_p_values = []
+            for ses in session_to_compare:
+                policy_values = mAIC_policy[ses][np.isfinite(mAIC_policy[ses])]
+                hybrid_values = mAIC_hybrid[ses][np.isfinite(mAIC_hybrid[ses])]
+                raw_p_values.append(
+                wilcoxon(policy_values, hybrid_values, alternative='two-sided').pvalue
+                    if policy_values.size and hybrid_values.size else np.nan
+                )
+            valid_p_values = np.isfinite(raw_p_values)
+            adjusted_p_values = np.full(len(raw_p_values), np.nan)
+            if np.any(valid_p_values):
+                adjusted_p_values[valid_p_values] = multipletests(
+                    np.asarray(raw_p_values)[valid_p_values], method='fdr_bh'
+                )[1]
+
+            annotation_idx = 0
+            for ses, adjusted_p_value in zip(session_to_compare, adjusted_p_values):
+                values = np.concatenate((mAIC_policy[ses], mAIC_hybrid[ses]))
+                if np.any(np.isfinite(values)):
+                    ax.texts[annotation_idx].set_text(
+                        f'FDR p = {adjusted_p_value:.3g}'
+                        if np.isfinite(adjusted_p_value) else 'FDR p = n/a'
+                    )
+                    ax.texts[annotation_idx].set_fontsize(12)
+                    annotation_idx += 1
+
+            all_values = np.concatenate([
+                np.concatenate((mAIC_policy[ses], mAIC_hybrid[ses]))
+                for ses in session_to_compare
+            ])
+            finite_values = all_values[np.isfinite(all_values)]
+            if finite_values.size:
+                y_lower, y_upper = np.percentile(finite_values, [1, 99])
+                padding = max((y_upper - y_lower) * 0.08, 0.1)
+                ax.set_ylim(y_lower - padding, y_upper + padding)
+                for annotation in ax.texts:
+                    annotation.xy = (annotation.xy[0], y_upper - padding)
+
+            ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+            ax.set_xticks(x, session_to_compare)
+            ax.set_xlabel('Session')
+            ax.set_ylabel('Mean-centered AIC')
+            ax.set_title(f'Policy gradient and hybrid model comparison {self.strain} {gender}')
+            ax.legend(
+                handles=[
+                    Patch(facecolor=colors['Policy gradient'], edgecolor=colors['Policy gradient'],
+                        alpha=0.35, label='Policy gradient'),
+                    Patch(facecolor=colors['Hybrid'], edgecolor=colors['Hybrid'],
+                        alpha=0.35, label='Hybrid'),
+                ],
+                frameon=False,
+            )
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            fig.tight_layout()
+            os.makedirs(os.path.join(self.summary, 'latent'), exist_ok=True)
+            fig.savefig(os.path.join(self.summary, 'latent', f'model_comparison_mAIC_{self.strain}_{gender}.png'), dpi=300)
+            fig.savefig(os.path.join(self.summary, 'latent', f'model_comparison_mAIC_{self.strain}_{gender}.svg'))
+            #plt.close(fig)
+        
     def odor_summary(self):
         # plot summary figures for model fitting
         # 1. fitted parameters (genotype comparisons)
@@ -4920,7 +5291,9 @@ class BehDataOdor(BehData):
     def plot_performance(self):
         # call matlab function to plot the performance
 
-        perf_df = pd.DataFrame(columns=['Animal','Gender', 'Genotype', 'Date', 'Protocol', 'ProtocolDay', 'RewardRate', 'd'])
+        perf_df = pd.DataFrame(columns=['Animal','Gender', 'Genotype', 'Date', 'Protocol', 'ProtocolDay','TrlalNum', 'RewardRate', 'd'])
+        # for 6-hour sessions, cut the time to 3 hours and calculate the performance
+        perf_df_3h = pd.DataFrame(columns=['Animal','Gender', 'Genotype', 'Date', 'Protocol', 'ProtocolDay','TrialNum', 'RewardRate', 'd'])
         for bIdx, behFiles in enumerate(self.data_index['BehCSV']):
             # load the files, calculate performance in 100-trial blocks
             resultdf = pd.read_csv(behFiles)
@@ -4932,29 +5305,62 @@ class BehDataOdor(BehData):
             perf_df.loc[bIdx, 'RewardRate'] = np.full((25,1), np.nan)
             perf_df.loc[bIdx, 'd'] = np.full((25,1), np.nan)
             perf_df.loc[bIdx, 'Gender'] = self.data_index['Gender'][bIdx]
+            perf_df.loc[bIdx, 'Session_length'] = self.data_index['Session_length'][bIdx]
+            perf_df.loc[bIdx, 'TrialNum'] = np.nan
+
+            resultdf_3h = resultdf[resultdf['side_in'] < (60*60*3 + resultdf['center_in'][0])]
+            perf_df_3h.loc[bIdx, 'Animal'] = self.data_index['Animal'][bIdx]
+            perf_df_3h.loc[bIdx, 'Genotype'] = self.data_index['Genotype'][bIdx]
+            perf_df_3h.loc[bIdx, 'Date'] = self.data_index['Date'][bIdx]
+            perf_df_3h.loc[bIdx, 'Protocol'] = self.data_index['Protocol'][bIdx]
+            perf_df_3h.loc[bIdx, 'ProtocolDay'] = self.data_index['ProtocolDay'][bIdx]
+            perf_df_3h.loc[bIdx, 'RewardRate'] = np.full((25,1), np.nan)
+            perf_df_3h.loc[bIdx, 'd'] = np.full((25,1), np.nan)
+            perf_df_3h.loc[bIdx, 'Gender'] = self.data_index['Gender'][bIdx]
+            perf_df_3h.loc[bIdx, 'Session_length'] = self.data_index['Session_length'][bIdx]
+            perf_df_3h.loc[bIdx, 'TrialNum'] = np.nan
 
             nTrials = resultdf.shape[0]
+            nTrials_3h = resultdf_3h.shape[0]
             tBlocks = 100
             
             protocol = self.data_index['Protocol'][bIdx]
             # determine the session length
             if protocol == 'AB':
                 startTrial = 0
+                startTrial_3h = 0
                 sti_A = 1
                 sti_B = 2
             elif protocol == 'AB-CD':
                 # look for the first trial with schedule 3 or 4
                 startTrial = np.where(resultdf['schedule']>=3)[0][0]
+                if 3 in resultdf_3h['schedule'].values or 4 in resultdf_3h['schedule'].values:
+                    startTrial_3h = np.where(resultdf_3h['schedule']>=3)[0][0]
+                else:
+                    startTrial_3h = np.nan
                 sti_A = 3
                 sti_B = 4
             elif protocol == 'AB-DC' or protocol == 'AB-CD-DC':
                 startTrial = np.where(resultdf['schedule']>=5)[0][0]
+                #startTrial_3h = np.where(resultdf_3h['schedule']>=5)[0][0]
+                startTrial_3h = 0
                 sti_A = 5
                 sti_B = 6
             endTrial = nTrials
+            endTrial_3h = nTrials_3h
+
+            perf_df.loc[bIdx, 'TrialNum'] = endTrial-startTrial+1
+            
+
             result = resultdf.iloc[startTrial:endTrial,:].reset_index(drop=True)
+            if not np.isnan(startTrial_3h):
+                result_3h = resultdf_3h.iloc[startTrial_3h:endTrial_3h,:].reset_index(drop=True)
+                perf_df_3h.loc[bIdx, 'TrialNum'] = endTrial_3h-startTrial_3h+1
+            else:
+                result_3h = None
+                
             nBlocks = result.shape[0] // tBlocks
-                # look for the first trial with schedule 3 or 4, and the first trial with schedule 2 or 4
+            
 
             for bb in range(nBlocks):
 
@@ -4980,6 +5386,34 @@ class BehDataOdor(BehData):
                 d_prime = norm.ppf(hit_rate) - norm.ppf(false_alarm_rate)
                 perf_df.loc[bIdx, 'd'][bb] = d_prime
 
+            # for 3h-cut
+            if not np.isnan(startTrial_3h):
+                for bb in range(nBlocks):
+                    block_df_3h = result_3h.iloc[bb*tBlocks:(bb+1)*tBlocks,:]
+                    # average reward rate
+                    if len(block_df_3h) > 60:  # need to have at least 60 trials
+                        perf_3h = np.sum(block_df_3h['reward']>0)/tBlocks
+                        perf_df_3h.loc[bIdx, 'RewardRate'][bb] = perf_3h
+                    else:
+                        perf_df_3h.loc[bIdx, 'RewardRate'][bb] = np.nan
+
+                    # d_prime 
+                    # hit rate P(right | B)
+                    # false alarm rate P(right | A)
+
+                    hit_rate_3h = np.sum((block_df_3h['actions']==1) & (block_df_3h['schedule']==sti_B))/np.sum(block_df_3h['schedule']==sti_B)
+                    false_alarm_rate_3h = np.sum((block_df_3h['actions']==1) & (block_df_3h['schedule']==sti_A))/np.sum(block_df_3h['schedule']==sti_A)
+                    if hit_rate_3h == 1:
+                        hit_rate_3h = 0.99999
+                    if false_alarm_rate_3h == 1:
+                        false_alarm_rate_3h = 0.99999
+                    if hit_rate_3h == 0:
+                        hit_rate_3h = 0.00001
+                    if false_alarm_rate_3h == 0:
+                        false_alarm_rate_3h = 0.00001
+                    d_prime_3h = norm.ppf(hit_rate_3h) - norm.ppf(false_alarm_rate_3h)
+                    perf_df_3h.loc[bIdx, 'd'][bb] = d_prime_3h
+
         # plot average performance for AB1, AB2, AB3
         # CD1, CD2, and CD3. and run stats
         # rebuild performance dataframe for plotting
@@ -4992,24 +5426,74 @@ class BehDataOdor(BehData):
         perf_plot_CD1 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
         perf_plot_CD2 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
         perf_plot_CD3 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        trials_AB1 = []
+        trials_AB2 = []
+        trials_AB3 = []
+        trials_CD1 = []
+        trials_CD2 = []
+        trials_CD3 = []
         for idx, row in perf_df.iterrows():
             for bb in range(10):
                 if not np.isnan(row['RewardRate'][bb]):
                     if row['Protocol'] == 'AB':
                         if row['ProtocolDay'] == 1:   
                             perf_plot_AB1 = pd.concat([perf_plot_AB1, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_AB1.append(row['TrialNum'])
                         elif row['ProtocolDay'] == 2:
                             perf_plot_AB2 = pd.concat([perf_plot_AB2, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_AB2.append(row['TrialNum'])
                         elif row['ProtocolDay'] == 3:
                             perf_plot_AB3 = pd.concat([perf_plot_AB3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_AB3.append(row['TrialNum'])
                     elif row['Protocol'] == 'AB-CD':
                         if row['ProtocolDay'] == 1:   
                             perf_plot_CD1 = pd.concat([perf_plot_CD1, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_CD1.append(row['TrialNum'])
                         elif row['ProtocolDay'] == 2:
                             perf_plot_CD2 = pd.concat([perf_plot_CD2, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_CD2.append(row['TrialNum'])
                         elif row['ProtocolDay'] == 3:
                             perf_plot_CD3 = pd.concat([perf_plot_CD3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
-            
+                            trials_CD3.append(row['TrialNum'])
+
+        # for 3h
+        perf_plot_3h_AB1 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_3h_AB2 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_3h_AB3 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_3h_CD1 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_3h_CD2 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        perf_plot_3h_CD3 = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate', 'd'])
+        trials_3h_AB1 = []
+        trials_3h_AB2 = []
+        trials_3h_AB3 = []
+        trials_3h_CD1 = []
+        trials_3h_CD2 = []
+        trials_3h_CD3 = []
+
+        for idx, row in perf_df_3h.iterrows():
+            for bb in range(10):
+                if not np.isnan(row['RewardRate'][bb]):
+                    if row['Protocol'] == 'AB':
+                        if row['ProtocolDay'] == 1:   
+                            perf_plot_3h_AB1 = pd.concat([perf_plot_3h_AB1, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_AB1.append(row['TrialNum'])
+                        elif row['ProtocolDay'] == 2:
+                            perf_plot_3h_AB2 = pd.concat([perf_plot_3h_AB2, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_AB2.append(row['TrialNum'])
+                        elif row['ProtocolDay'] == 3:
+                            perf_plot_3h_AB3 = pd.concat([perf_plot_3h_AB3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_AB3.append(row['TrialNum'])
+                    elif row['Protocol'] == 'AB-CD':
+                        if row['ProtocolDay'] == 1:   
+                            perf_plot_3h_CD1 = pd.concat([perf_plot_3h_CD1, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_CD1.append(row['TrialNum'])
+                        elif row['ProtocolDay'] == 2:
+                            perf_plot_3h_CD2 = pd.concat([perf_plot_3h_CD2, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_CD2.append(row['TrialNum'])
+                        elif row['ProtocolDay'] == 3:
+                            perf_plot_3h_CD3 = pd.concat([perf_plot_3h_CD3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
+                            trials_3h_CD3.append(row['TrialNum'])
+
         for sex in Sexes:
             plot_learning_curve(perf_plot_AB1[perf_plot_AB1['Gender'] == sex], save_name = 'AB1_rewardrate_' + sex, 
                                 value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
@@ -5029,6 +5513,109 @@ class BehDataOdor(BehData):
             plot_learning_curve(perf_plot_CD3[perf_plot_CD3['Gender'] == sex], save_name = 'CD3_rewardrate_' + sex,
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
                                 title = 'CD3 Reward Rate '+ sex + ' ' + self.strain)
+
+            # 3h performance
+            plot_learning_curve(perf_plot_3h_AB1[perf_plot_3h_AB1['Gender'] == sex], save_name = '3h_AB1_rewardrate_' + sex, 
+                                value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h AB1 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_3h_AB2[perf_plot_3h_AB2['Gender'] == sex], save_name = '3h_AB2_rewardrate_' + sex, 
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h AB2 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_3h_AB3[perf_plot_3h_AB3['Gender'] == sex], save_name = '3h_AB3_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h AB3 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_3h_CD1[perf_plot_3h_CD1['Gender'] == sex], save_name = '3h_CD1_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h CD1 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_3h_CD2[perf_plot_3h_CD2['Gender'] == sex], save_name = '3h_CD2_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h CD2 Reward Rate '+ sex + ' ' + self.strain)
+            plot_learning_curve(perf_plot_3h_CD3[perf_plot_3h_CD3['Gender'] == sex], save_name = '3h_CD3_rewardrate_' + sex,
+                        value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
+                                title = '3h CD3 Reward Rate '+ sex + ' ' + self.strain)
+
+
+        trial_sets = [
+            ('AB1', trials_AB1, trials_3h_AB1),
+            ('AB2', trials_AB2, trials_3h_AB2),
+            ('AB3', trials_AB3, trials_3h_AB3),
+            ('CD1', trials_CD1, trials_3h_CD1),
+            ('CD2', trials_CD2, trials_3h_CD2),
+            ('CD3', trials_CD3, trials_3h_CD3),
+        ]
+        trial_stats = []
+        for session, regular_trials, short_trials in trial_sets:
+            regular_trials = np.asarray(regular_trials, dtype=float)
+            short_trials = np.asarray(short_trials, dtype=float)
+            n_pairs = min(regular_trials.size, short_trials.size)
+            regular_trials = regular_trials[:n_pairs]
+            short_trials = short_trials[:n_pairs]
+            valid_subjects = np.isfinite(regular_trials) & np.isfinite(short_trials)
+            regular_trials = regular_trials[valid_subjects]
+            short_trials = short_trials[valid_subjects]
+            nonzero_regular = regular_trials != 0
+            if regular_trials.size:
+                try:
+                    statistic, p_value = wilcoxon(regular_trials, short_trials)
+                except ValueError:
+                    statistic, p_value = np.nan, np.nan
+            else:
+                statistic, p_value = np.nan, np.nan
+            trial_stats.append({
+                'Session': session,
+                'RegularTrials': regular_trials,
+                'ThreeHourTrials': short_trials,
+                'WilcoxonStatistic': statistic,
+                'PValue': p_value,
+                'MeanThreeHourPercent': (
+                    np.mean(short_trials[nonzero_regular] / regular_trials[nonzero_regular] * 100)
+                    if np.any(nonzero_regular) else np.nan
+                ),
+            })
+
+        valid_p_values = [row['PValue'] for row in trial_stats if np.isfinite(row['PValue'])]
+        adjusted_p_values = iter(
+            multipletests(valid_p_values, method='fdr_bh')[1] if valid_p_values else []
+        )
+        for row in trial_stats:
+            row['AdjustedPValue'] = next(adjusted_p_values) if np.isfinite(row['PValue']) else np.nan
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 9), sharey=True)
+        for ax, row in zip(axes.flat, trial_stats):
+            data = [row['RegularTrials'], row['ThreeHourTrials']]
+            if all(values.size > 1 for values in data):
+                violin = ax.violinplot(data, positions=[1, 2], showmedians=True)
+                for body, color in zip(violin['bodies'], ['tab:blue', 'tab:orange']):
+                    body.set_facecolor(color)
+                    body.set_edgecolor(color)
+                    body.set_alpha(0.3)
+                violin['cmedians'].set_color('black')
+            for regular, short in zip(row['RegularTrials'], row['ThreeHourTrials']):
+                ax.plot([1, 2], [regular, short], color='0.55', linewidth=0.8, zorder=2)
+            for position, values in enumerate(data, start=1):
+                if values.size:
+                    color = 'tab:blue' if position == 1 else 'tab:orange'
+                    ax.scatter(np.full(values.size, position), values, color=color, s=24,
+                               alpha=0.55, zorder=3)
+            ax.set_xticks([1, 2], ['6h', '3h'])
+            p_label = (f"FDR p={row['AdjustedPValue']:.3g}"
+                       if np.isfinite(row['AdjustedPValue']) else 'FDR p=nan')
+            percentage_label = (f"3h / 6h = {row['MeanThreeHourPercent']:.1f}%"
+                                if np.isfinite(row['MeanThreeHourPercent']) else '3h / 6h = nan')
+            ax.set_title(row['Session'])
+            ax.text(0.5, 0.95, f'{p_label}\n{percentage_label}', transform=ax.transAxes, ha='center', va='top',
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.8))
+            ax.set_ylabel('Trials performed')
+            ax.set_ylim(0, 2000)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+        fig.suptitle('Trials performed: 6h vs 3h condition')
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.summary, 'trials_6h_vs_3h.png'), dpi=300,
+                    bbox_inches='tight')
+        plt.close(fig)
+
+
 
         # plot_learning_curve(perf_plot_AB1, save_name = 'AB1_dprime', 
         #     value_col = 'd', trial_col = 'Block')
@@ -5409,7 +5996,6 @@ class BehDataOdor(BehData):
                 # # frame is a numpy array (H x W x 3)
                 # print(frame.shape)
 
-
 class BehDataRotarod(BehData):
 
     def __init__(self, root_file, strain):
@@ -5421,7 +6007,7 @@ class BehDataRotarod(BehData):
         strain_parts = strain.split('_')
         if any(part in ['Cntnap2'] for part in strain_parts):
             self.Mut = 'KO'
-        elif any(part in ['TSC2', 'Shank3B', 'ChD8', 'Syngap', 'Scn2A'] for part in strain_parts):
+        elif any(part in ['TSC2', 'Shank3B', 'Chd8', 'Syngap', 'Scn2A'] for part in strain_parts):
             self.Mut = 'HET'
         elif any(part in ['Nlgn3'] for part in strain_parts):
             self.Mut = 'HEM'
@@ -5464,26 +6050,27 @@ class BehDataRotarod(BehData):
             for aidx in range(self.data_index.shape[0]):
                 aa = self.data_index['Animal'][aidx]
                 date = self.data_index['Date'][aidx]
-                dataFolder = os.path.join(self.data, aa, 'Rotarod', 'Behavior',aa+'_'+str(date)[2:])
+                dataFolder = os.path.join(self.data, aa, 'Rotarod', 'BehavioralRecording',aa+'_'+str(date)[2:])
                 trialNum = self.data_index['Trial'][aidx]
                 if os.path.exists(dataFolder):
                     filePatternSpeed = aa + '*speed*.csv'
-                    filePatternDLC = aa + '*DLC_resnet*.csv'
+                    #filePatternDLC = aa + '*DLC_resnet*.csv'
+                    filePatternLitPose = aa+f'*trial{trialNum}????-??-??T??_??_??.csv'
                     filePatternVideo = aa + '*.avi'
                     filePatternTimestamp = aa + '*timeStamp*.csv'
 
                     speedCSV = glob.glob(os.path.join(dataFolder, filePatternSpeed))
                     timeStampCSV = glob.glob(os.path.join(dataFolder, filePatternTimestamp))
                     videoFiles = glob.glob(os.path.join(dataFolder, filePatternVideo))
-                    DLCFiles = glob.glob(os.path.join(dataFolder, filePatternDLC))
+                    LitPoseFiles = glob.glob(os.path.join(dataFolder, filePatternLitPose))
                     num_files = len(videoFiles)
 
                     if num_files>0:
                         # match the sessions: ASDxxx followed by optional middle part, 
                         # then trial(trialNum), optional underscore, and date YYYY-MM-DDTHH...
-                        DLC_ID = [ID for ID in range(len(DLCFiles)) if aa in DLCFiles[ID] and 'trial'+str(trialNum) in DLCFiles[ID]]
-                        if len(DLC_ID)>0:
-                            DLC_results[aidx] = DLCFiles[DLC_ID[0]]
+                        #LitPose_ID = [ID for ID in range(len(LitPoseFiles)) if aa in LitPoseFiles[ID] and 'trial'+str(trialNum) in LitPoseFiles[ID]]
+                        if len(LitPoseFiles)>0:
+                            DLC_results[aidx] = LitPoseFiles[0]
                         else:
                             DLC_results[aidx] = None
                         speed_ID = [ID for ID in range(len(speedCSV)) if aa in speedCSV[ID] and 'trial'+str(trialNum) in speedCSV[ID]]
@@ -5594,6 +6181,8 @@ class BehDataRotarod(BehData):
             #fps = 50
             if fps is None or len(fps)==0:
                dlc = None
+            elif filePath is None:
+                dlc = None
             else:
                 dlc = DLCSession(filePath, videoPath, rodPath, analysisPath, fps)  
             DLC_obj.append(dlc)
@@ -5601,18 +6190,9 @@ class BehDataRotarod(BehData):
         self.data_index['DLC_obj'] = DLC_obj
         #self.plotT = np.arange(0, minFrames-1)/fps
         animalIdx = np.arange(self.nSessions)
-        self.WTIdx = animalIdx[self.data_index['Genotype'] == self.WTGene]
-        self.MutIdx = animalIdx[self.data_index['Genotype'] == self.mutGene]
-        # grouping the animals
+        self.WTIdx = animalIdx[self.data_index['Genotype'] == self.WT]
+        self.MutIdx = animalIdx[self.data_index['Genotype'] == self.Mut]
 
-        # if self.Sex[0]==np.nan: # if no sex info
-        #     nGroups = 1
-        # else:
-        #     nGroups = 2
-
-        # if nGroups==2:
-        #     self.maleIdx = np.where(self.data['Sex']=='M')[0]
-        #     self.femaleIdx = np.where(self.data['Sex']=='F')[0]
 
         self.startVoltage = [4.45, 40] # 5 rpm = 0.273 V
         self.endVoltage = [8.90, 80]
@@ -5864,34 +6444,34 @@ class BehDataRotarod(BehData):
 
                 if self.data_index['DLC'][ss] is not None:
                     tempData = self.data_index['DLC_obj'][ss].data
-                    ave_left_rod_back = np.array([np.mean(np.array(tempData['rod_left_back']['x'])[np.array(tempData['rod_left_back']['p'])>0.95]),
-                                    np.mean(np.array(tempData['rod_left_back']['y'])[np.array(tempData['rod_left_back']['p'])>0.95])])
-                    ave_right_rod_back = np.array([np.mean(np.array(tempData['rod_right_back']['x'])[np.array(tempData['rod_right_back']['p'])>0.95]),
-                                    np.mean(np.array(tempData['rod_right_back']['y'])[np.array(tempData['rod_right_back']['p'])>0.95])])
-                    ave_center_rod_back = (ave_left_rod_back+ave_right_rod_back)/2
-                    self.data_index['DLC_obj'][ss].data['left_rod_back'] = ave_left_rod_back
-                    self.data_index['DLC_obj'][ss].data['right_rod_back'] = ave_right_rod_back
-                    self.data_index['DLC_obj'][ss].data['center_rod_back'] = ave_center_rod_back
+                    #ave_left_rod_back = np.array([np.mean(np.array(tempData['rod_left_back']['x'])[np.array(tempData['rod_left_back']['p'])>0.95]),
+                    #                 np.mean(np.array(tempData['rod_left_back']['y'])[np.array(tempData['rod_left_back']['p'])>0.95])])
+                    # ave_right_rod_back = np.array([np.mean(np.array(tempData['rod_right_back']['x'])[np.array(tempData['rod_right_back']['p'])>0.95]),
+                    #                 np.mean(np.array(tempData['rod_right_back']['y'])[np.array(tempData['rod_right_back']['p'])>0.95])])
+                    # ave_center_rod_back = (ave_left_rod_back+ave_right_rod_back)/2
+                    # self.data_index['DLC_obj'][ss].data['left_rod_back'] = ave_left_rod_back
+                    # self.data_index['DLC_obj'][ss].data['right_rod_back'] = ave_right_rod_back
+                    # self.data_index['DLC_obj'][ss].data['center_rod_back'] = ave_center_rod_back
 
-                    ave_left_rod_front = np.array([np.mean(np.array(tempData['rod_left_front']['x'])[np.array(tempData['rod_left_front']['p'])>0.95]),
-                                    np.mean(np.array(tempData['rod_left_front']['y'])[np.array(tempData['rod_left_front']['p'])>0.95])])
-                    ave_right_rod_front = np.array([np.mean(np.array(tempData['rod_right_front']['x'])[np.array(tempData['rod_right_front']['p'])>0.95]),
-                                    np.mean(np.array(tempData['rod_right_front']['y'])[np.array(tempData['rod_right_front']['p'])>0.95])])
-                    ave_center_rod_front = (ave_left_rod_front+ave_right_rod_front)/2
+                    # ave_left_rod_front = np.array([np.mean(np.array(tempData['rod_left_front']['x'])[np.array(tempData['rod_left_front']['p'])>0.95]),
+                    #                 np.mean(np.array(tempData['rod_left_front']['y'])[np.array(tempData['rod_left_front']['p'])>0.95])])
+                    # ave_right_rod_front = np.array([np.mean(np.array(tempData['rod_right_front']['x'])[np.array(tempData['rod_right_front']['p'])>0.95]),
+                    #                 np.mean(np.array(tempData['rod_right_front']['y'])[np.array(tempData['rod_right_front']['p'])>0.95])])
+                    # ave_center_rod_front = (ave_left_rod_front+ave_right_rod_front)/2
 
-                    self.data_index['DLC_obj'][ss].data['left_rod_front'] = ave_left_rod_front
-                    self.data_index['DLC_obj'][ss].data['right_rod_front'] = ave_right_rod_front
-                    self.data_index['DLC_obj'][ss].data['center_rod_front'] = ave_center_rod_front
+                    # self.data_index['DLC_obj'][ss].data['left_rod_front'] = ave_left_rod_front
+                    # self.data_index['DLC_obj'][ss].data['right_rod_front'] = ave_right_rod_front
+                    # self.data_index['DLC_obj'][ss].data['center_rod_front'] = ave_center_rod_front
 
                     # estimations on the left of 'right_rod_back' is in back area
                     # on the right of 'right rod front' is in front area
                     # plot a 1/0 mask to show each keypoints where they belong
                     kp_list = tempData['bodyparts']
-                    viewMask = np.zeros((len(kp_list), len(tempData['rod_right_back']['x'])))
+                    viewMask = np.zeros((len(kp_list), len(tempData['spine3']['x'])))
                     # 1 for back 0 for front
                     for idx,kp in enumerate(kp_list):
                     # on the left of
-                        viewMask[idx,:] = np.array(tempData[kp]['x']) < ave_right_rod_back[0]
+                        viewMask[idx,:] = np.array(tempData[kp]['x']) < 798  # half frame width
 
                     # plot frame with keypoints
                     # frame_num = 6180
@@ -5905,9 +6485,12 @@ class BehDataRotarod(BehData):
                     # plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
 
                     # plot number of back/front keypoints that is actually in back/front view
-                    back_kp = ['spine 3', 'tail 1', 'tail 2', 'tail 3', 'left foot', 'right foot']
-                    front_kp = ['spine 1', 'left ear', 'right ear', 'nose', 'left hand', 'right hand']
-                    viewNumber = np.zeros((3, len(tempData['rod_right_back']['x'])))
+                    #back_kp = ['spine 3', 'tail 1', 'tail 2', 'tail 3', 'left foot', 'right foot']
+                    #front_kp = ['spine 1', 'left ear', 'right ear', 'nose', 'left hand', 'right hand']
+                    back_kp = ['spine3', 'tail1', 'tail2', 'tail3', 'leftfoot', 'rightfoot']
+                    front_kp = ['spine1', 'leftear', 'rightear', 'nose', 'lefthand', 'righthand']
+
+                    viewNumber = np.zeros((3, len(tempData['spine3']['x'])))
                     for kp in kp_list:
                         if kp in back_kp:
                             viewNumber[0,:] = viewNumber[0,:] + viewMask[kp_list.index(kp),:]
@@ -6759,1155 +7342,172 @@ class BehDataRotarod(BehData):
 
         #%% plot average amplitude/frequency at 5-20 RPM within trial 1-3, 4-6, 7-9, and 10-12
         
-class DLCSession:
+    def process_for_moseq(self):
+        # stride analysis for rotarod behavior
+        # in situations where individual syllables jumped to the opposite side
+        # infer the coordinate with previous and post frames
+        # also remove the part when animal turns around
+
+        savefilefolder = os.path.join(self.root_path,'LPforMoseq')
+        saveorigfolder = os.path.join(self.root_path, 'LPforMoseq_origTS')
+        if not os.path.exists(savefilefolder):
+            os.makedirs(savefilefolder)
+        if not os.path.exists(saveorigfolder):
+            os.makedirs(saveorigfolder)
+
+        for idx, obj in tqdm(enumerate(self.data_index['DLC_obj'])):
+            animal = self.data_index['Animal'][idx]
+            trialIdx = self.data_index['Trial'][idx]
+            animalIdx = self.Animals.index(animal)
+
+            if self.data_index['DLC_obj'][idx] is not None :
+                # process video
+                # remove the turning part, save the DLC and video 6in separate pieces
+                #obj = self.data['DLC_obj'][idx]
+                turning_mask = obj.data['turning_mask']
+                turning_segments = obj.data['turning_period']
+                # load the Stride_freq
+                DLCCSV = self.data_index['DLC'][idx]
+                df = pd.read_csv(DLCCSV)
+
+                # remove the first the last 5 seconds for frames without animal on the rod
+                timeStart = np.where(obj.data['time']>(obj.data['rodRun'][0]))[0][0] 
+                timeOnRod = self.data_index['Performance'][np.logical_and(self.data_index['Animal']==animal,
+                            self.data_index['Trial']==trialIdx)]
+                timeEnd = np.where(obj.data['time']<(obj.data['rodRun'][0]+timeOnRod-8)[idx])[0][-1] 
+                # isolate the time when animals turns around
+                tempMask = np.logical_and(pd.to_numeric(df['scorer'][2:])>timeStart, pd.to_numeric(df['scorer'][2:])<=timeEnd)
+                tempMask = [True, True]+ list(tempMask)
+
+                file_path = os.path.normpath(DLCCSV)
+
+                # Extract the base filename without extension
+                filename = os.path.splitext(os.path.basename(file_path))[0]
+
+                # go through turning segments to get a non-turning segments
+                non_turning_segments = []
+                if len(turning_segments) ==0:
+                    non_turning_segments.append((0, len(obj.data['time'])-1))
+                elif len(turning_segments) ==1:
+                    non_turning_segments.append((0, turning_segments[0][0]-100))
+                    non_turning_segments.append((turning_segments[0][1]+100, len(obj.data['time'])-1))
+                else:
+                    for turnIdx in range(len(turning_segments)):
+                        if turnIdx==0:
+                            start_frame = 0
+                        else:
+                            start_frame = turning_segments[turnIdx-1][1]+100
+                        if turnIdx == len(turning_segments)-1:
+                            end_frame = len(obj.data['time'])
+                        else:
+                            end_frame = turning_segments[turnIdx][0]-100  # remove about 1s before and after turning
+                        non_turning_segments.append((start_frame, end_frame))
+
+                for turnIdx in range(len(non_turning_segments)):
+                    start_frame, end_frame = non_turning_segments[turnIdx]
+                    nonTurningMask = np.zeros(len(obj.data['time']), dtype=bool)
+                    nonTurningMask[start_frame:end_frame+1] = True
+                    nonTurningMask = [True, True]+ list(nonTurningMask)
+                    saveMask = np.logical_and(tempMask, nonTurningMask)
+
+                    # check it is longer than 2 second
+                    if sum(saveMask) > 100 and start_frame<end_frame:
+                    # save the non-turning segment
+                        df_segment = df[saveMask].copy()
+                        orig_index = df_segment.iloc[:,0].copy()
+                        # renumber it
+                        col = df_segment.iloc[:, 0].astype(object)
+                        col.iloc[2:] = pd.to_numeric(col.iloc[2:], errors='coerce')
+
+                        df_segment[df_segment.columns[0]] = col
+
+                        df_segment.iloc[2:,0] = np.arange(len(df_segment)-2)
+
+                        # go over the bodyparts in the df_segment, if the bodypart jumped to far a way 
+                        # to the other half of the frame, move it back 
+                        #df_segment_corrected = correct_bodyparts(df_segment)
+                        df_segment_corrected = df_segment
+                        savefilepath = os.path.join(savefilefolder, filename+f"_clip{turnIdx}.csv")
+                        df_segment_corrected.to_csv(savefilepath, index=False)
+                        #image = read_video(videoPath, 0, ifgray=True)
+                        savetimeStamp = os.path.join(saveorigfolder, filename+f"origIndex_clip{turnIdx}.csv")
+                        orig_index.to_csv(savetimeStamp, index=False)
+                        # save the video segment
+                        mask = saveMask.astype(int)
+
+                        ones_idx = np.where(mask[2:] == 1)[0]
+
+                        start_write = ones_idx[0]
+                        end_write   = ones_idx[-1]
+                        videoPath = self.data_index['Video'][idx]
+                        #cap = cv2.VideoCapture(videoPath)
+                        # container = av.open(videoPath)
+                        # stream = container.streams.video[0]
+                        #     # Determine FPS
+                        # fps = float(stream.average_rate)  # frames per second
+                        # width = stream.codec_context.width
+                        # height = stream.codec_context.height
+
+                        # Create output container and stream
+                        savevideopath_segment = os.path.join(savefilefolder, filename +f'_clip{turnIdx}.mp4')
+                        if not os.path.exists(savevideopath_segment):
+
+                            cap = cv2.VideoCapture(videoPath)
+                            fps = cap.get(cv2.CAP_PROP_FPS)
+                            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+                            # Use MJPG or XVID for AVI; use mp4v or H264 for MP4
+                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  
+                            out = cv2.VideoWriter(savevideopath_segment, fourcc, fps, (width, height))
+
+                            frame_idx = 0
+                            while True:
+                                ret, frame = cap.read()
+                                if not ret:
+                                    break
+
+                                if frame_idx < start_write:
+                                    frame_idx += 1
+                                    continue
+                                if frame_idx > end_write:
+                                    break
+
+                                out.write(frame)
+                                frame_idx += 1
+
+                            cap.release()
+                            out.release()
+
+                            # check if the saved video is corrupted (frames mismatch)
+                            verify_cap = cv2.VideoCapture(savevideopath_segment)
+                            verify_idx = 0
+                            while True:
+                                ret, frame = verify_cap.read()
+                                if not ret:
+                                    break
+                                verify_idx += 1
+
+                            verify_cap.release()
+                            # if verify_idx < (end_write - start_write + 1):
+                            #     nonTurningMask = np.zeros(len(obj.data['time']), dtype=bool)
+                            #     nonTurningMask[start_write:start_write+verify_idx] = True
+                            #     nonTurningMask = [True, True]+ list(nonTurningMask)
+                            #     saveMask = np.logical_and(tempMask, nonTurningMask)
+                            #     df_segment = df[saveMask]
+                            #     orig_index = df_segment.iloc[:,0].copy()
+                            #     # renumber it
+                            #     df_segment.iloc[2:,0] = np.arange(len(df_segment)-2)
+
+                            #     savefilepath = os.path.join(savefilefolder, filename+f"_clip{turnIdx}.csv")
+                            #     df_segment.to_csv(savefilepath, index=False)
+                            #     savetimeStamp = os.path.join(saveorigfolder, filename+f"origIndex_clip{turnIdx}.csv")
+                            #     orig_index.to_csv(savetimeStamp, index=False)
+                                # if frames is corrupted, rewrite orig TS and DLC file to match the non-currupted video
 
-    def __init__(self, filePath, videoPath, rodspeedPath,analysisPath, fps):
-        """
 
-        :param filePath: DLC csv path
-        :param videoPath:
-        :param rodspeedPath: rod speed csv path
-        :param analysisPath:
-        :param fps: number (frames per second); path: file path with time stamps
-        """
 
-        self.filePath = filePath
-        self.videoPath = videoPath
-        self.rodPath = rodspeedPath
-        self.nFrames = 0
-        # test if fps is a number or a file path
-        if isinstance(fps, (int, float)):
-            self.fps = fps
-        else:
-            # load the timeStamp csv
-            time_raw = pd.read_csv(fps, header=None)
-            self.t = np.array(time_raw[0]-time_raw[0][0])/1000
-            self.t_start = time_raw[0][0]
-        # read data
-        self.data = self.read_data()
-        self.analysis = analysisPath
-        self.fieldSize = 40 # in centimeter, used to convert px to cm
-        if not os.path.exists(self.analysis):
-            os.makedirs(self.analysis)
-        #self.video = self.read_video()
 
-    def get_confidence(self, p_threshold, savefigpath):
-        # get potentially outlier frames by confidence
-        # focus on body parts that are most likely to be wrong:
-        # tail 1, nose, left/right hand/foot
-        body_parts = ['nose', 'left hand', 'right hand', 'left foot', 'right foot', 'spine 1', 'spine 2', 'spine 3', 'tail 1']
-        outliers = []
-        for f in range(self.nFrames):
-            for bp in body_parts:
-                if self.data[bp]['p'][f]<p_threshold:
-                    outliers.append(f)
-                break
-
-        for ff in tqdm(range(len(outliers))):
-            frame = read_video(videoPath, outliers[ff], ifgray=False)
-        #self.plot_frame_label(outliers[1])
-            plt.imshow(frame)
-            figName = 'Frame' + str(outliers[ff]) + '.png'
-            plt.savefig(os.path.join(savefigpath,figName))
-            plt.close()
-
-    def get_jump(self, px_threshold, savefigpath):
-        body_parts = ['nose', 'left hand', 'right hand', 'left foot', 'right foot', 'tail 1', 'tail 2', 'tail 3']
-        outliers = []
-        for f in range(self.nFrames-1):
-            for bp in body_parts:
-                dx2 = (self.data[bp]['x'][f+1]-self.data[bp]['x'][f])**2
-                dy2 = (self.data[bp]['y'][f+1]-self.data[bp]['y'][f])**2
-                if np.sqrt(dx2+dy2) > px_threshold:
-                    outliers.append(f+1)
-                break
-
-
-        for ff in tqdm(range(len(outliers))):
-            frame = read_video(videoPath, outliers[ff], ifgray=False)
-            # self.plot_frame_label(outliers[1])
-            plt.imshow(frame)
-            figName = 'Frame' + str(outliers[ff]) + '.png'
-            plt.savefig(os.path.join(savefigpath, figName))
-            plt.close()
-
-    def kp_jump_dist(self):
-        # calculate cross frame keypoint jumps and plot the distrubution
-        body_parts = self.data['bodyparts']
-        kp_jumps = {}
-        for f in range(self.nFrames-1):
-            for bp in body_parts:
-                if f==0:
-                    kp_jumps[bp] = []
-                dx2 = (self.data[bp]['x'][f+1]-self.data[bp]['x'][f])**2
-                dy2 = (self.data[bp]['y'][f+1]-self.data[bp]['y'][f])**2
-                kp_jumps[bp].append(np.sqrt(dx2+dy2))
-
-        bins = np.arange(0.0,30,0.2)
-        fig, ax = plt.subplots(3,5,sharey=True)
-        for idx, bp in enumerate(body_parts):
-            ax[int(np.floor(idx/5)), int(np.mod(idx,5))].hist(kp_jumps[bp], bins= bins)
-            ax[int(np.floor(idx/5)), int(np.mod(idx,5))].set_xlabel(bp)
-
-    def moving_trace(self, savefigpath):
-        """ plot animal moving trace in the field"""
-        if not hasattr(self, 'arena'):
-            savedatapath = os.path.join(savefigpath, 'arena_coordinates.csv')
-            if not os.path.exists(savedatapath):
-                self.arena = frame_input(self.videoPath)
-                # save the results:
-                with open(savedatapath, 'w') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['upper left',
-                                     'upper right',
-                                     'lower right',
-                                     'lower left'])
-                    writer.writerow([self.arena['upper left'],
-                                    self.arena['upper right'],
-                                    self.arena['lower right'],
-                                    self.arena['lower left']])
-                    f.close()
-            else:
-                # read data from file
-                tempdata= pd.read_csv(savedatapath)
-                self.arena = {}
-                for key in tempdata.keys():
-                    self.arena[key] = ast.literal_eval(tempdata[key].values[0])
-
-                # convert px to cm
-                # calculate the length of each side in pixels, get the average, then convert to cm
-        sideLength = []
-        arenaKeys = list(self.arena.keys())
-        for kidx in range(len(arenaKeys)):
-            key1 = arenaKeys[kidx]
-            if kidx < len(arenaKeys)-1:
-                key2 = arenaKeys[kidx + 1]
-            else:
-                key2 = arenaKeys[0]
-            sideLength.append(np.sqrt((self.arena[key1][0]-self.arena[key2][0])**2+
-                                              (self.arena[key1][1]-self.arena[key2][1])**2))
-        # save the coordinates in analysis folder
-        self.px2cm = self.fieldSize/np.mean(sideLength)
-
-        arena_x = [self.arena['upper left'][0], self.arena['upper right'][0],
-                   self.arena['lower right'][0], self.arena['lower left'][0], self.arena['upper left'][0]]
-        arena_y = [self.arena['upper left'][1], self.arena['upper right'][1],
-                   self.arena['lower right'][1], self.arena['lower left'][1], self.arena['upper left'][1]]
-
-        # get the instantaneous distance from center
-        slope1 = (self.arena['upper left'][1] - self.arena['lower right'][1]) / (self.arena['upper left'][0] - self.arena['lower right'][0])
-        slope2 = (self.arena['lower left'][1] - self.arena['upper right'][1]) / (self.arena['lower left'][0] - self.arena['upper right'][0])
-
-        # Calculate the x-coordinate of the intersection point
-        x_intersection = ((self.arena['upper right'][1] - self.arena['upper left'][1]) + slope1 * self.arena['upper left'][0] - slope2 * self.arena['upper right'][0]) / (slope1 - slope2)
-
-        # Calculate the y-coordinate of the intersection point
-        y_intersection = slope1 * (x_intersection - self.arena['upper left'][0]) + self.arena['upper left'][1]
-
-        self.center_point = [x_intersection, y_intersection]
-
-        self.dist_center = np.sqrt((np.array(self.data['tail 1']['x'])-self.center_point[0])**2 +
-                                   (np.array(self.data['tail 1']['y'])-self.center_point[1])**2)
-
-        if hasattr(self, 'px2cm'):
-            self.dist_center = self.dist_center*self.px2cm
-
-        tracePlot = StartPlots()
-        tracePlot.ax.plot(arena_x, arena_y)
-        tracePlot.ax.plot(self.data['tail 1']['x'], self.data['tail 1']['y'])
-        tracePlot.ax.axis('equal')
-        # Hide the x and y axes
-        tracePlot.ax.axis('off')
-        tracePlot.save_plot('Moving trace.tif', 'tif', savefigpath)
-        tracePlot.save_plot('Moving trace.svg', 'svg', savefigpath)
-
-    def get_time_in_center(self):
-        """calculate time spent in the center"""
-        if hasattr(self, 'arena'):
-            # do the calculation
-            side_length = np.sqrt((self.arena['upper left'][0] - self.arena['upper right'][0])**2 + (self.arena['upper left'][1] - self.arena['upper right'][1])**2)
-            self.center = {}
-            self.center['upper left'] = (self.arena['upper left'][0] + side_length/4,
-                                         self.arena['upper left'][1] + side_length/4)
-            self.center['upper right'] = (self.arena['upper right'][0] - side_length/4,
-                                          self.arena['upper right'][1] + side_length / 4)
-            self.center['lower right'] = (self.arena['lower right'][0] - side_length/4,
-                                             self.arena['lower right'][1] - side_length / 4)
-            self.center['lower left'] = (self.arena['lower left'][0] + side_length/4,
-                                            self.arena['lower right'][1] - side_length / 4)
-
-            # determine if tail 1 is inthe center area\
-            x_left = (self.center['upper left'][0] + self.center['lower left'][0])/2
-            x_right = (self.center['upper right'][0] + self.center['lower right'][0])/2
-            y_upper = (self.center['upper left'][1] + self.center['upper right'][1])/2
-            y_lower = (self.center['lower left'][1] + self.center['lower right'][1])/2
-
-            is_center = np.zeros(len(self.data['tail 1']['x']))
-            num_cross = 0
-            self.num_cross = []  # number of times the animal crosses the border line of center area
-            for idx in range(len(self.data['tail 1']['x'])):
-                if self.data['tail 1']['x'][idx] > x_left and self.data['tail 1']['x'][idx] < x_right:
-                    if self.data['tail 1']['y'][idx] > y_upper and self.data['tail 1']['y'][idx] < y_lower:
-                        is_center[idx] = 1
-
-                        if idx > 0:
-                            if is_center[idx] != is_center[idx-1]:
-                                num_cross+=1
-                self.num_cross.append(num_cross)
-
-            self.time_in_center = is_center
-            self.cumu_time_center = []
-            cumu = 0
-            for f in range(self.nFrames):
-                cumu += self.time_in_center[f]/self.fps
-                self.cumu_time_center.append(cumu)
-
-        else:
-            print("please run moving_trace first")
-
-    def plot_distance_to_center(self, t, savefigpath):
-        # plot the distribution of distance to center
-        # as well as a function of time
-        distPlot = StartPlots()
-        self.dist_center_bins = distPlot.ax.hist(self.dist_center, bins=np.linspace(0, 1200, 101))
-        self.dist_center_bins_30 = distPlot.ax.hist(
-            self.dist_center[0:30 * 60 * int(self.fps)],
-            bins=np.linspace(0, 1200, 101)
-        )
-        distPlot.ax.set_xlabel('Distance from center (px)')
-        distPlot.ax.set_ylabel('Occurance')
-        distPlot.save_plot('Distribution of distance from center.tiff', 'tiff', savefigpath)
-
-        # average distance from center in a running window
-        window_frames = int(t * self.fps)
-        n_running = self.nFrames - 1 - window_frames
-        self.dist_center_running = np.zeros((n_running, 1))
-
-        for ff in range(n_running):
-            self.dist_center_running[ff] = np.nanmean(self.dist_center[ff:ff + window_frames])
-
-        distRunningPlot = StartPlots()
-        x = np.arange(len(self.dist_center_running)) / self.fps
-        distRunningPlot.ax.plot(x, self.dist_center_running.flatten())
-        distRunningPlot.ax.set_ylabel('Average distance from center (px)')
-        distRunningPlot.ax.set_xlabel('Time (s)')
-
-        distRunningPlot.save_plot('Average distance from center.tiff', 'tiff', savefigpath)
-        plt.close('all')
-
-    def read_data(self):
-        data = {}
-        if not hasattr(self, 't'):
-            self.t = []
-
-        if isinstance(self.filePath, str):
-            with open(self.filePath) as csv_file:
-                print("Loading data from: " + self.filePath)
-                csv_reader = csv.reader(csv_file)
-                line_count = 0
-                for row in csv_reader:
-                    if line_count == 0:  # scorer
-                        data[row[0]] = row[1]
-                        line_count += 1
-                    elif line_count == 1:  # body parts
-                        bodyPartList = []
-                        for bb in range(len(row) - 1):
-                            if row[bb + 1] not in bodyPartList:
-                                bodyPartList.append(row[bb + 1])
-                        data[row[0]] = bodyPartList
-                        #print(f'Column names are {", ".join(row)}')
-                        line_count += 1
-                    elif line_count == 2:  # coords
-                        #print(f'Column names are {", ".join(row)}')
-                        line_count += 1
-                    elif line_count == 3:  # actual coords
-                        # print({", ".join(row)})
-                        tempList = ['x', 'y', 'p']
-                        for ii in range(len(row) - 1):
-                            # get the corresponding body parts based on index
-                            body = data['bodyparts'][int(np.floor((ii) / 3))]
-                            if np.mod(ii, 3) == 0:
-                                data[body] = {}
-                            data[body][tempList[np.mod(ii, 3)]] = [float(row[ii + 1])]
-                        #self.t.append(0)
-                        line_count += 1
-                        self.nFrames += 1
-
-                    else:
-                        tempList = ['x', 'y', 'p']
-                        for ii in range(len(row) - 1):
-                            # get the corresponding body parts based on index
-                            body = data['bodyparts'][int(np.floor((ii) / 3))]
-                            data[body][tempList[np.mod(ii, 3)]].append(float(row[ii + 1]))
-                        #self.t.append(self.nFrames*(1/self.fps))
-                        line_count += 1
-                        self.nFrames += 1
-
-                print(f'Processed {line_count} lines.')
-
-                # add frame time
-                #tStep= 1/self.fps
-                data['time'] = self.t
-                #self.t = np.array(self.t)
-        else:
-            data['time'] = np.nan
-        # load rod speed data
-        # check if rodPath is None
-        if self.rodPath is not None:
-            rodSpeed = pd.read_csv(self.rodPath, header=None)
-            data['rodSpeed'] = rodSpeed.iloc[:, 0].values
-            data['rodT'] = (rodSpeed.iloc[:, 1].values-self.t_start)/1000
-        else:
-            rodSpeed = None
-            data['rodSpeed'] = rodSpeed
-            data['rodT'] = None
-
-
-        #%% for estimations with likelihood less than 0.8, replace the value with linear fit
-        # based on previous and next value
-        # corrected_data=copy.deepcopy(data)
-        # kp_list = ['spine 3', 'tail 1', 'tail 2', 'tail 3', 'left foot', 'right foot',
-        #            'nose', 'left ear', 'right ear','left hand', 'right hand']
-        # corrected_frames = []
-        # for kp in kp_list:
-        #     data[kp]['x'] = np.array(data[kp]['x'])
-        #     data[kp]['y'] = np.array(data[kp]['y'])
-        #     data[kp]['p'] = np.array(data[kp]['p'])
-        #     for i in range(6, len(data['time'])-6):
-        #         if data[kp]['p'][i] < 0.8:
-        #             prev_reliable={}
-        #             next_reliable = {}
-        #             prev_reliable['x'] = data[kp]['x'][max(0, i - 5):i][data[kp]['p'][max(0, i - 5):i] >= 0.8]
-        #             prev_reliable['y'] = data[kp]['y'][max(0, i - 5):i][data[kp]['p'][max(0, i - 5):i] >= 0.8]
-        #             next_reliable['x'] = data[kp]['x'][i + 1:min(len(data[kp]['p']), i + 6)][data[kp]['p'][i + 1:min(len(data[kp]['p']), i + 6)] >= 0.8]
-        #             next_reliable['y'] = data[kp]['y'][i + 1:min(len(data[kp]['p']), i + 6)][data[kp]['p'][i + 1:min(len(data[kp]['p']), i + 6)] >= 0.8]
-        #             prev_reliable = pd.DataFrame(prev_reliable)
-        #             next_reliable = pd.DataFrame(next_reliable)
-        #             reliable_points = pd.concat([prev_reliable, next_reliable])
-        #
-        #             # If we found any reliable points, replace the unreliable x and y values
-        #             if not reliable_points.empty:
-        #                 if not i in corrected_frames:
-        #                     corrected_frames.append(i)
-        #                 # Calculate average x and y of these reliable points
-        #                 avg_x = reliable_points['x'].mean()
-        #                 avg_y = reliable_points['y'].mean()
-        #
-        #                 # Replace unreliable x and y values with the interpolated average
-        #                 corrected_data[kp]['x'][i] = avg_x
-        #                 corrected_data[kp]['y'][i] = avg_y
-        #
-        # # plot some frames to examine it
-        # frame_num = 10198
-        # curr_frame = read_video(self.videoPath, frame_num, ifgray=False)
-        # plt.figure()
-        # plt.imshow(curr_frame)
-        # cmap = cm.get_cmap('viridis', len(kp_list))
-        # for kp in kp_list:
-        #     plt.scatter(data[kp]['x'][frame_num], data[kp]['y'][frame_num], c=cmap(kp_list.index(kp)), s=200,label = kp)
-        #     plt.scatter(corrected_data[kp]['x'][frame_num],corrected_data[kp]['y'][frame_num],marker = 'x',c=cmap(kp_list.index(kp)), s=200,label = kp+'_corrected')
-        # plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-
-        return data
-
-    def check_quality(self):
-        # go through the data and plot the distribution of p-values
-        pass
-
-    def get_movement(self):
-        # calculate distance, running velocity, acceleration, based on tail (base of tail)
-        savedatapath = os.path.join(self.analysis,'movement.pickle')
-        if not os.path.exists(savedatapath):
-            self.vel = np.zeros((self.nFrames-1, 1))
-            self.dist = np.zeros((self.nFrames-1,1))
-            self.accel = np.zeros((self.nFrames-1, 1))
-
-            for ff in range(self.nFrames-1):
-                self.dist[ff] = np.sqrt((self.data['tail 1']['x'][ff+1] - self.data['tail 1']['x'][ff])**2 +
-                    (self.data['tail 1']['y'][ff + 1] - self.data['tail 1']['y'][ff]) ** 2)
-
-                self.vel[ff] = (self.dist[ff])*self.fps
-                if ff<self.nFrames-2:
-                    self.accel[ff] = (self.vel[ff+1]-self.vel[ff])*self.fps
-            # save vel, dist, accel in pickle file
-            dist = self.dist
-            vel = self.vel
-            accel = self.accel
-            with open(savedatapath, 'wb') as f:
-                pickle.dump([dist, vel, accel], f)
-            f.close()
-        else:
-            # load dis, vel and accel from pickle file
-            with open(savedatapath, 'rb') as f:
-                self.dist, self.vel, self.accel = pickle.load(f)
-            f.close()
-
-        if hasattr(self, 'px2cm'):
-            self.dist = self.dist*self.px2cm
-            self.vel = self.vel*self.px2cm
-            self.accel = self.accel*self.px2cm
-
-    def get_movement_running(self, t, savefigpath):
-        savedatapath = os.path.join(self.analysis, 'movement_running.pickle')
-        if not os.path.exists(savedatapath):
-        # get average distance and velocity in running window of t seconds
-            self.vel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
-            self.dist_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
-            self.accel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
-
-            for ff in range(self.nFrames - 1 - t*self.fps):
-                self.dist_running[ff] = np.sum(self.dist[ff:ff+t*self.fps])
-                self.vel_running[ff] = np.nanmean(self.vel[ff:ff+t*self.fps])
-                self.accel_running[ff] = np.nanmean(self.accel[ff:ff+t*self.fps])
-                self.vel[ff] = (self.dist[ff]) * self.fps
-
-            dist_running = self.dist_running
-            vel_running = self.vel_running
-            accel_running = self.accel_running
-            with open(savedatapath, 'wb') as f:
-                pickle.dump([dist_running, vel_running, accel_running], f)
-            f.close()
-
-            velPlot = StartPlots()
-            x = np.arange(len(self.dist_running)) / self.fps
-            velPlot.ax.plot(x, self.dist_running.flatten())
-            velPlot.ax.set_ylabel('Average distance traveled (px)')
-            #ax2 = velPlot.ax.twinx()
-            #ax2.plot(self.t[0:self.nFrames - 1 - t * self.fps], self.vel_running, color='red')
-            #ax2.set_ylabel('Average velocity')
-            velPlot.ax.set_xlabel('Time (s)')
-
-            velPlot.save_plot('Running distance and velocity.png', 'png', savefigpath)
-            plt.close(velPlot.fig)
-        else:
-            # load dis, vel and accel from pickle file
-            with open(savedatapath, 'rb') as f:
-                self.dist_running, self.vel_running, self.accel_running = pickle.load(f)
-            f.close()
-        if hasattr(self, 'px2cm'):
-            self.dist_running = self.dist_running*self.px2cm
-            self.vel_running= self.vel_running*self.px2cm
-            self.accel_running = self.accel_running*self.px2cm
-
-    def get_angular_velocity(self):
-        # calculate angular velocity based on tail and spine 1
-        savedatapath = os.path.join(self.analysis, 'angular_velocity.pickle')
-        if not os.path.exists(savedatapath):
-            self.angVel = np.zeros((self.nFrames-1, 1))
-            for ff in range(self.nFrames-1):
-                y1 = self.data['spine 1']['y'][ff] - self.data['tail 1']['y'][ff]
-                x1 = self.data['spine 1']['x'][ff] - self.data['tail 1']['x'][ff]
-
-                y2 = self.data['spine 1']['y'][ff+1] - self.data['tail 1']['y'][ff+1]
-                x2 = self.data['spine 1']['x'][ff+1] - self.data['tail 1']['x'][ff+1]
-
-                self.angVel[ff] = self.get_angle([x1, y1], [x2, y2])*self.fps
-            angVel = self.angVel
-            with open(savedatapath, 'wb') as f:
-                pickle.dump(angVel, f)
-            f.close()
-        else:
-            with open(savedatapath, 'rb') as f:
-                self.angVel = pickle.load(f)
-            f.close()
-        #self.angVel = self.angVel*self.fps
-
-    def get_head_angular_velocity(self):
-        savedatapath = os.path.join(self.analysis, 'head_angular_velocity.pickle')
-        if not os.path.exists(savedatapath):
-            self.headAngVel = np.zeros((self.nFrames, 1))
-            for ff in range(self.nFrames-1):
-                # get the mid point of two ears
-                midX1 = (self.data['left ear']['x'][ff] + self.data['right ear']['x'][ff])/2
-                midY1 = (self.data['left ear']['y'][ff] + self.data['right ear']['y'][ff])/2
-
-                midX2 = (self.data['left ear']['x'][ff+1] + self.data['right ear']['x'][ff+1])/2
-                midY2 = (self.data['left ear']['y'][ff+1] + self.data['right ear']['y'][ff+1])/2
-
-                v1 = [self.data['nose']['x'][ff]-midX1, self.data['nose']['y'][ff]-midY1]
-                v2 = [self.data['nose']['x'][ff+1]-midX2, self.data['nose']['y'][ff+1]-midY2]
-
-                self.headAngVel[ff] = self.get_angle(v1, v2) * self.fps
-            with open(savedatapath, 'wb') as f:
-                pickle.dump(self.headAngVel, f)
-            f.close()
-        else:
-            with open(savedatapath, 'rb') as f:
-                self.headAngVel = pickle.load(f)
-            f.close()
-
-    def get_stride(self,front_kp, back_kp, df_entry):
-        savedatapath = os.path.join(self.analysis, 'stride_freq.csv')
-        runFile = os.path.join(self.analysis, 'notExist.csv') # a not existing file to allow re-calculating
-        if not os.path.exists(runFile):
-
-            savefigpath = os.path.join(self.analysis)
-            if not os.path.exists(savefigpath):
-                os.makedirs(savefigpath)
-
-            # get rid the the turning period
-            
-            # %% define rod plane first
-            # load reference point
-            # calculate the average position
-            tempData = self.data
-            ave_left_rod_back = np.array([np.mean(np.array(tempData['rod_left_back']['x'])[np.array(tempData['rod_left_back']['p'])>0.95]),
-                            np.mean(np.array(tempData['rod_left_back']['y'])[np.array(tempData['rod_left_back']['p'])>0.95])])
-            ave_right_rod_back = np.array([np.mean(np.array(tempData['rod_right_back']['x'])[np.array(tempData['rod_right_back']['p'])>0.95]),
-                            np.mean(np.array(tempData['rod_right_back']['y'])[np.array(tempData['rod_right_back']['p'])>0.95])])
-            ave_center_rod_back = (ave_left_rod_back+ave_right_rod_back)/2
-            self.data['ref_left_rod_back'] = ave_left_rod_back
-            self.data['ref_right_rod_back'] = ave_right_rod_back
-            self.data['ref_center_rod_back'] = ave_center_rod_back
-
-            ave_left_rod_front = np.array([np.mean(np.array(tempData['rod_left_front']['x'])[np.array(tempData['rod_left_front']['p'])>0.95]),
-                            np.mean(np.array(tempData['rod_left_front']['y'])[np.array(tempData['rod_left_front']['p'])>0.95])])
-            ave_right_rod_front = np.array([np.mean(np.array(tempData['rod_right_front']['x'])[np.array(tempData['rod_right_front']['p'])>0.95]),
-                            np.mean(np.array(tempData['rod_right_front']['y'])[np.array(tempData['rod_right_front']['p'])>0.95])])
-            ave_center_rod_front = (ave_left_rod_front+ave_right_rod_front)/2
-
-            self.data['ref_left_rod_front'] = ave_left_rod_front
-            self.data['ref_right_rod_front'] = ave_right_rod_front
-            self.data['ref_center_rod_front'] = ave_center_rod_front
-
-            ave_left_rod_back = self.data['ref_left_rod_back']
-            ave_right_rod_back = self.data['ref_right_rod_back']
-            ave_center_rod_back = self.data['ref_center_rod_back']
-            ave_left_rod_front = self.data['ref_left_rod_front']
-            ave_right_rod_front = self.data['ref_right_rod_front']
-            ave_center_rod_front = self.data['ref_center_rod_front']
-
-            ref_plot = os.path.join(savefigpath, 'Rod coordinate.png')
-            if not os.path.exists(ref_plot):
-                frame = read_video(self.videoPath, 0, ifgray=False)
-                # overlay the video frame?
-                plt.figure()
-                plt.imshow(frame)
-                plt.scatter(self.data['rod_left_back']['x'], self.data['rod_left_back']['y'],
-                            c=self.data['rod_left_back']['p'], cmap='viridis', s=100)
-
-                # Add color bar to show the scale of likelihood
-                plt.colorbar(label='Confidence')
-
-                plt.scatter(self.data['rod_right_back']['x'], self.data['rod_right_back']['y'],
-                            c=self.data['rod_right_back']['p'], cmap='viridis', s=100)
-
-                plt.scatter(self.data['rod_left_front']['x'], self.data['rod_left_front']['y'],
-                            c=self.data['rod_left_front']['p'], cmap='viridis', s=100)
-
-                # Add color bar to show the scale of likelihood
-
-                plt.scatter(self.data['rod_right_front']['x'], self.data['rod_right_front']['y'],
-                            c=self.data['rod_right_front']['p'], cmap='viridis', s=100)
-
-                # get average from keypoints with confidence higher than 95
-
-
-                plt.scatter(ave_left_rod_back[0],ave_left_rod_back[1], s=500)
-                plt.scatter(ave_right_rod_back[0], ave_right_rod_back[1], s=500)
-                plt.scatter(ave_center_rod_back[0], ave_center_rod_back[1], s=500)
-
-                plt.scatter(ave_left_rod_front[0],ave_left_rod_front[1], s=500)
-                plt.scatter(ave_right_rod_front[0], ave_right_rod_front[1], s=500)
-                plt.scatter(ave_center_rod_front[0], ave_center_rod_front[1], s=500)
-
-                plt.savefig(os.path.join(savefigpath, 'rod_plane.png'))
-                plt.close()
-            # save the figure
-
-            # %% examine the body parts in back view and front view
-
-            # find behavior time (from rod start turning to fall)
-            startTime= self.data['rodT'][self.data['rodSpeed_smoothed']>0][0]
-            if np.isnan(self.data['rodStart'][0]):
-                self.data['rodStart'][0] = 0
-            endTime = startTime+df_entry['Performance'] + self.data['rodRun'][0] - self.data['rodStart'][0] # need the time stay on rod
-
-            timeMaskDLC = np.logical_and(self.data['time']>=startTime, self.data['time']<= endTime)
-            timeMaskRod = np.logical_and(self.data['rodT']>=startTime, self.data['rodT']<= endTime)
-            nFramesInclude = np.sum(timeMaskDLC)
-            time_include = self.data['time'][timeMaskDLC]
-            kp_list = ['left hand', 'right hand', 'left foot', 'right foot']
-            self.stride = np.full((nFramesInclude, len(kp_list)), np.nan)
-
-            #dataMask = np.logical_and(timeMask, p_mask)
-            #self.notnanChunks = {}  # save the indices of not nan chunks in the stride for later filtering
-            for idx,kp in enumerate(kp_list):
-                if 'hand' in kp:
-                    self.stride[:,idx] = np.sqrt((np.array(self.data[kp]['x'])[timeMaskDLC]-ave_center_rod_front[0])**2 +
-                                            (np.array(self.data[kp]['y'])[timeMaskDLC]-ave_center_rod_front[1])**2)
-                elif 'foot' in kp:
-                    self.stride[:,idx] = np.sqrt((np.array(self.data[kp]['x'])[timeMaskDLC]-ave_center_rod_back[0])**2 +
-                                            (np.array(self.data[kp]['y'])[timeMaskDLC]-ave_center_rod_back[1])**2)
-
-            # try calculate the stride using distance from the rod (a horizontal line)
-            self.stride_rod = np.full((nFramesInclude, len(kp_list)), np.nan)
-
-            #dataMask = np.logical_and(timeMask, p_mask)
-            #self.notnanChunks = {}  # save the indices of not nan chunks in the stride for later filtering
-            for idx,kp in enumerate(kp_list):
-                if 'hand' in kp:
-                    self.stride_rod[:,idx] = distance_points_to_line(np.array(self.data[kp]['x'])[timeMaskDLC],
-                                                                    np.array(self.data[kp]['y'])[timeMaskDLC],
-                                                                    ave_left_rod_front, ave_right_rod_front)
-                elif 'foot' in kp:
-                    self.stride_rod[:,idx] = distance_points_to_line(np.array(self.data[kp]['x'])[timeMaskDLC],
-                                                                    np.array(self.data[kp]['y'])[timeMaskDLC],
-                                                                    ave_right_rod_back, ave_left_rod_back)
-
-            #tempMask = ~p_mask[timeMask]
-            #    self.stride[tempMask,idx] = np.nan
-            #    tempStride, tempIdx = fill_nans_and_split(self.stride[:, idx])
-                # interpolate the nans
-                # self.notnanChunks[kp] = tempIdx
-                # for ich, chunk in enumerate(tempIdx):
-                #     self.stride[chunk[0]:chunk[1]+1,idx] = tempStride[ich]
-
-
-            # low-pass filter the data
-            fps = 50
-            self.t_interp = np.arange(time_include[0], time_include[-1] + 1 / fps, 1 / fps)
-            self.filtered_stride = np.full((len(self.t_interp), len(kp_list)), np.nan)
-            self.interp_stride = np.full((len(self.t_interp), len(kp_list)), np.nan)
-
-            # need to determine the cutoff frequency here
-            for idx, kp in enumerate(kp_list):
-                #for ich, chunk in enumerate(self.notnanChunks[kp]):
-                #    if chunk[1]-chunk[0]+1 > 18:  # padlen
-                # interpolate the data first. Original data were recorded with unstable fps. (around 50)
-                self.interp_stride[:,idx] = np.interp(self.t_interp, time_include, self.stride_rod[:,idx])
-
-                self.filtered_stride[:,idx] = butter_lowpass_filter(self.interp_stride[:,idx], 5,fps,order=5)
-
-            #%%
-            # examine the autocorrelation
-            # average them over genotype and trial
-            # find the time when rod speed reach 5/10
-            #if df_entry['Trial']<=6:
-            startSpeed = 5
-            #else:
-            #    startSpeed = 10
-            startTime_auto = self.data['rodT'][self.data['rodSpeed_smoothed']>startSpeed][0]
-            fig, ax = plt.subplots(2, 2, figsize=(10, 8))  # 2x2 grid for 4 subplots
-            ax = ax.flatten()
-            for ss in range(len(kp_list)):
-                signal = pd.Series(self.filtered_stride[self.t_interp>startTime_auto,ss])
-                autocorr_values = [signal.autocorr(lag=i) for i in range(len(signal)//2)]
-
-                plot_time = 10
-                # Subplot 1 (First row, spanning two columns)
-                ax[ss].plot(np.arange(len(autocorr_values))/fps, autocorr_values, linewidth=0.5)
-                ax[ss].plot(np.arange(len(autocorr_values))/fps, np.zeros(len(autocorr_values)),c='r', linewidth=2)
-                #ax[ss].stem(range(len(autocorr_values)), autocorr_values,linefmt='b-', basefmt=" ", use_line_collection=True)
-                ax[ss].set_title('Autocorrelation of ' + kp_list[ss])
-
-                if ss==0:
-                    # save autocorrelation value and lags in dataframe
-                    autocorr_df = pd.DataFrame({'lags': np.arange(len(autocorr_values))/fps})
-                autocorr_df[kp_list[ss]] = autocorr_values
-
-            plt.tight_layout()  # Adjust subplot parameters to give specified padding
-            plt.savefig(os.path.join(self.analysis, 'Stride autocorrelation.png'), dpi=300)  # Save as PNG fil
-            # save autocorrelation
-            autocorr_df.to_csv(os.path.join(self.analysis, 'Stride autocorrelation.csv'))
-            plt.close()
-
-            #%%
-            # instantaneous frequency with hilbert transform
-
-            # Compute the analytic signal
-            #
-            # analytic_signal = hilbert(self.interp_stride[:,2])
-            # instantaneous_phase = np.unwrap(np.angle(analytic_signal))
-            # instantaneous_frequency = np.diff(instantaneous_phase) / (2.0 * np.pi * (1 / fps))
-
-
-            # Plot spectrogram
-
-            # %% short time fourier transform
-            # from scipy.signal import stft
-            # frequencies, times, Zxx = stft(self.filtered_stride[:,3], fs=50, nperseg=256)
-            # plt.pcolormesh(times, frequencies, np.abs(Zxx), shading='gouraud')
-            # plt.colorbar(label='Magnitude')
-            # plt.ylabel('Frequency [Hz]')
-            # plt.xlabel('Time [s]')
-            # plt.title('STFT Magnitude')
-
-            #%% pearson correlation between limbs
-            # phase lag?
-            # generate some plots
-            pcorr = pd.DataFrame({'time': self.t_interp})
-            corr_group = [['left hand','right hand'], ['left foot', 'right foot'],
-                           ['left hand', 'left foot'], ['right hand', 'right foot']]
-            corr_Idx = [[0,1], [2,3], [0,2], [1,3]]
-            # xcorr between hands/feet/left/right
-            timeStep = 2 # in second
-            for kp_pairs,kp_idx in zip(corr_group,corr_Idx):
-                corrCoeff_running = np.zeros((len(self.t_interp)))
-                for idx,t in enumerate(self.t_interp):
-                    tMask = np.logical_and(self.t_interp>t, self.t_interp <t+timeStep)
-                    corrCoeff_running[idx] = np.corrcoef(self.filtered_stride[tMask,kp_idx[0]],
-                                                             self.filtered_stride[tMask,kp_idx[1]])[0,1]
-                pcorr[kp_pairs[0]+'-'+kp_pairs[1]] = corrCoeff_running
-            
-            # cross correlation
-            max_lag_sec = 1.0  # maximum lag to compute (in seconds)
-            dt = self.t_interp[1] - self.t_interp[0]  # time step of your signal
-            max_lag_samples = int(max_lag_sec / dt)
-
-            # Store results
-            max_xcorr = pd.DataFrame({'time': self.t_interp})
-            max_lag = pd.DataFrame({'time': self.t_interp})
-
-            for kp_pairs, kp_idx in zip(corr_group, corr_Idx):
-                # Each element will be a 2D array: shape (len(t_interp), 2*max_lag_samples+1)
-                # Arrays for max correlation and lag at each time point
-                corr_max = np.full(len(self.t_interp), np.nan)
-                lag_at_max = np.full(len(self.t_interp), np.nan)
-
-                lags = np.arange(-max_lag_samples, max_lag_samples + 1) * dt
-
-                for idx, t in enumerate(self.t_interp):
-                    # 2-second window mask
-                    tMask = (self.t_interp > t) & (self.t_interp < t + timeStep)
-                    x = self.filtered_stride[tMask, kp_idx[0]]
-                    y = self.filtered_stride[tMask, kp_idx[1]]
-
-                    if len(x) < 2 or len(y) < 2:
-                        continue
-
-                    # Normalize signals
-                    x = x - np.mean(x)
-                    y = y - np.mean(y)
-
-                    # Compute normalized cross-correlation
-                    c = correlate(y, x, mode='full')
-                    if np.std(x) != 0 and np.std(y) != 0:
-                        c = c / (np.std(x) * np.std(y) * len(x))
-
-                    # Center index
-                    mid = len(c) // 2
-                    c_window = c[mid - max_lag_samples: mid + max_lag_samples + 1]
-
-                    # Find max correlation and corresponding lag
-                    max_idx = np.nanargmax(c_window)
-                    corr_max[idx] = c_window[max_idx]
-                    lag_at_max[idx] = lags[max_idx]
-                
-                max_xcorr[kp_pairs[0]+'-'+kp_pairs[1]] = corr_max
-                max_lag[kp_pairs[0]+'-'+kp_pairs[1]] = lag_at_max
-
-            #save cross correlation results
-            pcorr_renamed = pcorr.copy()
-            pcorr_renamed.columns = ['time'] + [col + '_pearson' for col in pcorr.columns[1:]]
-
-            max_xcorr_renamed = max_xcorr.copy()
-            max_xcorr_renamed.columns = ['time'] + [col + '_maxxcorr' for col in max_xcorr.columns[1:]]
-
-            max_lag_renamed = max_lag.copy()
-            max_lag_renamed.columns = ['time'] + [col + '_lag' for col in max_lag.columns[1:]]
-
-            # 2. Merge all DataFrames on 'time'
-            combined_df = pcorr_renamed.merge(max_xcorr_renamed, on='time').merge(max_lag_renamed, on='time')
-
-            # 3. Save to CSV
-            combined_df.to_csv(os.path.join(self.analysis, 'Stride correlation.csv'), index=False)
-
-            # make a plot to show pearson correlation and cross correlation and max lag
-            fig,ax = plt.subplots(4, 1, figsize=(16, 10))
-            # Subplot 1 (First row, spanning two columns)
-            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
-            for start_idx, end_idx in self.data['turning_period']:
-                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
-                    color='grey', alpha=0.3)
-            ax[0].set_title('Rod speed')
-            ax[0].set_ylabel('Rod speed (RPM)')
-            ax[0].tick_params(axis='x', which='both', labelbottom=False)
-            #ax[0].plot(self.t_interp , self.filtered_stride[:,1])
-            #ax[0].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            
-            # plot pearson correlation of hands and foot
-            ax[1].plot(self.t_interp, pcorr['left hand-right hand'], label= 'Hands')
-            ax[1].plot(self.t_interp, pcorr['left foot-right foot'], label = 'Feet')
-            #ax[1].legend(loc='upper left', bbox_to_anchor=(1, 1))
-            ax[1].set_title('Pearson correlation coefficient')
-            ax[1].tick_params(axis='x', which='both', labelbottom=False)
-
-            # plot cross correlation 
-            ax[2].plot(self.t_interp, max_xcorr['left hand-right hand'], label= 'Hands')
-            ax[2].plot(self.t_interp, max_xcorr['left foot-right foot'], label = 'Feet')
-            ax[2].tick_params(axis='x', which='both', labelbottom=False)
-            ax[2].set_title('Max cross correlation coefficient')
-            #ax[2].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            # plot max lag
-            ax[3].plot(self.t_interp, max_lag['left hand-right hand'], label= 'Hands')
-            ax[3].plot(self.t_interp, max_lag['left foot-right foot'], label = 'Feet')
-            ax[3].set_title('Max lag (s)')
-            ax[3].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            for a in ax:  # ax is a list/array of subplots
-                a.spines['top'].set_visible(False)
-                a.spines['right'].set_visible(False)
-
-            plt.savefig(os.path.join(self.analysis,'Stride correlation - HF.png'), dpi=300)  # Save as PNG fil
-            #plt.show()
-            plt.close()
-
-            # same plot to show left and right
-            fig,ax = plt.subplots(4, 1, figsize=(16, 10))
-            # Subplot 1 (First row, spanning two columns)
-            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
-            for start_idx, end_idx in self.data['turning_period']:
-                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
-                    color='grey', alpha=0.3)
-            ax[0].set_title('Rod speed')
-            ax[0].set_ylabel('Rod speed (RPM)')
-            ax[0].tick_params(axis='x', which='both', labelbottom=False)
-            #ax[0].plot(self.t_interp , self.filtered_stride[:,1])
-            #ax[0].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            
-            # plot pearson correlation of hands and foot
-            ax[1].plot(self.t_interp, pcorr['left hand-left foot'], label= 'Left')
-            ax[1].plot(self.t_interp, pcorr['right hand-right foot'], label = 'Right')
-            #ax[1].legend(loc='upper left', bbox_to_anchor=(1, 1))
-            ax[1].set_title('Pearson correlation coefficient')
-            ax[1].tick_params(axis='x', which='both', labelbottom=False)
-
-            # plot cross correlation 
-            ax[2].plot(self.t_interp, max_xcorr['left hand-left foot'], label= 'LEft')
-            ax[2].plot(self.t_interp, max_xcorr['right hand-right foot'], label = 'Right')
-            ax[2].tick_params(axis='x', which='both', labelbottom=False)
-            ax[2].set_title('Max cross correlation coefficient')
-            #ax[2].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            # plot max lag
-            ax[3].plot(self.t_interp, max_lag['left hand-left foot'], label= 'Hands')
-            ax[3].plot(self.t_interp, max_lag['right hand-right foot'], label = 'Feet')
-            ax[3].set_title('Max lag (s)')
-            ax[3].legend(loc='upper left', bbox_to_anchor=(1, 1))
-
-            for a in ax:  # ax is a list/array of subplots
-                a.spines['top'].set_visible(False)
-                a.spines['right'].set_visible(False)
-
-            plt.savefig(os.path.join(self.analysis,'Stride correlation - LR.png'), dpi=300)  # Save as PNG fil
-            #plt.show()
-            plt.close()
-
-            #%% calculate hand/foot step amplitude and frequency based on peak detection
-            self.stride_amp = []
-            self.stride_time = []
-            self.stride_freq = np.full(self.filtered_stride.shape, np.nan)
-
-            time = self.t_interp
-            for ll in range(4): # step size and amplitude of 4 limbs
-            # Detect peaks (foot lifts)
-            
-                distance = self.filtered_stride[:,ll]
-                peaks, props = find_peaks(distance, prominence=2, distance=None)
-
-                # Estimate baseline before each step using local minima
-                inv_distance = -distance
-                troughs, _ = find_peaks(inv_distance, prominence=2 / 2, distance=None)
-
-                step_amplitudes = []
-                step_times = []
-
-                for peak in peaks:
-                    # Find the closest following trough (baseline)
-                    next_troughs = troughs[troughs > peak]
-                    if len(next_troughs) == 0:
-                        continue
-                    baseline_idx = next_troughs[0]
-                    amplitude = distance[peak] - distance[baseline_idx]
-                    step_amplitudes.append(amplitude)
-                    step_times.append(time[peak])
-
-                step_amplitudes = np.array(step_amplitudes)
-                step_times = np.array(step_times)
-
-                self.stride_amp.append(step_amplitudes)
-                self.stride_time.append(step_times)
-
-
-                # Compute step frequency (Hz) in running 2 second window
-                window = 2
-                freqs = np.full(len(time), np.nan)  # preallocate
-
-                for i, t in enumerate(time):
-                    # count steps within [t - window/2, t + window/2]
-                    mask = (step_times >= t - window/2) & (step_times <= t + window/2)
-                    steps_in_window = step_times[mask]
-
-                    if len(steps_in_window) >= 1:
-                        intervals = np.diff(steps_in_window)
-                        freqs[i] = 1 / np.mean(intervals)
-                    else:
-                        freqs[i] = np.nan
-
-                self.stride_freq[:,ll] = freqs
-
-
-            fig,ax = plt.subplots(5, 1, figsize=(16, 16))
-            # rod speed
-            ax[0].plot(self.data['rodT'],self.data['rodSpeed_smoothed'])
-            for start_idx, end_idx in self.data['turning_period']:
-                ax[0].axvspan(self.data['time'][start_idx], self.data['time'][end_idx],
-                    color='grey', alpha=0.3)
-            ax[0].set_title('Rod speed')
-            ax[0].set_ylabel('Rod speed (RPM)')
-            ax[0].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 2, stride of hand
-            ax[1].plot(self.t_interp, self.filtered_stride[:,0])
-            ax[1].plot(self.t_interp , self.filtered_stride[:,1])
-            ax[1].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[1].set_title('Distance between left/right hand and the rod')
-            ax[1].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 3 foot
-            ax[2].plot(self.t_interp, self.filtered_stride[:,2])
-            ax[2].plot(self.t_interp, self.filtered_stride[:,3])
-            ax[2].legend(['left foot', 'right foot'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[2].set_title('Distance between left/right foot and the rod')
-            ax[2].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 4 hand amplitude
-            ax[3].stem(self.stride_time[0], self.stride_amp[0], linefmt='C0-',  basefmt=" ", label='left hand')
-            ax[3].stem(self.stride_time[1], self.stride_amp[1],linefmt='C1-',  basefmt=" ",label='right hand')
-            ax[3].legend(['left hand', 'right hand'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[3].set_title('Hand step amplitude')
-            ax[3].tick_params(axis='x', which='both', labelbottom=False)
-
-            # Subplot 4 (Third row, first column)
-            ax[4].stem(self.stride_time[2], self.stride_amp[2], linefmt='C0-',  basefmt=" ", label='left foot')
-            ax[4].stem(self.stride_time[3], self.stride_amp[3], linefmt='C1-',  basefmt=" ", label='right foot')
-            ax[4].legend(['left foot', 'right foot'],loc='upper left', bbox_to_anchor=(1, 1))
-            ax[4].set_title('Foot step amplitude')
-
-            for a in ax:  # ax is a list/array of subplots
-                a.spines['top'].set_visible(False)
-                a.spines['right'].set_visible(False)
-            
-            plt.tight_layout()  # Adjust subplot parameters to give specified padding
-            plt.savefig(os.path.join(self.analysis,'Stride amplitude.png'), dpi=300)  # Save as PNG fil
-            #plt.show()
-            plt.close()
-
-            data = {'left hand': self.filtered_stride[:,0],
-                    'right hand': self.filtered_stride[:,1],
-                    'left foot': self.filtered_stride[:, 2],
-                    'right foot': self.filtered_stride[:, 3],
-                    'stride amplitude': self.stride_amp,
-                    'stride time': self.stride_time,
-                    'stride frequency': self.stride_freq,
-                    'time': self.t_interp}
-            #dataDF = pd.DataFrame(data)
-            #dataDF.to_csv(savedatapath)
-            # save to pickle file
-            with open( os.path.join(self.analysis, 'stride_freq.pickle'), 'wb') as f:
-                pickle.dump(data, f)
-
-            #%%
-            # cumulative area under the curve
-            # cum_xcorr_foot = np.cumsum(xcorr['left foot-right foot'])/fps
-            # cum_xcorr_hand = np.cumsum(xcorr['left hand-right hand']) / fps
-            # cum_xcorr_left = np.cumsum(xcorr['left hand-left foot'])/fps
-            # cum_xcorr_right = np.cumsum(xcorr['right hand-right foot']) / fps
-            # plt.figure()
-            # plt.plot(self.t_interp, cum_xcorr_foot)
-            # plt.plot(self.t_interp, cum_xcorr_hand)
-            # plt.plot(self.t_interp, cum_xcorr_left)
-            # plt.plot(self.t_interp, cum_xcorr_right)
-            # plt.plot(self.data['rodT'][timeMaskRod], self.data['rodSpeed_smoothed'][timeMaskRod])
-            # plt.xlabel('time')
-            # plt.ylabel('Cumulative area under the curve of xcorr')
-            # plt.legend(['feet','hands','left','right', 'Rod speed'])
-            # plt.savefig(os.path.join(self.analysis,'Stride correlation.png'), dpi=300)  # Save as PNG fil
-            # #plt.show()
-            # plt.close()
-            # # cross correlation in 10 second window
-
-            # # save data in csv
-            # xcorr.to_csv(os.path.join(self.analysis, 'Stride crosscorrelation.csv'))
-
-            #
-            #%% tail angle
-            # calculate spine 3 - tail 1 - tail 2 angle
-            A = np.array([self.data['spine 3']['x'], self.data['spine 3']['y']]).T
-            B = np.array([self.data['tail 1']['x'], self.data['tail 1']['y']]).T
-            C = np.array([self.data['tail 2']['x'], self.data['tail 2']['y']]).T
-
-            A = A[timeMaskDLC,:]
-            B = B[timeMaskDLC,:]
-            C = C[timeMaskDLC,:]
-            # Calculate vectors AB and BC
-            AB = B - A
-            BC = C - B
-
-            # Calculate the angle between AB and BC
-            # Calculate dot and cross products for each time point
-            dot_product = np.sum(AB * BC, axis=1)  # Dot product for each row (time point)
-            cross_product = AB[:, 0] * BC[:, 1] - AB[:, 1] * BC[:, 0]  # Cross product for each time point
-
-            # Calculate the angle at each time point
-            angles = np.arctan2(cross_product, dot_product)
-
-            # Convert to degrees
-            angles = np.degrees(angles)
-
-            # interpolate and filter the angle
-            fps = 50
-            self.filtered_angle = np.full((len(self.t_interp)), np.nan)
-            self.interp_angle = np.full((len(self.t_interp)), np.nan)
-
-            # need to determine the cutoff frequency here
-
-                # interpolate the data first. Original data were recorded with unstable fps. (around 50)
-            self.interp_angle= np.interp(self.t_interp, time_include, angles)
-
-            self.filtered_angle = butter_lowpass_filter(self.interp_angle, 5,fps,order=5)
-
-
-            # save data in csv
-            tail_angle= pd.DataFrame({'angle':self.filtered_angle, 'time':self.t_interp})
-            tail_angle.to_csv(os.path.join(self.analysis, 'Tail angle.csv'))
-            # Calculate the angle in radians using atan2 for correct sign
-
-            # plot the video frame with keypoint estimatino
-            # frame_num = 7760
-            # curr_frame = read_video(self.videoPath, frame_num, ifgray=False)
-            # plt.figure()
-            # plt.imshow(curr_frame)
-            # kp_plot = ['tail 2']
-            # for kp in kp_plot:
-            #     plt.scatter(self.data[kp]['x'][frame_num], self.data[kp]['y'][frame_num], s=20)
-
-            #%% head angle
-
-            #%% tail position
-            # plot the density distribution of the tail
-            # set coordinate of tail 1 to be (0, 0)
-            # ego_tail = {}
-            # tail_key = ['tail 1', 'tail 2', 'tail 3']
-            # for t in tail_key:
-            #     ego_tail[t] = {}
-            #     ego_tail[t]['x']= np.array(self.data[t]['x'])-np.array(self.data['tail 1']['x'])
-            #     ego_tail[t]['y'] = np.array(self.data[t]['y']) - np.array(self.data['tail 1']['y'])
-            #
-            # plt.figure(figsize=(12, 6))
-            # # Density plot for aligned b coordinates
-            # sns.kdeplot(data=pd.DataFrame(ego_tail['tail 2']), x='x', y='y',
-            #             fill=True, cmap='Blues', alpha=0.5, label='Point B',
-            #             thresh=0.001,  # Avoid clipping at 0
-            #             levels=20,
-            #             norm=LogNorm())
-            # # Density plot for aligned c coordinates
-            # sns.kdeplot(data=pd.DataFrame(ego_tail['tail 3']), x='x', y='y',
-            #             fill=True, cmap='Reds', alpha=0.5, label='Point C',
-            #             thresh=0.001,  # Avoid clipping at 0
-            #             levels=20,
-            #             norm=LogNorm()
-            #             )
-            # plt.axhline(0, color='black', lw=1, ls='--', label='y = 0')
-            # plt.axvline(0, color='black', lw=1, ls='--', label='x = 0')
-            #
-            # plt.title('Density Distribution of Aligned Points B and C')
-            # plt.xlabel('Aligned B X')
-            # plt.ylabel('Aligned B Y / Aligned C Y')
-            # plt.axhline(0, color='black', lw=0.5, ls='--')
-            # plt.axvline(0, color='black', lw=0.5, ls='--')
-            # plt.legend()
-            # plt.grid()
-            # plt.show()
-            # with open(savedatapath, 'wb') as f:
-            #     pickle.dump(self.stride, self. f)
-            # f.close()
-        else:
-            print("Analysis already done")
-            return np.nan
-
-    def get_result(self):
-
-        # go over the behavior result and get time before fell
-        x=1
-        rodData = read_rotarod_csv()
-
-    def get_angular_velocity_running(self, t, savefigpath):
-        # calculate angular velocity with running window t
-        savedatapath = os.path.join(self.analysis, 'angular_velocity_running.pickle')
-
-        if not os.path.exists(savedatapath):
-            self.angVel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
-            self.headAngVel_running = np.zeros((self.nFrames - 1 - t*self.fps, 1))
-
-            for ff in range(self.nFrames - 1 - t*self.fps):
-                self.angVel_running[ff] = np.nanmean(self.angVel[ff:ff+t*self.fps])
-                self.headAngVel_running[ff] = np.nanmean(self.headAngVel[ff:ff+t*self.fps])
-
-            # plot the velocity here
-            angPlot = StartPlots()
-            x = np.arange(len(self.angVel_running)) / self.fps
-            angPlot.ax.plot(x, self.angVel_running.flatten())
-            angPlot.ax.set_ylabel('Angular velocity')
-            ax2 = angPlot.ax.twinx()
-            ax2.plot(x, self.headAngVel_running.flatten(), color='red')
-            ax2.set_ylabel('Head angular velocity', color='red')
-            angPlot.ax.set_xlabel('Time (s)')
-
-            angPlot.save_plot('Running angular vel.tiff', 'tiff', savefigpath)
-            plt.close(angPlot.fig)
-
-            angVel_running = self.angVel_running
-            headAngVel_running = self.headAngVel_running
-            with open (savedatapath, 'wb') as f:
-                pickle.dump([angVel_running,headAngVel_running], f)
-            f.close()
-        else:
-            with open(savedatapath, 'rb') as f:
-                self.angVel_running, self.headAngVel_running = pickle.load(f)
-            f.close()
-
-    def get_angle(self, v1, v2):
-        # get angle between two vectors
-            v1_u = self.unit_vector(v1)
-            v2_u = self.unit_vector(v2)
-
-            angle = np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0))
-            if v1[0] * v2[1] - v1[1] * v2[0] < 0:
-                angle = -angle
-            return angle
-
-    def plot_keypoints(self, nFrame):
-        bodyparts = self.data['bodyparts']
-        skeleton = [
-            ['nose', 'head'],
-            ['head', 'left ear'],
-            ['head', 'right ear'],
-            ['head', 'spine 1'],
-            ['spine 1', 'left hand'],
-            ['spine 1', 'right hand'],
-            ['spine 1', 'spine 2'],
-            ['spine 2', 'spine 3'],
-            ['spine 3', 'left foot'],
-            ['spine 3', 'right foot'],
-            ['spine 3', 'tail 1'],
-            ['tail 1', 'tail 2'],
-            ['tail 2', 'tail 3']
-        ]
-        image = read_video(self.videoPath, nFrame, ifgray=True)
-        plt.imshow(image)
-        for bd in bodyparts:
-            plt.scatter(self.data[bd]['x'][nFrame], self.data[bd]['y'][nFrame])
-        for sk in skeleton:
-            plt.plot([self.data[sk[0]]['x'][nFrame],self.data[sk[1]['x'][nFrame]]], [self.data[sk[0]]['y'][nFrame],self.data[sk[1]['y'][nFrame]]])
-
-        plt.show()
-
-    def unit_vector(self, v):
-        """ Returns the unit vector of the vector.  """
-        return v / np.linalg.norm(v)
 
 
 if __name__ == "__main__":
