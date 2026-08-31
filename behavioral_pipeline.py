@@ -18,6 +18,8 @@ import matplotlib
 #matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
 plt.ion()
+import seaborn as sns
+
 from matplotlib.collections import LineCollection
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
@@ -51,7 +53,66 @@ class BehData:
         self.data = os.path.join(self.root_path, 'Data')
         self.analysis = os.path.join(self.root_path, 'Analysis')
         self.summary = os.path.join(self.root_path, 'Summary')
-        self.AnimalInfo = pd.read_csv(os.path.join(self.data, 'AnimalList.csv'))
+
+        animal_list_xlsx = os.path.join(
+            self.data,
+            'AnimalList.xlsx'
+        )
+
+        animal_list_csv = os.path.join(
+            self.data,
+            'AnimalList.csv'
+        )
+
+        if os.path.exists(animal_list_xlsx):
+
+            self.AnimalInfo = pd.read_excel(
+                animal_list_xlsx,
+                engine='openpyxl'
+            )
+
+            print(
+                "Loaded AnimalList.xlsx"
+            )
+
+        elif os.path.exists(animal_list_csv):
+
+            # Backward compatibility:
+            # some older AnimalList.csv files were actually
+            # Excel .xlsx files with the wrong extension.
+            with open(
+                animal_list_csv,
+                'rb'
+            ) as f:
+                file_head = f.read(4)
+
+            if file_head.startswith(b'PK'):
+
+                self.AnimalInfo = pd.read_excel(
+                    animal_list_csv,
+                    engine='openpyxl'
+                )
+
+                print(
+                    "Loaded AnimalList.csv as Excel file"
+                )
+
+            else:
+
+                self.AnimalInfo = pd.read_csv(
+                    animal_list_csv
+                )
+
+                print(
+                    "Loaded AnimalList.csv"
+                )
+
+        else:
+
+            raise FileNotFoundError(
+                f"Could not find AnimalList.xlsx or AnimalList.csv in {self.data}"
+            )
+
         self.Animals = [str(x) for x in self.AnimalInfo['AnimalID']]
         self.Genotypes = self.AnimalInfo['Genotype']
         if 'Gender' in self.AnimalInfo.columns:
@@ -109,6 +170,11 @@ class BehDataOF(BehData):
             filePatternVideo = '*' + aa + '*.avi'
             filePatternTimeStamp = '*' + aa + '*timestamps*.csv'
             dataFolder = os.path.join(self.data, aa, 'Openfield', 'BehavioralRecording')
+            if not os.path.isdir(dataFolder):
+                print(
+                    f"Skipping {aa}: BehavioralRecording folder not found"
+                )
+                continue
             # find folders in dataFolder
             for folder in os.listdir(dataFolder):
                 if not folder == '.DS_Store':
@@ -143,7 +209,22 @@ class BehDataOF(BehData):
             filePath = self.data_index['CSV'][s]
             videoPath = self.data_index['Video'][s]
             fps = 30
-            dlc = DLCSession(filePath, videoPath, None, analysisPath, fps)
+
+            print(
+                f"Loading session {s + 1}/{self.nSessions}: "
+                f"{self.data_index['Animal'][s]} | "
+                f"{self.data_index['Age'][s]}"
+            )
+            print(f"  DLC CSV: {filePath}")
+
+            dlc = DLCSession(
+                filePath,
+                videoPath,
+                None,
+                analysisPath,
+                fps
+            )
+
             DLC_obj.append(dlc)
             if dlc.nFrames < minFrames:
                 minFrames = dlc.nFrames
@@ -162,431 +243,3134 @@ class BehDataOF(BehData):
             self.femaleIdx = np.where(self.data_index['Gender']=='F')[0]
 
     def center_analysis(self, savefigpath):
-        centerMat = np.full((self.minFrames, self.nSubjects), np.nan)
-        runningAve_center = np.full((self.minFrames, self.nSubjects), np.nan)
-        numCrossMat = np.full((self.minFrames, self.nSubjects), np.nan)
-        plotT = np.arange(self.minFrames)/self.fps
-        for idx, obj in enumerate(self.data['DLC_obj']):
-            savefigFolder = os.path.join(self.analysisFolder, self.Animals[idx])
-            if not os.path.exists(savefigFolder):
-                os.makedirs(savefigFolder)
-            obj.moving_trace(savefigFolder)
-            obj.get_time_in_center()
-            t = 5*60
-            obj.plot_distance_to_center(t, savefigFolder)
-            centerMat[:,idx] = obj.cumu_time_center[0:self.minFrames]
-            numCrossMat[:, idx] = obj.num_cross[0:self.minFrames]
-            if idx==0:
-                nbins = len(obj.dist_center_bins[1])
-                centerDistMat = np.full((nbins-1, self.nSubjects), np.nan)
-                centerDistMat30 = np.full((nbins - 1, self.nSubjects), np.nan)
-            centerDistMat[:,idx] = obj.dist_center_bins[0]
-            centerDistMat30[:,idx] = obj.dist_center_bins_30[0]
+        """
+        Open-field center analysis.
 
-            runningAve_center[0: len(obj.dist_center_running), idx]=obj.dist_center_running.flatten()
+        Arena definition:
+        - Arena floor is manually annotated for each recording.
+        - Animal position is defined by the DLC 'tail 1' keypoint.
+        - Center zone is the middle 50% x 50% of the annotated arena.
 
-        WTColor = (255 / 255, 189 / 255, 53 / 255)
-        MutColor = (63 / 255, 167 / 255, 150 / 255)
-        # save centerMat result
+        Scalar metrics:
+        1. Time spent in center
+        2. Percent time in center
+        3. Number of center crossings
+        4. Distance traveled in center
+        5. Percent distance traveled in center
 
-        # total time in the center
-        totalCenter = centerMat[-1,:]
-        totalCross = numCrossMat[-1,:]
-        # violin plot
-        custom_palette = {0: WTColor, 1: MutColor}
-        ax=sns.violinplot(data=[totalCenter[self.WTIdx], totalCenter[self.MutIdx]],palette=custom_palette)
-        ax.set_xticklabels(['WT', 'Mut'])
-        ax.set_ylabel('Total time in the center')
-        ax.set_xlabel('Group')
-        ax.set_title('Total time in the center')
-        plt.savefig(savefigpath + '\\violin_center_time.png', dpi=300)
-        plt.savefig(savefigpath + '\\violin_center_time.svg', dpi=300)
-        plt.close()
+        Every metric is plotted for Allsex, Male, and Female,
+        both age-pooled (WT vs HET) and age-stratified when applicable.
 
-        ax=sns.violinplot(data=[totalCross[self.WTIdx], totalCross[self.MutIdx]],palette=custom_palette)
-        ax.set_xticklabels(['WT', 'Mut'])
-        ax.set_ylabel('Total cross time')
-        ax.set_xlabel('Group')
-        ax.set_title('Total cross time')
-        plt.savefig(savefigpath + '/violin_cross_time.png', dpi=300)
-        plt.savefig(savefigpath + '/violin_cross_time.svg', dpi=300)
-        plt.close()
+        Curve / distribution metrics:
+        1. Cumulative time spent in center
+        2. Distribution of distance from center
+        3. Distribution of distance from center during first 30 min
+        4. Time spent in center in running 5-min windows
+        5. Cumulative number of center crossings
+        """
 
-        data = {'animalID':self.Animals,
-                'timeinCenter': totalCenter,
-                'crossTime': totalCross}
-        data = pd.DataFrame(data)
-        data.to_csv(savefigpath + '/timeinCenter.csv')
+        import re
+        import warnings
 
-        # WTBoot = bootstrap(centerMat[:, self.WTIdx], 1,
-        #                        centerMat[:, self.WTIdx].shape[0])
-        # MutBoot = bootstrap(centerMat[:, self.MutIdx], 1,
-        #                         centerMat[:, self.MutIdx].shape[0])
-        # WTColor = (255 / 255, 189 / 255, 53 / 255)
-        # MutColor = (63 / 255, 167 / 255, 150 / 255)
-        #
-        # binX = (obj.dist_center_bins[1][0:-1] + obj.dist_center_bins[1][1:]) / 2
-        #
-        # for ss in ['male','female','allsex']:
-        #     # plot distance
-        #     self.plot_movement_results(centerMat,plotT,savefigpath,
-        #                                'Time spent in the center', ss,
-        #                                ['WT', 'Mut'],WTColor, MutColor)
-        #     self.plot_movement_results(centerDistMat,binX,savefigpath,
-        #                                'Distribution of distance from center', ss,
-        #                                ['WT', 'Mut'],WTColor, MutColor)
-        #     self.plot_movement_results(centerDistMat30,binX,savefigpath,
-        #                                'Distribution of distance from center 30 mins', ss,
-        #                                ['WT', 'Mut'],WTColor, MutColor)
-        #     self.plot_movement_results(runningAve_center,plotT,savefigpath,
-        #                                'Time spent in the center in running 5 mins windows', ss,
-        #                                ['WT', 'Mut'],WTColor, MutColor)
-        #     self.plot_movement_results(numCrossMat,plotT,savefigpath,
-        #                                'Num of crossings', ss,
-        #                                ['WT', 'Mut'],WTColor, MutColor)
+        os.makedirs(savefigpath, exist_ok=True)
 
-        # KS test
-        # from scipy.stats import ks_2samp
-        # WTMale = centerDistMat30[:,  list(set(self.WTIdx) & set(self.maleIdx))]
-        # MutMale = centerDistMat30[:,  list(set(self.MutIdx) & set(self.maleIdx))]
-        # WTFemale = centerDistMat30[:,  list(set(self.WTIdx) & set(self.femaleIdx))]
-        # MutFemale = centerDistMat30[:,  list(set(self.MutIdx) & set(self.femaleIdx))]
-        # # Assuming you have two arrays of data: data1 and data2
-        # # Perform the KS test
-        # statistic, p_value = ks_2samp(WTMaleBoot['bootAve'], MutMaleBoot['bootAve'])
+        # ============================================================
+        # Basic dimensions
+        # ============================================================
+
+        first_obj = self.data_index['DLC_obj'].iloc[0]
+        fps = float(first_obj.fps)
+
+        plotT = np.arange(self.minFrames) / fps
+
+        # ============================================================
+        # Time-series matrices
+        # ============================================================
+
+        # Cumulative center time (seconds)
+        centerMat = np.full(
+            (self.minFrames, self.nSubjects),
+            np.nan
+        )
+
+        # Time spent in center during each running 5-min window (seconds)
+        runningCenterTimeMat = np.full(
+            (self.minFrames, self.nSubjects),
+            np.nan
+        )
+
+        # Cumulative number of center-boundary crossings
+        numCrossMat = np.full(
+            (self.minFrames, self.nSubjects),
+            np.nan
+        )
+
+        # ============================================================
+        # Scalar metrics
+        # ============================================================
+
+        timeInCenter = np.full(
+            self.nSubjects,
+            np.nan
+        )
+
+        percentCenterTime = np.full(
+            self.nSubjects,
+            np.nan
+        )
+
+        centerCrossings = np.full(
+            self.nSubjects,
+            np.nan
+        )
+
+        centerDistance = np.full(
+            self.nSubjects,
+            np.nan
+        )
+
+        percentCenterDistance = np.full(
+            self.nSubjects,
+            np.nan
+        )
+
+        # Total distance is calculated here both for
+        # percentCenterDistance and for compatibility with the
+        # previous center-analysis summary output.
+        totalDistanceForRatio = np.full(
+            self.nSubjects,
+            np.nan
+        )
+
+        # ============================================================
+        # Distance-from-center distribution
+        # ============================================================
+
+        # Keep the same distance range as the previous implementation.
+        distEdges = np.linspace(
+            0,
+            1200,
+            101
+        )
+
+        distCenters = (
+            distEdges[:-1]
+            + distEdges[1:]
+        ) / 2
+
+        centerDistMat = np.full(
+            (
+                len(distCenters),
+                self.nSubjects
+            ),
+            np.nan
+        )
+
+        centerDistMat30 = np.full(
+            (
+                len(distCenters),
+                self.nSubjects
+            ),
+            np.nan
+        )
+
+        # ============================================================
+        # Helper functions
+        # ============================================================
+
+        def genotype_label(idx):
+            """
+            Standardize genotype display to WT / HET.
+            """
+
+            genotype = str(
+                self.data_index.iloc[idx]['Genotype']
+            ).strip().upper()
+
+            if genotype == 'WT':
+                return 'WT'
+
+            if genotype == 'HET':
+                return 'HET'
+
+            return None
+
+
+        def age_group(idx):
+            """
+            Standardized age groups:
+
+            P15  = P15
+            P30  = P29-P35
+            P60+ = P60 and older
+            """
+
+            row = self.data_index.iloc[idx]
+
+            # --------------------------------------------------------
+            # First use AgeGroup if available.
+            # --------------------------------------------------------
+            if 'AgeGroup' in self.data_index.columns:
+
+                value = str(
+                    row['AgeGroup']
+                ).strip().upper()
+
+                if value == 'P15':
+                    return 'P15'
+
+                if value in [
+                    'P30',
+                    'P29-P35',
+                    'P29–P35'
+                ]:
+                    return 'P30'
+
+                if value in [
+                    'P60+',
+                    'P60',
+                    'ADULT'
+                ]:
+                    return 'P60+'
+
+            # --------------------------------------------------------
+            # Otherwise use Age.
+            # --------------------------------------------------------
+            if 'Age' in self.data_index.columns:
+
+                value = str(
+                    row['Age']
+                ).strip()
+
+                match = re.search(
+                    r'[pP]?(\d+)',
+                    value
+                )
+
+                if match:
+
+                    age = int(
+                        match.group(1)
+                    )
+
+                    if age == 15:
+                        return 'P15'
+
+                    if 29 <= age <= 35:
+                        return 'P30'
+
+                    if age >= 60:
+                        return 'P60+'
+
+            # --------------------------------------------------------
+            # Final fallback: extract Pxx from file/path strings.
+            # --------------------------------------------------------
+            for col in [
+                'Video',
+                'CSV',
+                'Timestamp',
+                'AnalysisPath'
+            ]:
+
+                if col not in self.data_index.columns:
+                    continue
+
+                value = str(
+                    row[col]
+                )
+
+                match = re.search(
+                    r'[pP](\d+)',
+                    value
+                )
+
+                if match:
+
+                    age = int(
+                        match.group(1)
+                    )
+
+                    if age == 15:
+                        return 'P15'
+
+                    if 29 <= age <= 35:
+                        return 'P30'
+
+                    if age >= 60:
+                        return 'P60+'
+
+            return None
+
+
+        def get_group_indices(target_age=None, sex_group='allsex'):
+            """
+            Return WT and HET subject indices.
+
+            If target_age is supplied, restrict subjects
+            to that age group.
+            """
+
+            wt_idx = []
+            het_idx = []
+
+            for idx in range(self.nSubjects):
+
+                genotype = genotype_label(idx)
+
+                if genotype not in [
+                    'WT',
+                    'HET'
+                ]:
+                    continue
+
+                if sex_group != 'allsex':
+
+                    sex_value = str(
+                        self.data_index.iloc[idx]['Gender']
+                    ).strip().upper()
+
+                    target_sex = (
+                        'M'
+                        if sex_group == 'male'
+                        else 'F'
+                    )
+
+                    if sex_value != target_sex:
+                        continue
+
+                if target_age is not None:
+
+                    if age_group(idx) != target_age:
+                        continue
+
+                if genotype == 'WT':
+
+                    wt_idx.append(idx)
+
+                elif genotype == 'HET':
+
+                    het_idx.append(idx)
+
+            return (
+                np.asarray(
+                    wt_idx,
+                    dtype=int
+                ),
+                np.asarray(
+                    het_idx,
+                    dtype=int
+                )
+            )
+
+
+        def bootstrap_curve(
+            matrix,
+            indices,
+            n_boot=500
+        ):
+            """
+            Bootstrap animals to obtain group mean
+            and 95% confidence interval.
+            """
+
+            if len(indices) == 0:
+
+                empty = np.full(
+                    matrix.shape[0],
+                    np.nan
+                )
+
+                return (
+                    empty,
+                    empty,
+                    empty
+                )
+
+            values = matrix[
+                :,
+                indices
+            ]
+
+            with warnings.catch_warnings():
+
+                warnings.simplefilter(
+                    'ignore',
+                    category=RuntimeWarning
+                )
+
+                group_mean = np.nanmean(
+                    values,
+                    axis=1
+                )
+
+            rng = np.random.default_rng(
+                12345
+            )
+
+            boot = np.full(
+                (
+                    n_boot,
+                    matrix.shape[0]
+                ),
+                np.nan
+            )
+
+            for bb in range(n_boot):
+
+                sample_idx = rng.integers(
+                    0,
+                    values.shape[1],
+                    size=values.shape[1]
+                )
+
+                with warnings.catch_warnings():
+
+                    warnings.simplefilter(
+                        'ignore',
+                        category=RuntimeWarning
+                    )
+
+                    boot[
+                        bb,
+                        :
+                    ] = np.nanmean(
+                        values[
+                            :,
+                            sample_idx
+                        ],
+                        axis=1
+                    )
+
+            with warnings.catch_warnings():
+
+                warnings.simplefilter(
+                    'ignore',
+                    category=RuntimeWarning
+                )
+
+                boot_low = np.nanpercentile(
+                    boot,
+                    2.5,
+                    axis=0
+                )
+
+                boot_high = np.nanpercentile(
+                    boot,
+                    97.5,
+                    axis=0
+                )
+
+            return (
+                group_mean,
+                boot_low,
+                boot_high
+            )
+
+
+        # Keep the existing WT / mutant colors.
+        WTColor = (
+            255 / 255,
+            189 / 255,
+            53 / 255
+        )
+
+        HETColor = (
+            63 / 255,
+            167 / 255,
+            150 / 255
+        )
+
+
+        def add_group_curve(
+            ax,
+            matrix,
+            x,
+            indices,
+            label,
+            color
+        ):
+            """
+            Add mean curve and bootstrap 95% CI.
+            """
+
+            if len(indices) == 0:
+                return
+
+            mean_curve, low, high = (
+                bootstrap_curve(
+                    matrix,
+                    indices
+                )
+            )
+
+            ax.plot(
+                x,
+                mean_curve,
+                color=color,
+                linewidth=2,
+                label=(
+                    f'{label} '
+                    f'(n={len(indices)})'
+                )
+            )
+
+            ax.fill_between(
+                x,
+                low,
+                high,
+                color=color,
+                alpha=0.20,
+                linewidth=0
+            )
+
+
+
+        def metric_dir(metric_name):
+            """
+            Create / return a metric-specific folder directly under summary.
+            """
+            folder = os.path.join(
+                savefigpath,
+                metric_name
+            )
+            os.makedirs(
+                folder,
+                exist_ok=True
+            )
+            return folder
+
+
+        def sex_display_name(sex_group):
+            if sex_group == 'male':
+                return 'Male'
+            if sex_group == 'female':
+                return 'Female'
+            return 'Allsex'
+
+
+        def plot_overall(
+            matrix,
+            x,
+            title,
+            xlabel,
+            ylabel,
+            filename,
+            output_dir,
+            sex_group='allsex'
+        ):
+            """
+            All ages pooled together:
+            WT vs HET.
+
+            A separate plot is generated for:
+            - Allsex
+            - Male
+            - Female
+            """
+
+            wt_idx, het_idx = (
+                get_group_indices(
+                    sex_group=sex_group
+                )
+            )
+
+            fig, ax = plt.subplots(
+                figsize=(7, 5)
+            )
+
+            add_group_curve(
+                ax,
+                matrix,
+                x,
+                wt_idx,
+                'WT',
+                WTColor
+            )
+
+            add_group_curve(
+                ax,
+                matrix,
+                x,
+                het_idx,
+                'HET',
+                HETColor
+            )
+
+            ax.set_title(
+                f'{title} - {sex_display_name(sex_group)}'
+            )
+
+            ax.set_xlabel(
+                xlabel
+            )
+
+            ax.set_ylabel(
+                ylabel
+            )
+
+            ax.spines[
+                'top'
+            ].set_visible(False)
+
+            ax.spines[
+                'right'
+            ].set_visible(False)
+
+            if len(wt_idx) > 0 or len(het_idx) > 0:
+                ax.legend(
+                    frameon=False
+                )
+
+            fig.tight_layout()
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.png'
+                ),
+                dpi=300,
+                bbox_inches='tight'
+            )
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.svg'
+                ),
+                bbox_inches='tight'
+            )
+
+            plt.close(fig)
+
+
+        def plot_by_age(
+            matrix,
+            x,
+            title,
+            xlabel,
+            ylabel,
+            filename,
+            output_dir,
+            sex_group='allsex'
+        ):
+            """
+            P15 / P30 / P60+ in three panels.
+
+            WT vs HET within each panel.
+            A separate figure is generated for Allsex / Male / Female.
+            """
+
+            age_groups = [
+                'P15',
+                'P30',
+                'P60+'
+            ]
+
+            fig, axes = plt.subplots(
+                1,
+                3,
+                figsize=(16, 4.8),
+                sharex=True,
+                sharey=True
+            )
+
+            for ax, age_name in zip(
+                axes,
+                age_groups
+            ):
+
+                wt_idx, het_idx = (
+                    get_group_indices(
+                        target_age=age_name,
+                        sex_group=sex_group
+                    )
+                )
+
+                add_group_curve(
+                    ax,
+                    matrix,
+                    x,
+                    wt_idx,
+                    'WT',
+                    WTColor
+                )
+
+                add_group_curve(
+                    ax,
+                    matrix,
+                    x,
+                    het_idx,
+                    'HET',
+                    HETColor
+                )
+
+                ax.set_title(
+                    age_name
+                )
+
+                ax.set_xlabel(
+                    xlabel
+                )
+
+                ax.spines[
+                    'top'
+                ].set_visible(False)
+
+                ax.spines[
+                    'right'
+                ].set_visible(False)
+
+                if len(wt_idx) > 0 or len(het_idx) > 0:
+                    ax.legend(
+                        frameon=False,
+                        fontsize=9
+                    )
+
+            axes[0].set_ylabel(
+                ylabel
+            )
+
+            fig.suptitle(
+                f'{title} - {sex_display_name(sex_group)}',
+                y=1.02
+            )
+
+            fig.tight_layout()
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.png'
+                ),
+                dpi=300,
+                bbox_inches='tight'
+            )
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.svg'
+                ),
+                bbox_inches='tight'
+            )
+
+            plt.close(fig)
+
+
+        def scalar_dataframe(
+            values,
+            sex_group='allsex',
+            require_age=False
+        ):
+            """
+            Build a scalar dataframe for WT / HET subjects.
+            """
+
+            rows = []
+
+            for idx in range(self.nSubjects):
+
+                genotype = genotype_label(idx)
+                age_name = age_group(idx)
+                value = values[idx]
+
+                if genotype not in [
+                    'WT',
+                    'HET'
+                ]:
+                    continue
+
+                if sex_group != 'allsex':
+                    sex_value = str(
+                        self.data_index.iloc[idx]['Gender']
+                    ).strip().upper()
+
+                    target_sex = (
+                        'M'
+                        if sex_group == 'male'
+                        else 'F'
+                    )
+
+                    if sex_value != target_sex:
+                        continue
+
+                if require_age and age_name not in [
+                    'P15',
+                    'P30',
+                    'P60+'
+                ]:
+                    continue
+
+                if not np.isfinite(value):
+                    continue
+
+                rows.append(
+                    {
+                        'ageGroup': age_name,
+                        'genotype': genotype,
+                        'value': value
+                    }
+                )
+
+            return pd.DataFrame(
+                rows
+            )
+
+
+        def plot_scalar_overall(
+            values,
+            ylabel,
+            title,
+            filename,
+            output_dir,
+            sex_group='allsex'
+        ):
+            """
+            Scalar metric with age pooled:
+            WT vs HET.
+
+            Separate figures are generated for Allsex / Male / Female.
+            """
+
+            plot_df = scalar_dataframe(
+                values,
+                sex_group=sex_group,
+                require_age=False
+            )
+
+            if plot_df.empty:
+                print(
+                    f'Warning: no valid data for {title} '
+                    f'({sex_group})'
+                )
+                return
+
+            fig, ax = plt.subplots(
+                figsize=(5.5, 6)
+            )
+
+            palette = {
+                'WT': WTColor,
+                'HET': HETColor
+            }
+
+            sns.boxplot(
+                data=plot_df,
+                x='genotype',
+                y='value',
+                order=[
+                    'WT',
+                    'HET'
+                ],
+                palette=palette,
+                showfliers=False,
+                ax=ax
+            )
+
+            sns.stripplot(
+                data=plot_df,
+                x='genotype',
+                y='value',
+                order=[
+                    'WT',
+                    'HET'
+                ],
+                palette=palette,
+                size=5,
+                alpha=0.85,
+                linewidth=0.4,
+                edgecolor='black',
+                ax=ax
+            )
+
+            counts = (
+                plot_df
+                .groupby(
+                    'genotype'
+                )
+                .size()
+            )
+
+            labels = []
+            for genotype in [
+                'WT',
+                'HET'
+            ]:
+                labels.append(
+                    f'{genotype} (n={int(counts.get(genotype, 0))})'
+                )
+
+            ax.set_xticks(
+                [0, 1]
+            )
+            ax.set_xticklabels(
+                labels
+            )
+
+            ax.set_xlabel(
+                'Genotype'
+            )
+
+            ax.set_ylabel(
+                ylabel
+            )
+
+            ax.set_title(
+                f'{title} - {sex_display_name(sex_group)}'
+            )
+
+            ax.spines[
+                'top'
+            ].set_visible(False)
+
+            ax.spines[
+                'right'
+            ].set_visible(False)
+
+            fig.tight_layout()
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.png'
+                ),
+                dpi=300,
+                bbox_inches='tight'
+            )
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.svg'
+                ),
+                bbox_inches='tight'
+            )
+
+            plt.close(fig)
+
+
+        def plot_scalar_by_age(
+            values,
+            ylabel,
+            title,
+            filename,
+            output_dir,
+            sex_group='allsex'
+        ):
+            """
+            Scalar metric:
+
+            P15 / P30 / P60+ on the x-axis,
+            with WT and HET boxplots + individual animals.
+
+            Separate figures are generated for Allsex / Male / Female.
+            """
+
+            plot_df = scalar_dataframe(
+                values,
+                sex_group=sex_group,
+                require_age=True
+            )
+
+            if plot_df.empty:
+
+                print(
+                    f'Warning: no valid data for {title} '
+                    f'({sex_group})'
+                )
+
+                return
+
+            fig, ax = plt.subplots(
+                figsize=(8, 6)
+            )
+
+            palette = {
+                'WT': WTColor,
+                'HET': HETColor
+            }
+
+            sns.boxplot(
+                data=plot_df,
+                x='ageGroup',
+                y='value',
+                hue='genotype',
+                order=[
+                    'P15',
+                    'P30',
+                    'P60+'
+                ],
+                hue_order=[
+                    'WT',
+                    'HET'
+                ],
+                palette=palette,
+                showfliers=False,
+                ax=ax
+            )
+
+            sns.stripplot(
+                data=plot_df,
+                x='ageGroup',
+                y='value',
+                hue='genotype',
+                order=[
+                    'P15',
+                    'P30',
+                    'P60+'
+                ],
+                hue_order=[
+                    'WT',
+                    'HET'
+                ],
+                palette=palette,
+                dodge=True,
+                size=5,
+                alpha=0.85,
+                linewidth=0.4,
+                edgecolor='black',
+                legend=False,
+                ax=ax
+            )
+
+            ax.set_xlabel(
+                'Age group'
+            )
+
+            ax.set_ylabel(
+                ylabel
+            )
+
+            ax.set_title(
+                f'{title} - {sex_display_name(sex_group)}'
+            )
+
+            ax.spines[
+                'top'
+            ].set_visible(False)
+
+            ax.spines[
+                'right'
+            ].set_visible(False)
+
+            ax.legend(
+                title='Genotype',
+                frameon=False
+            )
+
+            fig.tight_layout()
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.png'
+                ),
+                dpi=300,
+                bbox_inches='tight'
+            )
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.svg'
+                ),
+                bbox_inches='tight'
+            )
+
+            plt.close(fig)
+
+        # ============================================================
+        # Process every recording
+        # ============================================================
+
+        for idx, obj in enumerate(
+            self.data_index['DLC_obj']
+        ):
+
+            savefigFolder = os.path.join(
+                savefigpath,
+                str(self.Animals[idx])
+            )
+
+            os.makedirs(
+                savefigFolder,
+                exist_ok=True
+            )
+
+            # ========================================================
+            # Load manually annotated arena coordinates
+            # ========================================================
+
+            arena_csv = os.path.join(
+                savefigFolder,
+                'arena_coordinates.csv'
+            )
+
+            if not os.path.exists(
+                arena_csv
+            ):
+
+                raise FileNotFoundError(
+                    f"Arena coordinates not found for "
+                    f"animal {self.Animals[idx]}: "
+                    f"{arena_csv}. "
+                    f"Please annotate the arena first."
+                )
+
+            arena_df = pd.read_csv(
+                arena_csv
+            )
+
+            ul = np.array(
+                eval(
+                    arena_df[
+                        'upper left'
+                    ].iloc[0]
+                ),
+                dtype=float
+            )
+
+            ur = np.array(
+                eval(
+                    arena_df[
+                        'upper right'
+                    ].iloc[0]
+                ),
+                dtype=float
+            )
+
+            lr = np.array(
+                eval(
+                    arena_df[
+                        'lower right'
+                    ].iloc[0]
+                ),
+                dtype=float
+            )
+
+            ll = np.array(
+                eval(
+                    arena_df[
+                        'lower left'
+                    ].iloc[0]
+                ),
+                dtype=float
+            )
+
+            obj.arena = {
+                'upper left': tuple(ul),
+                'upper right': tuple(ur),
+                'lower right': tuple(lr),
+                'lower left': tuple(ll)
+            }
+
+            # ========================================================
+            # Animal position = tail 1
+            # ========================================================
+
+            x = np.asarray(
+                obj.data[
+                    'tail 1'
+                ]['x']
+            ).flatten()
+
+            y = np.asarray(
+                obj.data[
+                    'tail 1'
+                ]['y']
+            ).flatten()
+
+            nFrames = min(
+                len(x),
+                len(y),
+                self.minFrames
+            )
+
+            # ========================================================
+            # Center zone
+            #
+            # Middle 50% x 50% of manually annotated arena.
+            # ========================================================
+
+            c_ul = (
+                ul
+                + 0.25 * (ur - ul)
+                + 0.25 * (ll - ul)
+            )
+
+            c_ur = (
+                ul
+                + 0.75 * (ur - ul)
+                + 0.25 * (ll - ul)
+            )
+
+            c_lr = (
+                ul
+                + 0.75 * (ur - ul)
+                + 0.75 * (ll - ul)
+            )
+
+            c_ll = (
+                ul
+                + 0.25 * (ur - ul)
+                + 0.75 * (ll - ul)
+            )
+
+            center_poly = np.array(
+                [
+                    c_ul,
+                    c_ur,
+                    c_lr,
+                    c_ll
+                ],
+                dtype=np.float32
+            )
+
+            # ========================================================
+            # Determine whether animal is inside center
+            # ========================================================
+
+            time_in_center = np.zeros(
+                nFrames,
+                dtype=bool
+            )
+
+            for ff in range(
+                nFrames
+            ):
+
+                if (
+                    np.isfinite(x[ff])
+                    and np.isfinite(y[ff])
+                ):
+
+                    time_in_center[
+                        ff
+                    ] = (
+                        cv2.pointPolygonTest(
+                            center_poly,
+                            (
+                                float(x[ff]),
+                                float(y[ff])
+                            ),
+                            False
+                        )
+                        >= 0
+                    )
+
+            obj.time_in_center = (
+                time_in_center
+            )
+
+            # ========================================================
+            # Cumulative time spent in center
+            # ========================================================
+
+            obj.cumu_time_center = (
+                np.cumsum(
+                    time_in_center
+                )
+                / obj.fps
+            )
+
+            centerMat[
+                :nFrames,
+                idx
+            ] = obj.cumu_time_center[
+                :nFrames
+            ]
+
+            timeInCenter[
+                idx
+            ] = (
+                np.sum(
+                    time_in_center
+                )
+                / obj.fps
+            )
+
+            total_time_s = (
+                nFrames
+                / obj.fps
+            )
+
+            if total_time_s > 0:
+
+                percentCenterTime[
+                    idx
+                ] = (
+                    100
+                    * timeInCenter[idx]
+                    / total_time_s
+                )
+
+            # ========================================================
+            # Center crossings
+            #
+            # Counts every center-boundary transition.
+            # ========================================================
+
+            center_change = np.diff(
+                time_in_center.astype(int)
+            )
+
+            obj.num_cross = np.insert(
+                np.cumsum(
+                    center_change != 0
+                ),
+                0,
+                0
+            )
+
+            numCrossMat[
+                :nFrames,
+                idx
+            ] = obj.num_cross[
+                :nFrames
+            ]
+
+            if nFrames > 0:
+
+                centerCrossings[
+                    idx
+                ] = obj.num_cross[
+                    nFrames - 1
+                ]
+
+            # ========================================================
+            # Movement distance
+            # ========================================================
+
+            obj.get_movement()
+
+            dist = np.asarray(
+                obj.dist,
+                dtype=float
+            ).flatten()
+
+            # dist[k] = movement from frame k to frame k+1.
+            nDist = min(
+                len(dist),
+                nFrames - 1
+            )
+
+            if nDist > 0:
+
+                dist_use = dist[
+                    :nDist
+                ]
+
+                center_seg = time_in_center[
+                    :nDist
+                ]
+
+                totalDistanceForRatio[
+                    idx
+                ] = np.nansum(
+                    dist_use
+                )
+
+                centerDistance[
+                    idx
+                ] = np.nansum(
+                    dist_use[
+                        center_seg
+                    ]
+                )
+
+                if (
+                    totalDistanceForRatio[idx]
+                    > 0
+                ):
+
+                    percentCenterDistance[
+                        idx
+                    ] = (
+                        100
+                        * centerDistance[idx]
+                        / totalDistanceForRatio[idx]
+                    )
+
+            # ========================================================
+            # Distance from arena center
+            # ========================================================
+
+            arena_center = (
+                ul
+                + ur
+                + lr
+                + ll
+            ) / 4
+
+            obj.dist_center = np.sqrt(
+                (
+                    x[:nFrames]
+                    - arena_center[0]
+                ) ** 2
+                +
+                (
+                    y[:nFrames]
+                    - arena_center[1]
+                ) ** 2
+            )
+
+            # --------------------------------------------------------
+            # Full analyzed recording
+            # --------------------------------------------------------
+
+            valid_dist = obj.dist_center[
+                np.isfinite(
+                    obj.dist_center
+                )
+            ]
+
+            if valid_dist.size > 0:
+
+                counts, _ = np.histogram(
+                    valid_dist,
+                    bins=distEdges
+                )
+
+                if counts.sum() > 0:
+
+                    centerDistMat[
+                        :,
+                        idx
+                    ] = (
+                        counts
+                        / counts.sum()
+                        * 100
+                    )
+
+            # --------------------------------------------------------
+            # First 30 min
+            # --------------------------------------------------------
+
+            n30 = min(
+                nFrames,
+                int(
+                    30
+                    * 60
+                    * obj.fps
+                )
+            )
+
+            dist_30 = obj.dist_center[
+                :n30
+            ]
+
+            valid_dist_30 = dist_30[
+                np.isfinite(
+                    dist_30
+                )
+            ]
+
+            if valid_dist_30.size > 0:
+
+                counts, _ = np.histogram(
+                    valid_dist_30,
+                    bins=distEdges
+                )
+
+                if counts.sum() > 0:
+
+                    centerDistMat30[
+                        :,
+                        idx
+                    ] = (
+                        counts
+                        / counts.sum()
+                        * 100
+                    )
+
+            # ========================================================
+            # Time spent in center in running 5-min windows
+            #
+            # IMPORTANT:
+            # The previous implementation calculated mean distance
+            # from arena center here. This version correctly calculates
+            # center occupancy time in each 5-min window.
+            # ========================================================
+
+            window_sec = 5 * 60
+
+            window_frames = int(
+                round(
+                    window_sec
+                    * obj.fps
+                )
+            )
+
+            if (
+                window_frames > 0
+                and nFrames >= window_frames
+            ):
+
+                center_int = (
+                    time_in_center.astype(
+                        np.int64
+                    )
+                )
+
+                cumulative = np.concatenate(
+                    (
+                        [0],
+                        np.cumsum(
+                            center_int
+                        )
+                    )
+                )
+
+                window_counts = (
+                    cumulative[
+                        window_frames:
+                    ]
+                    -
+                    cumulative[
+                        :-window_frames
+                    ]
+                )
+
+                running_center_time = (
+                    window_counts
+                    / obj.fps
+                )
+
+                n_running = min(
+                    len(
+                        running_center_time
+                    ),
+                    self.minFrames
+                )
+
+                runningCenterTimeMat[
+                    :n_running,
+                    idx
+                ] = running_center_time[
+                    :n_running
+                ]
+
+                obj.center_time_running = (
+                    running_center_time
+                )
+
+            else:
+
+                obj.center_time_running = (
+                    np.array(
+                        [],
+                        dtype=float
+                    )
+                )
+
+
+        # ============================================================
+        # Save / organize center-analysis outputs
         #
-        # from scipy.stats import permutation_test
-        # res = permutation_test((WTMale.T,MutMale.T), ks_2samp)
-        #
-        # # Print the test statistic and p-value
-        # print("KS statistic:", statistic)
-        # print("p-value:", p_value)
-        # # two-way ANOVA for centerDistMat30
-        # gene_anova_male = []
-        # dist_anova_male = []
-        # response_anova_male = []
-        # subject_male = []
-        # gene_anova_female = []
-        # dist_anova_female = []
-        # subject_female = []
-        # response_anova_female = []
-        #
-        # for t in range(len(self.GeneBG)):
-        #     for s in range(len(binX)):
-        #         if self.Sex[t] == 'M':
-        #             response_anova_male.append(centerDistMat30[s,t])
-        #             gene_anova_male.append(self.GeneBG[t])
-        #             dist_anova_male.append(binX[s])
-        #             subject_male.append(self.animals[t])
-        #         else:
-        #             response_anova_female.append(centerDistMat30[s,t])
-        #             gene_anova_female.append(self.GeneBG[t])
-        #             dist_anova_female.append(binX[s])
-        #             subject_female.append(self.animals[t])
-        #
-        # anova_data = pd.DataFrame({'gene': gene_anova_male,
-        #                            'dist': dist_anova_male,
-        #                            'response': response_anova_male,
-        #                            'subject': subject_male
-        #                            })
-        # model = ols('response ~ gene + dist + gene:dist', anova_data).fit()
-        # anova_table = sm.stats.anova_lm(model, typ=3)
-        # # print ANOVA table
-        # print(anova_table)
-        #
-        # # three way anova?
-        # gene_anova = []
-        # dist_anova = []
-        # response_anova = []
-        # subject = []
-        # sex = []
-        #
-        #
-        # for t in range(len(self.GeneBG)):
-        #     for s in range(len(binX)):
-        #         response_anova.append(centerDistMat30[s,t])
-        #         gene_anova.append(self.GeneBG[t])
-        #         dist_anova.append(binX[s])
-        #         subject.append(self.animals[t])
-        #         sex.append(self.Sex[t])
-        #
-        # anova_data = pd.DataFrame({'gene': gene_anova,
-        #                            'dist': dist_anova,
-        #                            'response': response_anova,
-        #                            'sex': sex,
-        #                            'subject': subject
-        #                            })
-        # model = ols('response ~ gene + dist + sex + gene:dist + gene:sex + dist:sex + dist:sex:gene', anova_data).fit()
-        # anova_table = sm.stats.anova_lm(model, typ=3)
-        # # print ANOVA table
-        # print(anova_table)
-        #
-        #
-        # distPlot = StartPlots()
-        # distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
-        # distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
-        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='KO')
-        # distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
-        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.set_xlabel('Time (s)')
-        # distPlot.ax.set_ylabel('Time spent in the center (s)')
-        # distPlot.legend(['WT', 'KO'])
-        # # save the plot
-        # distPlot.save_plot('Time spent in the center.tif', 'tif', savefigpath)
-        # distPlot.save_plot('Time spent in the center.svg', 'svg', savefigpath)
-        #
-        # # distribution of distance from center
-        # WTBoot = bootstrap(centerDistMat[:, self.WTIdx], 1,
-        #                        centerDistMat[:, self.WTIdx].shape[0])
-        # MutBoot = bootstrap(centerDistMat[:, self.MutIdx], 1,
-        #                         centerDistMat[:, self.MutIdx].shape[0])
-        # binX = (obj.dist_center_bins[1][0:-1] + obj.dist_center_bins[1][1:])/2
-        # distPlot = StartPlots()
-        # distPlot.ax.plot(binX, WTBoot['bootAve'], color=WTColor, label='WT')
-        # distPlot.ax.fill_between(binX, WTBoot['bootLow'],
-        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.plot(binX, MutBoot['bootAve'], color=MutColor, label='KO')
-        # distPlot.ax.fill_between(binX, MutBoot['bootLow'],
-        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.set_xlabel('Distance from center (px)')
-        # distPlot.ax.set_ylabel('Number of frames')
-        # distPlot.legend(['WT', 'KO'])
-        # # save the plot
-        # distPlot.save_plot('Distribution of distance from center.tif', 'tif', savefigpath)
-        # distPlot.save_plot('Distribution of distance from center.svg', 'svg', savefigpath)
-        #
-        # # plot average distance from center in running windows
-        # WTBoot = bootstrap(runningAve_center[:, self.WTIdx], 1,
-        #                        runningAve_center[:, self.WTIdx].shape[0])
-        # MutBoot = bootstrap(runningAve_center[:, self.MutIdx], 1,
-        #                         runningAve_center[:, self.MutIdx].shape[0])
-        #
-        # distPlot = StartPlots()
-        # distPlot.ax.plot(plotT, WTBoot['bootAve'], color=WTColor, label='WT')
-        # distPlot.ax.fill_between(plotT, WTBoot['bootLow'],
-        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.plot(plotT, MutBoot['bootAve'], color=MutColor, label='KO')
-        # distPlot.ax.fill_between(plotT, MutBoot['bootLow'],
-        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.set_xlabel('Time (s)')
-        # distPlot.ax.set_ylabel('Time spent in the center in running 5 mins windows (s)')
-        # distPlot.legend(['WT', 'KO'])
-        # # save the plot
-        # distPlot.save_plot('Time spent in the center in running 5 mins windows.tif', 'tif', savefigpath)
-        # distPlot.save_plot('Time spent in the center in running 5 mins windows.svg', 'svg', savefigpath)
+        # Every metric has its own folder directly under summary.
+        # ============================================================
+
+        age_labels = [
+            age_group(idx)
+            for idx in range(
+                self.nSubjects
+            )
+        ]
+
+        genotype_labels = [
+            genotype_label(idx)
+            for idx in range(
+                self.nSubjects
+            )
+        ]
+
+        center_summary = pd.DataFrame(
+            {
+                'animalID': self.Animals,
+                'genotype': genotype_labels,
+                'sex': self.data_index[
+                    'Gender'
+                ].values,
+                'ageGroup': age_labels,
+                'timeinCenter': timeInCenter,
+                'percentCenterTime': percentCenterTime,
+                'centerCrossings': centerCrossings,
+                'centerDistance': centerDistance,
+                'percentCenterDistance': percentCenterDistance,
+                'totalDistance': totalDistanceForRatio
+            }
+        )
+
+        center_summary_dir = metric_dir(
+            'Center summary'
+        )
+
+        center_summary.to_csv(
+            os.path.join(
+                center_summary_dir,
+                'center_summary.csv'
+            ),
+            index=False
+        )
+
+        # Keep the legacy filename, but place it in the Center summary folder.
+        center_summary.to_csv(
+            os.path.join(
+                center_summary_dir,
+                'timeinCenter.csv'
+            ),
+            index=False
+        )
+
+        subject_names = [
+            str(animal)
+            for animal in self.Animals
+        ]
+
+        sex_groups = [
+            'allsex',
+            'male',
+            'female'
+        ]
+
+        # ============================================================
+        # Scalar center metrics
+        # ============================================================
+
+        scalar_metrics = [
+            (
+                timeInCenter,
+                'timeinCenter',
+                'Time spent in center (s)',
+                'Time spent in center'
+            ),
+            (
+                percentCenterTime,
+                'percentCenterTime',
+                'Time spent in center (%)',
+                'Percent time spent in center'
+            ),
+            (
+                centerCrossings,
+                'centerCrossings',
+                'Number of center crossings',
+                'Number of center crossings'
+            ),
+            (
+                centerDistance,
+                'centerDistance',
+                'Distance traveled in center (px)',
+                'Distance traveled in center'
+            ),
+            (
+                percentCenterDistance,
+                'percentCenterDistance',
+                'Distance traveled in center (%)',
+                'Percent distance traveled in center'
+            )
+        ]
+
+        for values, column_name, ylabel, metric_name in scalar_metrics:
+
+            output_dir = metric_dir(
+                metric_name
+            )
+
+            metric_df = center_summary[
+                [
+                    'animalID',
+                    'genotype',
+                    'sex',
+                    'ageGroup',
+                    column_name
+                ]
+            ].copy()
+
+            metric_df.to_csv(
+                os.path.join(
+                    output_dir,
+                    metric_name.replace(' ', '_') + '.csv'
+                ),
+                index=False
+            )
+
+            for sex_group in sex_groups:
+
+                sex_label = sex_display_name(
+                    sex_group
+                ).lower()
+
+                # Age pooled: WT vs HET.
+                plot_scalar_overall(
+                    values,
+                    ylabel,
+                    metric_name,
+                    metric_name + ' - overall - ' + sex_label,
+                    output_dir,
+                    sex_group=sex_group
+                )
+
+                # P15 / P30 / P60+: WT vs HET.
+                plot_scalar_by_age(
+                    values,
+                    ylabel,
+                    metric_name,
+                    metric_name + ' - by age and genotype - ' + sex_label,
+                    output_dir,
+                    sex_group=sex_group
+                )
+
+        # ============================================================
+        # Curve / distribution center metrics
+        # ============================================================
+
+        curve_metrics = [
+            (
+                centerMat,
+                plotT,
+                'Cumulative time spent in center',
+                'Time (s)',
+                'Cumulative time spent in center (s)',
+                'CumulativeCenterTime.csv',
+                'time'
+            ),
+            (
+                centerDistMat,
+                distCenters,
+                'Distribution of distance from center',
+                'Distance from center (px)',
+                'Percentage of frames (%)',
+                'DistanceFromCenterDistribution.csv',
+                'distanceBinCenter'
+            ),
+            (
+                centerDistMat30,
+                distCenters,
+                'Distribution of distance from center - first 30 min',
+                'Distance from center (px)',
+                'Percentage of frames (%)',
+                'DistanceFromCenterDistributionFirst30min.csv',
+                'distanceBinCenter'
+            ),
+            (
+                runningCenterTimeMat,
+                plotT,
+                'Time spent in center in running 5-min windows',
+                'Time (s)',
+                'Time spent in center within 5-min window (s)',
+                'Running5minCenterTime.csv',
+                'time'
+            ),
+            (
+                numCrossMat,
+                plotT,
+                'Cumulative number of center crossings',
+                'Time (s)',
+                'Cumulative number of center crossings',
+                'CumulativeCenterCrossings.csv',
+                'time'
+            )
+        ]
+
+        for (
+            matrix,
+            x,
+            metric_name,
+            xlabel,
+            ylabel,
+            csv_name,
+            x_column_name
+        ) in curve_metrics:
+
+            output_dir = metric_dir(
+                metric_name
+            )
+
+            data = pd.DataFrame(
+                matrix,
+                columns=subject_names
+            )
+
+            if x_column_name == 'time':
+                data[x_column_name] = x
+            else:
+                data.insert(
+                    0,
+                    x_column_name,
+                    x
+                )
+
+            data.to_csv(
+                os.path.join(
+                    output_dir,
+                    csv_name
+                ),
+                index=False
+            )
+
+            for sex_group in sex_groups:
+
+                sex_label = sex_display_name(
+                    sex_group
+                ).lower()
+
+                # Age pooled, genotype only.
+                plot_overall(
+                    matrix,
+                    x,
+                    metric_name,
+                    xlabel,
+                    ylabel,
+                    metric_name + ' - overall - ' + sex_label,
+                    output_dir,
+                    sex_group=sex_group
+                )
+
+                # Age-stratified.
+                plot_by_age(
+                    matrix,
+                    x,
+                    metric_name,
+                    xlabel,
+                    ylabel,
+                    metric_name + ' - by age - ' + sex_label,
+                    output_dir,
+                    sex_group=sex_group
+                )
+
+        print(
+            'center_analysis completed successfully.'
+        )
 
     def motion_analysis(self, savefigpath=None):
+        """
+        Open-field motion analysis.
 
-        # basic analysis for motion related variables
-        # distance traveled, speed, angular velocity...
-        distanceMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
-        velocityMat = np.full((self.minFrames - 1, self.nSubjects), np.nan)
-        # in 5 mins window
-        runningAve_distance = np.full((self.minFrames - 1, self.nSubjects), np.nan)
-        runningAve_velocity = np.full((self.minFrames - 1, self.nSubjects), np.nan)
-        #
-        velEdges = np.arange(0, 1000, 10)
-        velocityDist = np.full((len(velEdges), self.nSubjects), np.nan)
-        angEdges = np.arange(-15, 15, 0.5)
-        angularDist = np.full((len(angEdges), self.nSubjects), np.nan)
-        headAngularDist = np.full((len(angEdges), self.nSubjects), np.nan)
+        Metrics:
+        1. Cumulative distance traveled
+        2. Velocity distribution
+        3. Angular velocity distribution
+        4. Distance traveled in running 5-min windows
 
-        for idx, obj in enumerate(self.data_index['DLC_obj']):
-            obj.get_movement()
-            # cumulative curve of distance travelled
-            cumu_dist = np.cumsum(obj.dist)
-            distanceMat[:, idx] = cumu_dist[0:self.minFrames - 1]
-            velocityMat[:, idx] = obj.vel[0:self.minFrames - 1, 0]
-            counts, _ = np.histogram(obj.vel, bins=velEdges)
-            velocityDist[0:-1, idx] = counts * 100 / (sum(counts))
+        For each metric:
+        - overall figures: all ages pooled, WT vs HET,
+          separately for Allsex / Male / Female
+        - by-age figures: P15, P30, P60+ in three panels,
+          separately for Allsex / Male / Female
+        - each metric is saved in its own folder under summary
+        """
 
-            obj.get_angular_velocity()
-            counts, _ = np.histogram(obj.angVel, bins=angEdges)
-            angularDist[0:-1, idx] = counts * 100 / (sum(counts))
+        import re
+        import warnings
 
-            obj.get_head_angular_velocity()
-            counts, _ = np.histogram(obj.headAngVel, bins=angEdges)
-            headAngularDist[0:-1, idx] = counts * 100 / (sum(counts))
-
-            # running windows
-            if savefigpath is None:
-                savefigFolder = self.data_index.iloc[idx]['AnalysisPath']
-            else:
-                savefigFolder = os.path.join(savefigpath, str(self.Animals[idx]))
-            os.makedirs(savefigFolder, exist_ok=True)
-            t = 5*60  # running windos of 5 mins
-            obj.get_movement_running(t, savefigFolder)
-            obj.get_angular_velocity_running(t, savefigFolder)
-
-            runningAve_distance[0:len(obj.dist_running),idx]=obj.dist_running.flatten()
-            runningAve_velocity[0:len(obj.dist_running), idx] = obj.vel_running.flatten()
-        """ make plots"""
-        """distance plot"""
-       
-        mutLabel = self.mutGene
-
-        # WTIdx = np.where(self.data['GeneBG'] == 'WT')[0]
-
-        # plot the result without considering sex info
-        # WTBoot = bootstrap(distanceMat[:, self.WTIdx], 1,
-        #                        distanceMat[:, self.WTIdx].shape[0], 500)
-        # MutBoot = bootstrap(distanceMat[:, self.MutIdx], 1,
-        #                         distanceMat[:, self.MutIdx].shape[0],500)
-        WTColor = (255 / 255, 189 / 255, 53 / 255)
-        MutColor = (63 / 255, 167 / 255, 150 / 255)
-
-        # distPlot = StartPlots()
-        # distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
-        # distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
-        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
-        # distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
-        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.set_xlabel('Time (s)')
-        # distPlot.ax.set_ylabel('Distance travelled (px)')
-        # distPlot.legend(['WT', 'KO'])
-        # # save the plot
-        # distPlot.save_plot('Distance traveled.tif', 'tif', savefigpath)
-        # distPlot.save_plot('Distance traveled.svg', 'svg', savefigpath)
-        #
-        # """velocity plot"""
-        # WTBoot = bootstrap(velocityDist[:, self.WTIdx], 1,
-        #                        velocityDist[:, self.WTIdx].shape[0])
-        # MutBoot = bootstrap(velocityDist[:, self.MutIdx], 1,
-        #                         velocityDist[:, self.MutIdx].shape[0])
-        # velPlot = StartPlots()
-        # velPlot.ax.plot(velEdges, WTBoot['bootAve'], color=WTColor, label='WT')
-        # velPlot.ax.fill_between(velEdges, WTBoot['bootLow'],
-        #                             WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        # velPlot.ax.plot(velEdges, MutBoot['bootAve'], color=MutColor, label='KO')
-        # velPlot.ax.fill_between(velEdges, MutBoot['bootLow'],
-        #                             MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        # velPlot.ax.set_xlabel('Velocity (px/s)')
-        # velPlot.ax.set_ylabel('Velocity distribution (%)')
-        # velPlot.legend(['WT', 'KO'])
-        # velPlot.save_plot('Velocity distribution.tif', 'tif', savefigpath)
-        # velPlot.save_plot('Velocity distribution.svg', 'svg', savefigpath)
-        #
-        # """ plot angular velocity distribution"""
-        # WTBoot = bootstrap(angularDist[:, self.WTIdx], 1,
-        #                        angularDist[:, self.WTIdx].shape[0])
-        # MutBoot = bootstrap(angularDist[:, self.MutIdx], 1,
-        #                         angularDist[:, self.MutIdx].shape[0])
-        #
-        # """angular velocity plot"""
-        # angPlot = StartPlots()
-        # angPlot.ax.plot(angEdges, WTBoot['bootAve'], color=WTColor, label='WT')
-        # angPlot.ax.fill_between(angEdges, WTBoot['bootLow'],
-        #                             WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        # angPlot.ax.plot(angEdges, MutBoot['bootAve'], color=MutColor, label='Mut')
-        # angPlot.ax.fill_between(angEdges, MutBoot['bootLow'],
-        #                             MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        # angPlot.ax.set_xlabel('Angular velocity (radian/s)')
-        # angPlot.ax.set_ylabel('Angular velocity distribution (%)')
-        # angPlot.legend(['WT', 'Mut'])
-        # angPlot.save_plot('Angular velocity distribution.tif', 'tif', savefigpath)
-        # angPlot.save_plot('Angular velocity distribution.svg', 'svg', savefigpath)
-        #
-        # """plot head angular velocity distribution"""
-        # WTBoot = bootstrap(headAngularDist[:, self.WTIdx], 1,
-        #                        headAngularDist[:, self.WTIdx].shape[0])
-        # MutBoot = bootstrap(headAngularDist[:, self.MutIdx], 1,
-        #                         headAngularDist[:, self.MutIdx].shape[0])
-        #
-        # angPlot = StartPlots()
-        # angPlot.ax.plot(angEdges, WTBoot['bootAve'], color=WTColor, label='WT')
-        # angPlot.ax.fill_between(angEdges, WTBoot['bootLow'],
-        #                             WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        # angPlot.ax.plot(angEdges, MutBoot['bootAve'], color=MutColor, label='Mut')
-        # angPlot.ax.fill_between(angEdges, MutBoot['bootLow'],
-        #                             MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        # angPlot.ax.set_xlabel('Angular velocity(head) (radian/s)')
-        # angPlot.ax.set_ylabel('Angular velocity(head) distribution (%)')
-        # angPlot.legend(['WT', 'Mut'])
-        # angPlot.save_plot('Angular velocity(head) distribution.tif', 'tif', savefigpath)
-        # angPlot.save_plot('Angular velocity(head distribution.svg', 'svg', savefigpath)
-        #
-        #
-        # # distance and velocity in 5 mins running window
-        # WTBoot = bootstrap(runningAve_distance[:, self.WTIdx], 1,
-        #                        runningAve_distance[:, self.WTIdx].shape[0], 500)
-        # MutBoot = bootstrap(runningAve_distance[:, self.MutIdx], 1,
-        #                         runningAve_distance[:, self.MutIdx].shape[0],500)
-        #
-        # distPlot = StartPlots()
-        # distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
-        # distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
-        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
-        # distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
-        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.set_xlabel('Time (s)')
-        # distPlot.ax.set_ylabel('Running average distance travelled in 5 mins (px)')
-        # distPlot.legend(['WT', 'KO'])
-        # # save the plot
-        # distPlot.save_plot('Running average distance travelled in 5 mins.tif', 'tif', savefigpath)
-        # distPlot.save_plot('Running average distance travelled in 5 mins.svg', 'svg', savefigpath)
-        #
-        # WTBoot = bootstrap(runningAve_velocity[:, self.WTIdx], 1,
-        #                        runningAve_velocity[:, self.WTIdx].shape[0], 500)
-        # MutBoot = bootstrap(runningAve_velocity[:, self.MutIdx], 1,
-        #                         runningAve_velocity[:, self.MutIdx].shape[0],500)
-        #
-        # distPlot = StartPlots()
-        # distPlot.ax.plot(self.plotT, WTBoot['bootAve'], color=WTColor, label='WT')
-        # distPlot.ax.fill_between(self.plotT, WTBoot['bootLow'],
-        #                              WTBoot['bootHigh'], color=WTColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.plot(self.plotT, MutBoot['bootAve'], color=MutColor, label='KO')
-        # distPlot.ax.fill_between(self.plotT, MutBoot['bootLow'],
-        #                              MutBoot['bootHigh'], color=MutColor, alpha=0.2, label='_nolegend_')
-        # distPlot.ax.set_xlabel('Time (s)')
-        # distPlot.ax.set_ylabel('Running average velocity in 5 mins (px)')
-        # distPlot.legend(['WT', 'KO'])
-        # # save the plot
-        # distPlot.save_plot('Running average distance travelled in 5 mins.tif', 'tif', savefigpath)
-        # distPlot.save_plot('Running average distance travelled in 5 mins.svg', 'svg', savefigpath)
-        #
-        # plt.close('all')
-
-        # plot result separating male and female
-        # save distanceMat, runningAve_distance
-
-        # convert to cm
+        # ============================================================
+        # Output folder
+        # ============================================================
         if savefigpath is None:
             savefigpath = self.data_index.iloc[0]['AnalysisPath']
+
         os.makedirs(savefigpath, exist_ok=True)
-        savedistPath = os.path.join(savefigpath, 'CumulativeDistance.csv')
-        data = {}
-        for idx,animal in enumerate(self.Animals):
-            data[animal] = distanceMat[:,idx]
-        data['time'] = self.plotT
-        data = pd.DataFrame(data)
-        data.to_csv(savedistPath)
 
-        savedistPath = os.path.join(savefigpath, 'runningAverageDistance.csv')
-        data = {}
-        for idx,animal in enumerate(self.Animals):
-            data[animal] = runningAve_distance[:,idx]
-        data['time'] = self.plotT
-        data = pd.DataFrame(data)
-        data.to_csv(savedistPath)
+        # ============================================================
+        # Basic dimensions
+        # ============================================================
+        first_obj = self.data_index['DLC_obj'].iloc[0]
+        fps = float(first_obj.fps)
 
-        for ss in ['male','female', 'allsex']:
-            # plot distance
-            self.plot_movement_results(distanceMat,self.plotT,savefigpath,
-                                       'Distance travelled', ss,
-                                       ['WT', 'Mut'],WTColor, MutColor)
+        n_time = self.minFrames - 1
+        plotT = np.arange(n_time) / fps
 
-            self.plot_movement_results(velocityDist,velEdges,savefigpath,
-                                       'Velocity', ss,
-                                       ['WT', 'Mut'],WTColor, MutColor)
-            self.plot_movement_results(angularDist,angEdges,savefigpath,
-                                       'Angular velocity', ss,
-                                       ['WT', 'Mut'],WTColor, MutColor)
-            self.plot_movement_results(runningAve_distance,self.plotT,savefigpath,
-                                       'Distance running 5 mins', ss,
-                                       ['WT', 'Mut'],WTColor, MutColor)
+        # ============================================================
+        # Data matrices
+        # ============================================================
+        distanceMat = np.full(
+            (n_time, self.nSubjects),
+            np.nan
+        )
+
+        runningAve_distance = np.full(
+            (n_time, self.nSubjects),
+            np.nan
+        )
+
+        totalDistance = np.full(
+            self.nSubjects,
+            np.nan
+        )
+
+        # ------------------------------------------------------------
+        # Histogram bins
+        #
+        # Use bin centers for plotting rather than the bin edges.
+        # ------------------------------------------------------------
+        velEdges = np.arange(
+            0,
+            1010,
+            10
+        )
+
+        velCenters = (
+            velEdges[:-1] + velEdges[1:]
+        ) / 2
+
+        angEdges = np.arange(
+            -15,
+            15.5,
+            0.5
+        )
+
+        angCenters = (
+            angEdges[:-1] + angEdges[1:]
+        ) / 2
+
+        velocityDist = np.full(
+            (len(velCenters), self.nSubjects),
+            np.nan
+        )
+
+        angularDist = np.full(
+            (len(angCenters), self.nSubjects),
+            np.nan
+        )
+
+        # ============================================================
+        # Helper functions
+        # ============================================================
+
+        def genotype_label(idx):
+            """
+            Standardize genotype labels to WT / HET.
+            """
+
+            genotype = str(
+                self.data_index.iloc[idx]['Genotype']
+            ).strip().upper()
+
+            if genotype == 'WT':
+                return 'WT'
+
+            if genotype == 'HET' :
+                return 'HET'
+
+            return None
+
+
+        def age_group(idx):
+            """
+            Standardized age groups:
+
+            P15  : P15
+            P30  : P29-P35
+            P60+ : P60 and older
+            """
+
+            row = self.data_index.iloc[idx]
+
+            # --------------------------------------------------------
+            # First use AgeGroup if it already exists.
+            # --------------------------------------------------------
+            if 'AgeGroup' in self.data_index.columns:
+                value = str(
+                    row['AgeGroup']
+                ).strip().upper()
+
+                if value == 'P15':
+                    return 'P15'
+
+                if value in [
+                    'P30',
+                    'P29-P35',
+                    'P29–P35'
+                ]:
+                    return 'P30'
+
+                if value in [
+                    'P60+',
+                    'P60',
+                    'ADULT'
+                ]:
+                    return 'P60+'
+
+            # --------------------------------------------------------
+            # Otherwise try Age.
+            # --------------------------------------------------------
+            if 'Age' in self.data_index.columns:
+                value = str(
+                    row['Age']
+                ).strip()
+
+                match = re.search(
+                    r'[pP]?(\d+)',
+                    value
+                )
+
+                if match:
+                    age = int(
+                        match.group(1)
+                    )
+
+                    if age == 15:
+                        return 'P15'
+
+                    if 29 <= age <= 35:
+                        return 'P30'
+
+                    if age >= 60:
+                        return 'P60+'
+
+            # --------------------------------------------------------
+            # Final fallback: extract Pxx from file/path information.
+            # --------------------------------------------------------
+            for col in [
+                'Video',
+                'CSV',
+                'Timestamp',
+                'AnalysisPath'
+            ]:
+                if col not in self.data_index.columns:
+                    continue
+
+                value = str(
+                    row[col]
+                )
+
+                match = re.search(
+                    r'[pP](\d+)',
+                    value
+                )
+
+                if match:
+                    age = int(
+                        match.group(1)
+                    )
+
+                    if age == 15:
+                        return 'P15'
+
+                    if 29 <= age <= 35:
+                        return 'P30'
+
+                    if age >= 60:
+                        return 'P60+'
+
+            return None
+
+
+        def get_group_indices(target_age=None, sex_group='allsex'):
+            """
+            Return indices for WT and HET.
+
+            If target_age is specified, restrict to that age group.
+            """
+
+            wt_idx = []
+            het_idx = []
+
+            for idx in range(self.nSubjects):
+
+                genotype = genotype_label(idx)
+
+                if genotype not in [
+                    'WT',
+                    'HET'
+                ]:
+                    continue
+
+                if sex_group != 'allsex':
+
+                    sex_value = str(
+                        self.data_index.iloc[idx]['Gender']
+                    ).strip().upper()
+
+                    target_sex = (
+                        'M'
+                        if sex_group == 'male'
+                        else 'F'
+                    )
+
+                    if sex_value != target_sex:
+                        continue
+
+                if target_age is not None:
+                    if age_group(idx) != target_age:
+                        continue
+
+                if genotype == 'WT':
+                    wt_idx.append(idx)
+
+                elif genotype == 'HET':
+                    het_idx.append(idx)
+
+            return (
+                np.asarray(
+                    wt_idx,
+                    dtype=int
+                ),
+                np.asarray(
+                    het_idx,
+                    dtype=int
+                )
+            )
+
+
+        def bootstrap_curve(
+            matrix,
+            indices,
+            n_boot=500
+        ):
+            """
+            Bootstrap animals to obtain group mean
+            and 95% confidence interval.
+            """
+
+            if len(indices) == 0:
+
+                empty = np.full(
+                    matrix.shape[0],
+                    np.nan
+                )
+
+                return (
+                    empty,
+                    empty,
+                    empty
+                )
+
+            values = matrix[
+                :,
+                indices
+            ]
+
+            with warnings.catch_warnings():
+
+                warnings.simplefilter(
+                    'ignore',
+                    category=RuntimeWarning
+                )
+
+                group_mean = np.nanmean(
+                    values,
+                    axis=1
+                )
+
+            rng = np.random.default_rng(
+                12345
+            )
+
+            boot = np.full(
+                (
+                    n_boot,
+                    matrix.shape[0]
+                ),
+                np.nan
+            )
+
+            for bb in range(n_boot):
+
+                sample_idx = rng.integers(
+                    0,
+                    values.shape[1],
+                    size=values.shape[1]
+                )
+
+                with warnings.catch_warnings():
+
+                    warnings.simplefilter(
+                        'ignore',
+                        category=RuntimeWarning
+                    )
+
+                    boot[
+                        bb,
+                        :
+                    ] = np.nanmean(
+                        values[
+                            :,
+                            sample_idx
+                        ],
+                        axis=1
+                    )
+
+            with warnings.catch_warnings():
+
+                warnings.simplefilter(
+                    'ignore',
+                    category=RuntimeWarning
+                )
+
+                boot_low = np.nanpercentile(
+                    boot,
+                    2.5,
+                    axis=0
+                )
+
+                boot_high = np.nanpercentile(
+                    boot,
+                    97.5,
+                    axis=0
+                )
+
+            return (
+                group_mean,
+                boot_low,
+                boot_high
+            )
+
+
+        # Same colors as the existing pipeline.
+        WTColor = (
+            255 / 255,
+            189 / 255,
+            53 / 255
+        )
+
+        HETColor = (
+            63 / 255,
+            167 / 255,
+            150 / 255
+        )
+
+
+        def add_group_curve(
+            ax,
+            matrix,
+            x,
+            indices,
+            label,
+            color
+        ):
+            """
+            Add group mean + bootstrap 95% CI.
+            """
+
+            if len(indices) == 0:
+                return
+
+            mean_curve, low, high = (
+                bootstrap_curve(
+                    matrix,
+                    indices
+                )
+            )
+
+            ax.plot(
+                x,
+                mean_curve,
+                color=color,
+                linewidth=2,
+                label=(
+                    f'{label} '
+                    f'(n={len(indices)})'
+                )
+            )
+
+            ax.fill_between(
+                x,
+                low,
+                high,
+                color=color,
+                alpha=0.20,
+                linewidth=0
+            )
+
+
+
+        def metric_dir(metric_name):
+            """
+            Create / return a metric-specific folder directly under summary.
+            """
+            folder = os.path.join(
+                savefigpath,
+                metric_name
+            )
+            os.makedirs(
+                folder,
+                exist_ok=True
+            )
+            return folder
+
+
+        def sex_display_name(sex_group):
+            if sex_group == 'male':
+                return 'Male'
+            if sex_group == 'female':
+                return 'Female'
+            return 'Allsex'
+
+
+        def plot_overall(
+            matrix,
+            x,
+            title,
+            xlabel,
+            ylabel,
+            filename,
+            output_dir,
+            sex_group='allsex'
+        ):
+            """
+            All ages pooled together:
+            WT vs HET.
+
+            A separate plot is generated for:
+            - Allsex
+            - Male
+            - Female
+            """
+
+            wt_idx, het_idx = (
+                get_group_indices(
+                    sex_group=sex_group
+                )
+            )
+
+            fig, ax = plt.subplots(
+                figsize=(7, 5)
+            )
+
+            add_group_curve(
+                ax,
+                matrix,
+                x,
+                wt_idx,
+                'WT',
+                WTColor
+            )
+
+            add_group_curve(
+                ax,
+                matrix,
+                x,
+                het_idx,
+                'HET',
+                HETColor
+            )
+
+            ax.set_title(
+                f'{title} - {sex_display_name(sex_group)}'
+            )
+
+            ax.set_xlabel(
+                xlabel
+            )
+
+            ax.set_ylabel(
+                ylabel
+            )
+
+            ax.spines[
+                'top'
+            ].set_visible(False)
+
+            ax.spines[
+                'right'
+            ].set_visible(False)
+
+            if len(wt_idx) > 0 or len(het_idx) > 0:
+                ax.legend(
+                    frameon=False
+                )
+
+            fig.tight_layout()
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.png'
+                ),
+                dpi=300,
+                bbox_inches='tight'
+            )
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.svg'
+                ),
+                bbox_inches='tight'
+            )
+
+            plt.close(fig)
+
+
+        def plot_by_age(
+            matrix,
+            x,
+            title,
+            xlabel,
+            ylabel,
+            filename,
+            output_dir,
+            sex_group='allsex'
+        ):
+            """
+            P15 / P30 / P60+ in three panels.
+
+            WT vs HET within each panel.
+            A separate figure is generated for Allsex / Male / Female.
+            """
+
+            age_groups = [
+                'P15',
+                'P30',
+                'P60+'
+            ]
+
+            fig, axes = plt.subplots(
+                1,
+                3,
+                figsize=(16, 4.8),
+                sharex=True,
+                sharey=True
+            )
+
+            for ax, age_name in zip(
+                axes,
+                age_groups
+            ):
+
+                wt_idx, het_idx = (
+                    get_group_indices(
+                        target_age=age_name,
+                        sex_group=sex_group
+                    )
+                )
+
+                add_group_curve(
+                    ax,
+                    matrix,
+                    x,
+                    wt_idx,
+                    'WT',
+                    WTColor
+                )
+
+                add_group_curve(
+                    ax,
+                    matrix,
+                    x,
+                    het_idx,
+                    'HET',
+                    HETColor
+                )
+
+                ax.set_title(
+                    age_name
+                )
+
+                ax.set_xlabel(
+                    xlabel
+                )
+
+                ax.spines[
+                    'top'
+                ].set_visible(False)
+
+                ax.spines[
+                    'right'
+                ].set_visible(False)
+
+                if len(wt_idx) > 0 or len(het_idx) > 0:
+                    ax.legend(
+                        frameon=False,
+                        fontsize=9
+                    )
+
+            axes[0].set_ylabel(
+                ylabel
+            )
+
+            fig.suptitle(
+                f'{title} - {sex_display_name(sex_group)}',
+                y=1.02
+            )
+
+            fig.tight_layout()
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.png'
+                ),
+                dpi=300,
+                bbox_inches='tight'
+            )
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.svg'
+                ),
+                bbox_inches='tight'
+            )
+
+            plt.close(fig)
+
+
+        def scalar_dataframe(
+            values,
+            sex_group='allsex',
+            require_age=False
+        ):
+            """
+            Build a scalar dataframe for WT / HET subjects.
+            """
+
+            rows = []
+
+            for idx in range(self.nSubjects):
+
+                genotype = genotype_label(idx)
+                age_name = age_group(idx)
+                value = values[idx]
+
+                if genotype not in [
+                    'WT',
+                    'HET'
+                ]:
+                    continue
+
+                if sex_group != 'allsex':
+                    sex_value = str(
+                        self.data_index.iloc[idx]['Gender']
+                    ).strip().upper()
+
+                    target_sex = (
+                        'M'
+                        if sex_group == 'male'
+                        else 'F'
+                    )
+
+                    if sex_value != target_sex:
+                        continue
+
+                if require_age and age_name not in [
+                    'P15',
+                    'P30',
+                    'P60+'
+                ]:
+                    continue
+
+                if not np.isfinite(value):
+                    continue
+
+                rows.append(
+                    {
+                        'ageGroup': age_name,
+                        'genotype': genotype,
+                        'value': value
+                    }
+                )
+
+            return pd.DataFrame(
+                rows
+            )
+
+
+        def plot_scalar_overall(
+            values,
+            ylabel,
+            title,
+            filename,
+            output_dir,
+            sex_group='allsex'
+        ):
+            """
+            Scalar metric with age pooled:
+            WT vs HET.
+
+            Separate figures are generated for Allsex / Male / Female.
+            """
+
+            plot_df = scalar_dataframe(
+                values,
+                sex_group=sex_group,
+                require_age=False
+            )
+
+            if plot_df.empty:
+                print(
+                    f'Warning: no valid data for {title} '
+                    f'({sex_group})'
+                )
+                return
+
+            fig, ax = plt.subplots(
+                figsize=(5.5, 6)
+            )
+
+            palette = {
+                'WT': WTColor,
+                'HET': HETColor
+            }
+
+            sns.boxplot(
+                data=plot_df,
+                x='genotype',
+                y='value',
+                order=[
+                    'WT',
+                    'HET'
+                ],
+                palette=palette,
+                showfliers=False,
+                ax=ax
+            )
+
+            sns.stripplot(
+                data=plot_df,
+                x='genotype',
+                y='value',
+                order=[
+                    'WT',
+                    'HET'
+                ],
+                palette=palette,
+                size=5,
+                alpha=0.85,
+                linewidth=0.4,
+                edgecolor='black',
+                ax=ax
+            )
+
+            counts = (
+                plot_df
+                .groupby(
+                    'genotype'
+                )
+                .size()
+            )
+
+            labels = []
+            for genotype in [
+                'WT',
+                'HET'
+            ]:
+                labels.append(
+                    f'{genotype} (n={int(counts.get(genotype, 0))})'
+                )
+
+            ax.set_xticks(
+                [0, 1]
+            )
+            ax.set_xticklabels(
+                labels
+            )
+
+            ax.set_xlabel(
+                'Genotype'
+            )
+
+            ax.set_ylabel(
+                ylabel
+            )
+
+            ax.set_title(
+                f'{title} - {sex_display_name(sex_group)}'
+            )
+
+            ax.spines[
+                'top'
+            ].set_visible(False)
+
+            ax.spines[
+                'right'
+            ].set_visible(False)
+
+            fig.tight_layout()
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.png'
+                ),
+                dpi=300,
+                bbox_inches='tight'
+            )
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.svg'
+                ),
+                bbox_inches='tight'
+            )
+
+            plt.close(fig)
+
+
+        def plot_scalar_by_age(
+            values,
+            ylabel,
+            title,
+            filename,
+            output_dir,
+            sex_group='allsex'
+        ):
+            """
+            Scalar metric:
+
+            P15 / P30 / P60+ on the x-axis,
+            with WT and HET boxplots + individual animals.
+
+            Separate figures are generated for Allsex / Male / Female.
+            """
+
+            plot_df = scalar_dataframe(
+                values,
+                sex_group=sex_group,
+                require_age=True
+            )
+
+            if plot_df.empty:
+
+                print(
+                    f'Warning: no valid data for {title} '
+                    f'({sex_group})'
+                )
+
+                return
+
+            fig, ax = plt.subplots(
+                figsize=(8, 6)
+            )
+
+            palette = {
+                'WT': WTColor,
+                'HET': HETColor
+            }
+
+            sns.boxplot(
+                data=plot_df,
+                x='ageGroup',
+                y='value',
+                hue='genotype',
+                order=[
+                    'P15',
+                    'P30',
+                    'P60+'
+                ],
+                hue_order=[
+                    'WT',
+                    'HET'
+                ],
+                palette=palette,
+                showfliers=False,
+                ax=ax
+            )
+
+            sns.stripplot(
+                data=plot_df,
+                x='ageGroup',
+                y='value',
+                hue='genotype',
+                order=[
+                    'P15',
+                    'P30',
+                    'P60+'
+                ],
+                hue_order=[
+                    'WT',
+                    'HET'
+                ],
+                palette=palette,
+                dodge=True,
+                size=5,
+                alpha=0.85,
+                linewidth=0.4,
+                edgecolor='black',
+                legend=False,
+                ax=ax
+            )
+
+            ax.set_xlabel(
+                'Age group'
+            )
+
+            ax.set_ylabel(
+                ylabel
+            )
+
+            ax.set_title(
+                f'{title} - {sex_display_name(sex_group)}'
+            )
+
+            ax.spines[
+                'top'
+            ].set_visible(False)
+
+            ax.spines[
+                'right'
+            ].set_visible(False)
+
+            ax.legend(
+                title='Genotype',
+                frameon=False
+            )
+
+            fig.tight_layout()
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.png'
+                ),
+                dpi=300,
+                bbox_inches='tight'
+            )
+
+            fig.savefig(
+                os.path.join(
+                    output_dir,
+                    filename + '.svg'
+                ),
+                bbox_inches='tight'
+            )
+
+            plt.close(fig)
+
+        # ============================================================
+        # Calculate motion metrics for every recording
+        # ============================================================
+        for idx, obj in enumerate(
+            self.data_index['DLC_obj']
+        ):
+
+            # --------------------------------------------------------
+            # Basic movement
+            # --------------------------------------------------------
+            obj.get_movement()
+
+            dist = np.asarray(
+                obj.dist,
+                dtype=float
+            ).flatten()
+
+            vel = np.asarray(
+                obj.vel,
+                dtype=float
+            ).flatten()
+
+            # --------------------------------------------------------
+            # Cumulative distance traveled
+            # --------------------------------------------------------
+            cumu_dist = np.cumsum(
+                dist
+            )
+
+            if cumu_dist.size > 0:
+                finite_cumu = cumu_dist[np.isfinite(cumu_dist)]
+                if finite_cumu.size > 0:
+                    totalDistance[idx] = finite_cumu[-1]
+
+            n_use = min(
+                len(cumu_dist),
+                n_time
+            )
+
+            distanceMat[
+                :n_use,
+                idx
+            ] = cumu_dist[
+                :n_use
+            ]
+
+            # --------------------------------------------------------
+            # Velocity distribution
+            # --------------------------------------------------------
+            valid_vel = vel[
+                np.isfinite(vel)
+            ]
+
+            if valid_vel.size > 0:
+
+                counts, _ = np.histogram(
+                    valid_vel,
+                    bins=velEdges
+                )
+
+                total_counts = counts.sum()
+
+                if total_counts > 0:
+
+                    velocityDist[
+                        :,
+                        idx
+                    ] = (
+                        counts
+                        / total_counts
+                        * 100
+                    )
+
+            # --------------------------------------------------------
+            # Angular velocity distribution
+            # --------------------------------------------------------
+            obj.get_angular_velocity()
+
+            ang_vel = np.asarray(
+                obj.angVel,
+                dtype=float
+            ).flatten()
+
+            valid_ang = ang_vel[
+                np.isfinite(ang_vel)
+            ]
+
+            if valid_ang.size > 0:
+
+                counts, _ = np.histogram(
+                    valid_ang,
+                    bins=angEdges
+                )
+
+                total_counts = counts.sum()
+
+                if total_counts > 0:
+
+                    angularDist[
+                        :,
+                        idx
+                    ] = (
+                        counts
+                        / total_counts
+                        * 100
+                    )
+
+            # --------------------------------------------------------
+            # Distance traveled in running 5-min windows
+            # --------------------------------------------------------
+            savefigFolder = os.path.join(
+                savefigpath,
+                str(self.Animals[idx])
+            )
+
+            os.makedirs(
+                savefigFolder,
+                exist_ok=True
+            )
+
+            window_sec = 5 * 60
+
+            obj.get_movement_running(
+                window_sec,
+                savefigFolder
+            )
+
+            dist_running = np.asarray(
+                obj.dist_running,
+                dtype=float
+            ).flatten()
+
+            n_use = min(
+                len(dist_running),
+                n_time
+            )
+
+            runningAve_distance[
+                :n_use,
+                idx
+            ] = dist_running[
+                :n_use
+            ]
+
+
+        # ============================================================
+        # Save / organize motion-analysis outputs
+        #
+        # Every metric has its own folder directly under summary.
+        # ============================================================
+
+        age_labels = [
+            age_group(idx)
+            for idx in range(
+                self.nSubjects
+            )
+        ]
+
+        genotype_labels = [
+            genotype_label(idx)
+            for idx in range(
+                self.nSubjects
+            )
+        ]
+
+        motion_summary = pd.DataFrame(
+            {
+                'animalID': self.Animals,
+                'genotype': genotype_labels,
+                'sex': self.data_index[
+                    'Gender'
+                ].values,
+                'ageGroup': age_labels,
+                'totalDistance': totalDistance
+            }
+        )
+
+        subject_names = [
+            str(animal)
+            for animal in self.Animals
+        ]
+
+        sex_groups = [
+            'allsex',
+            'male',
+            'female'
+        ]
+
+        # ============================================================
+        # Total distance traveled
+        # ============================================================
+
+        total_distance_dir = metric_dir(
+            'Total distance traveled'
+        )
+
+        motion_summary.to_csv(
+            os.path.join(
+                total_distance_dir,
+                'motion_summary.csv'
+            ),
+            index=False
+        )
+
+        for sex_group in sex_groups:
+
+            sex_label = sex_display_name(
+                sex_group
+            ).lower()
+
+            # Age pooled: WT vs HET.
+            plot_scalar_overall(
+                totalDistance,
+                'Total distance traveled (px)',
+                'Total distance traveled',
+                'Total distance traveled - overall - ' + sex_label,
+                total_distance_dir,
+                sex_group=sex_group
+            )
+
+            # P15 / P30 / P60+: WT vs HET.
+            plot_scalar_by_age(
+                totalDistance,
+                'Total distance traveled (px)',
+                'Total distance traveled',
+                'Total distance traveled - by age and genotype - ' + sex_label,
+                total_distance_dir,
+                sex_group=sex_group
+            )
+
+        # ============================================================
+        # Motion curves / distributions
+        # ============================================================
+
+        curve_metrics = [
+            (
+                distanceMat,
+                plotT,
+                'Cumulative distance traveled',
+                'Time (s)',
+                'Cumulative distance traveled (px)',
+                'CumulativeDistance.csv',
+                'time'
+            ),
+            (
+                velocityDist,
+                velCenters,
+                'Velocity distribution',
+                'Velocity (px/s)',
+                'Percentage of frames (%)',
+                'VelocityDistribution.csv',
+                'velocityBinCenter'
+            ),
+            (
+                angularDist,
+                angCenters,
+                'Angular velocity distribution',
+                'Angular velocity (rad/s)',
+                'Percentage of frames (%)',
+                'AngularVelocityDistribution.csv',
+                'angularVelocityBinCenter'
+            ),
+            (
+                runningAve_distance,
+                plotT,
+                'Distance traveled in running 5-min windows',
+                'Time (s)',
+                'Distance traveled in running 5-min window (px)',
+                'runningAverageDistance.csv',
+                'time'
+            )
+        ]
+
+        for (
+            matrix,
+            x,
+            metric_name,
+            xlabel,
+            ylabel,
+            csv_name,
+            x_column_name
+        ) in curve_metrics:
+
+            output_dir = metric_dir(
+                metric_name
+            )
+
+            data = pd.DataFrame(
+                matrix,
+                columns=subject_names
+            )
+
+            if x_column_name == 'time':
+                data[x_column_name] = x
+            else:
+                data.insert(
+                    0,
+                    x_column_name,
+                    x
+                )
+
+            data.to_csv(
+                os.path.join(
+                    output_dir,
+                    csv_name
+                ),
+                index=False
+            )
+
+            for sex_group in sex_groups:
+
+                sex_label = sex_display_name(
+                    sex_group
+                ).lower()
+
+                # Age pooled, genotype only.
+                plot_overall(
+                    matrix,
+                    x,
+                    metric_name,
+                    xlabel,
+                    ylabel,
+                    metric_name + ' - overall - ' + sex_label,
+                    output_dir,
+                    sex_group=sex_group
+                )
+
+                # Age-stratified.
+                plot_by_age(
+                    matrix,
+                    x,
+                    metric_name,
+                    xlabel,
+                    ylabel,
+                    metric_name + ' - by age - ' + sex_label,
+                    output_dir,
+                    sex_group=sex_group
+                )
+
+        print(
+            'motion_analysis completed successfully.'
+        )
 
     def plot_movement_results(self, variableMat, plotT, savefigpath, label, group, leg,color1, color2):
         if group =='male':
