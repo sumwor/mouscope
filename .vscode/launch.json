@@ -12,7 +12,11 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
-            "console": "integratedTerminal"
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "MPLBACKEND": "QtAgg"
+            }
         }
     ]
 }

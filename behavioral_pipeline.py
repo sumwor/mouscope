@@ -15,7 +15,7 @@ import cv2
 
 # matplotlib
 import matplotlib
-matplotlib.use('QtAgg')
+#matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
 plt.ion()
 from matplotlib.collections import LineCollection
@@ -712,7 +712,11 @@ class BehDataOdor(BehData):
                     'perf_AB': [],                     # average performance of AB
                     'perf_CD': [],                     # average performance of CD
                     'perf_DC': [],                     # average performance of DC reversal
-                    'odor_presented': []               # actual odor presented in the raw behavior file
+                    'water_left': np.nan,              # water dispensed from left port
+                    'water_right': np.nan,             # water dispensed from right port
+                    'odor_presented': [],               # actual odor presented in the raw behavior file
+                    'n_trials': np.nan,                     # total number of trials in the session
+
                 }
                 
                 row_dict = {
@@ -778,9 +782,15 @@ class BehDataOdor(BehData):
             perf_D = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==4]))
             perf_rev_C = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==6]))
             perf_rev_D = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==5]))
+            water_left = np.sum(resultdf['reward'][resultdf['schedule'].isin([1, 3, 6])])
+            water_right = np.sum(resultdf['reward'][resultdf['schedule'].isin([2, 4, 5])])
+            nTrials = resultdf.shape[0]
             self.data_index.at[bIdx, 'perf_AB'] = [perf_A, perf_B]
             self.data_index.at[bIdx, 'perf_CD'] = [perf_C, perf_D]
             self.data_index.at[bIdx, 'perf_DC'] = [perf_rev_C, perf_rev_D]
+            self.data_index.at[bIdx, 'water_left'] = water_left
+            self.data_index.at[bIdx, 'water_right'] = water_right
+            self.data_index.at[bIdx, 'nTrials'] = nTrials
 
         # Check for missing sessions based on date.
         session_dates = pd.to_datetime(self.data_index['Date'], format='%Y%m%d')
@@ -794,15 +804,15 @@ class BehDataOdor(BehData):
         # identify any mismatching sessions
         
         gc = gspread.service_account(filename="credentials/rotarod_reader.json")
-        sh = gc.open_by_url(url_address)
+        sh_google = gc.open_by_url(url_address)
         comparisons = pd.DataFrame()
 
-        for worksheet in sh.worksheets():
+        for worksheet in sh_google.worksheets():
             animal = worksheet.title.strip()
             animal = animal[3:]
             pipeline_data = self.data_index.loc[
                 self.data_index['Animal'].astype(str).str.strip() == animal,
-                ['Date', 'odor_presented', 'perf_AB', 'perf_CD'],
+                ['Date', 'odor_presented', 'perf_AB', 'perf_CD', 'perf_DC', 'water_left', 'water_right', 'nTrials'],
             ].copy()
             if pipeline_data.empty:
                 continue
@@ -813,7 +823,7 @@ class BehDataOdor(BehData):
             }
             if 'schedule' in notebook_columns:
                 notebook_data = notebook_data.loc[
-                    notebook_data[notebook_columns['schedule']].isin(['AB_rwdsz3','AB_rwdsz2', 'AB_retrain','AB-CD','AB-CD-DC', 'AB-DC'])
+                    notebook_data[notebook_columns['schedule']].isin(['AB_rwdsz3','AB_rwdsz2', 'AB_retrain','AB-CD','AB-CD_retrain','AB-CD-DC', 'AB-DC'])
                 ].copy()
 
             def pair_value(performance, index):
@@ -823,12 +833,15 @@ class BehDataOdor(BehData):
             pipeline_data['perf_B'] = pipeline_data['perf_AB'].map(lambda value: pair_value(value, 1))
             pipeline_data['perf_C'] = pipeline_data['perf_CD'].map(lambda value: pair_value(value, 0))
             pipeline_data['perf_D'] = pipeline_data['perf_CD'].map(lambda value: pair_value(value, 1))
-            #pipeline_data['perf_C_rev'] = pipeline_data['perf_DC'].map(lambda value: pair_value(value, 0))
-            #pipeline_data['perf_D_rev'] = pipeline_data['perf_DC'].map(lambda value: pair_value(value, 1))
+            pipeline_data['perf_C_rev'] = pipeline_data['perf_DC'].map(lambda value: pair_value(value, 0))
+            pipeline_data['perf_D_rev'] = pipeline_data['perf_DC'].map(lambda value: pair_value(value, 1))
 
             pipeline_data.rename(columns={'odor_presented': 'protocol_pipeline'}, inplace=True)
             pipeline_data = pipeline_data[
-                ['Date', 'protocol_pipeline', 'perf_A', 'perf_B', 'perf_C', 'perf_D']
+                ['Date', 'protocol_pipeline', 
+                 'perf_A', 'perf_B', 'perf_C', 'perf_D', 
+                 'perf_C_rev', 'perf_D_rev',
+                 'water_left', 'water_right', 'nTrials']
             ]
 
             comparison = pd.DataFrame({
@@ -841,6 +854,8 @@ class BehDataOdor(BehData):
                 'B': notebook_data[notebook_columns['b']] if 'b' in notebook_columns else np.nan,
                 'C': notebook_data[notebook_columns['c']] if 'c' in notebook_columns else np.nan,
                 'D': notebook_data[notebook_columns['d']] if 'd' in notebook_columns else np.nan,
+                'L_H2O': notebook_data[notebook_columns['l_h2o']] if 'l_h2o' in notebook_columns else np.nan,
+                'R_H2O': notebook_data[notebook_columns['r_h2o']] if 'r_h2o' in notebook_columns else np.nan
             })
             comparison['Date'] = pd.to_datetime(
                 comparison['Date'], format='%m/%d/%y', errors='coerce'
@@ -861,6 +876,8 @@ class BehDataOdor(BehData):
                 'B': first_value,
                 'C': first_value,
                 'D': first_value,
+                'L_H2O': first_value,
+                'R_H2O': first_value
             })
             pipeline_data = pipeline_data.groupby('Date', as_index=False).agg({
                 'protocol_pipeline': first_value,
@@ -868,6 +885,8 @@ class BehDataOdor(BehData):
                 'perf_B': first_value,
                 'perf_C': first_value,
                 'perf_D': first_value,
+                'water_left': first_value,
+                'water_right': first_value
             })
             comparison = pipeline_data.merge(comparison, on='Date', how='outer')
             for odor in 'ABCD':
@@ -875,16 +894,29 @@ class BehDataOdor(BehData):
                     comparison[f'perf_{odor}']
                     - pd.to_numeric(comparison[odor], errors='coerce')
                 )
+            comparison[f'diff_L_H2O'] = (
+                    comparison[f'water_left']
+                    - pd.to_numeric(comparison['L_H2O'], errors='coerce')
+                )
+            comparison[f'diff_R_H2O'] = (
+                    comparison[f'water_right']
+                    - pd.to_numeric(comparison['R_H2O'], errors='coerce')
+                )
             comparison.insert(0, 'Animal', animal)
             comparison = comparison[
                 ['Animal', 'Date', 'protocol_pipeline', 'protocol_notebook',
                  'perf_A', 'A', 'diff_A', 'perf_B', 'B', 'diff_B',
-                 'perf_C', 'C', 'diff_C', 'perf_D', 'D', 'diff_D']
+                 'perf_C', 'C', 'diff_C', 'perf_D', 'D', 'diff_D', 
+                 'water_left', 'L_H2O', 'diff_L_H2O', 
+                 'water_right', 'R_H2O', 'diff_R_H2O']
             ]
             comparisons = pd.concat([comparisons, comparison], ignore_index=True)
 
         #self.notebook_comparison = comparisons
-        return self.notebook_comparison
+        #return self.notebook_comparison
+        # save the dataframe to a csv file
+        saveQCpath = os.path.join(self.root_path,'notebook_matlab_comparison.csv')
+        comparisons.to_csv(saveQCpath, index=False)
 
     def align_timeStamps(self):
         # align timestamps between behavior log and recording

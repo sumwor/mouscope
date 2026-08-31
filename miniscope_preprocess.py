@@ -27,7 +27,7 @@ from caiman.utils.visualization import view_quilt
 
 import glob
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('QtAgg')
 import time
 import warnings
 import pickle

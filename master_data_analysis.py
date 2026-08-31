@@ -1,13 +1,16 @@
 # master script for analyzing behavioral and imaging data
 
 # todo:
+import debugpy
+debugpy.configure(qt="none")
+
 
 from sqlite3 import Time
 
 from behavioral_pipeline import *
 
 import matplotlib
-matplotlib.use('QtAgg') 
+#matplotlib.use('QtAgg') 
 import matplotlib.pyplot as plt
 
 plt.ion()
@@ -15,7 +18,7 @@ plt.ion()
 run_odor = True
 run_rotarod = True
 count_animals = False
-if_QC = True
+if_QC = False
 
 notebook_url_path = r'Y:\HongliWang\Odor\url_individual_notebook.csv'
 
@@ -68,9 +71,9 @@ if run_odor:
 
     #%% for odor behavioral data
     # analyze the TSC2 behavioral recording data
-    #strain_list = ['TSC2_adol', 'TSC2_adult', 'ChD8_adol', 'Cntnap2_adol', 'Scn2A_adol']
+    #strain_list = ['TSC2_adol', 'TSC2_adult', 'ChD8_adol', 'Cntnap2_adol', 'Scn2a_adol', 'Scn2a_adult', 'Syngap(SGR)_adult', 'Syngap_adol']
     #for strain in strain_list:
-    strain = 'TSC2_adol'
+    strain = 'Syngap_adol'
     root_dir = os.path.join(r'Y:\HongliWang\Odor', strain)
 
     Odor = BehDataOdor(root_dir, strain)

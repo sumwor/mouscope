@@ -11,7 +11,7 @@ import imageio
 from skimage import color
 
 import matplotlib
-matplotlib.use('QtAgg')
+#matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
 plt.ion()
 
@@ -1139,8 +1139,8 @@ def plot_learning_curve(
         p_values = stats_df.set_index('term')['p_value']
         stats_text = (
             f"GLMM p genotype = {p_values.get('genotype', np.nan):.3g}\n"
-            f"GLMM p learning = {p_values.get('learning', np.nan):.3g}\n"
-            f"GLMM p interaction = {p_values.get('genotype:learning', np.nan):.3g}"
+            f"GLMM p learning = {p_values.get('trial', np.nan):.3g}\n"
+            f"GLMM p interaction = {p_values.get('genotype:trial', np.nan):.3g}"
         )
         ax.text(
             0.98, 0.98, stats_text,
