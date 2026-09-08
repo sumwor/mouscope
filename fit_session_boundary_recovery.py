@@ -1,0 +1,199 @@
+"""Fit exponential recovery following behavioral-session boundaries.
+
+This standalone diagnostic imports the established read-only behavioral loading
+and reward definitions. It does not modify behavioral source data or pipeline
+code.
+"""
+
+from __future__ import annotations
+
+import matplotlib
+
+# Keep imports of the existing behavioral pipeline safe in headless runs.
+_original_matplotlib_use = matplotlib.use
+
+
+def _headless_matplotlib_use(backend, *args, **kwargs):
+    if str(backend).lower() in {"qtagg", "qt5agg", "qt6agg"}:
+        backend = "Agg"
+    return _original_matplotlib_use(backend, *args, **kwargs)
+
+
+matplotlib.use = _headless_matplotlib_use
+matplotlib.use("Agg")
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import least_squares
+
+from analyze_session_boundary import (
+    ReadOnlyBehDataOdor,
+    load_protocol_sessions,
+    rewarded_vector,
+)
+
+
+PARAMETER_LOWER = np.array([0.0, 0.0, 1.0])
+PARAMETER_UPPER = np.array([1.0, 1.0, 300.0])
+MIN_FIT_BINS = 8
+
+
+def exponential_recovery(n, p_inf, amplitude, recovery_lambda):
+    """Evaluate P(n) = P_inf - A exp(-n/lambda)."""
+
+    n = np.asarray(n, dtype=float)
+    return p_inf - amplitude * np.exp(-n / recovery_lambda)
+
+
+def binned_model_prediction(bin_starts, bin_ends, parameters):
+    """Average the trial-level model over each inclusive integer bin."""
+
+    p_inf, amplitude, recovery_lambda = np.asarray(parameters, dtype=float)
+    return np.array(
+        [
+            exponential_recovery(
+                np.arange(int(start), int(end) + 1),
+                p_inf,
+                amplitude,
+                recovery_lambda,
+            ).mean()
+            for start, end in zip(bin_starts, bin_ends)
+        ],
+        dtype=float,
+    )
+
+
+def parameter_warnings(parameters, fit_success):
+    """Return explicit near-bound and fitted-P(0) warning flags."""
+
+    if not fit_success or not np.all(np.isfinite(parameters)):
+        return {
+            "PInfWarning": False,
+            "AWarning": False,
+            "LambdaWarning": False,
+            "P0Warning": False,
+            "BoundaryWarning": True,
+        }
+
+    p_inf, amplitude, recovery_lambda = np.asarray(parameters, dtype=float)
+    p_inf_warning = bool(p_inf <= 0.01 or p_inf >= 0.99)
+    amplitude_warning = bool(amplitude <= 0.01 or amplitude >= 0.99)
+    lambda_margin = 0.01 * (PARAMETER_UPPER[2] - PARAMETER_LOWER[2])
+    lambda_warning = bool(
+        recovery_lambda <= PARAMETER_LOWER[2] + lambda_margin
+        or recovery_lambda >= PARAMETER_UPPER[2] - lambda_margin
+    )
+    p0_warning = bool(p_inf - amplitude < 0.0 or p_inf - amplitude > 1.0)
+    return {
+        "PInfWarning": p_inf_warning,
+        "AWarning": amplitude_warning,
+        "LambdaWarning": lambda_warning,
+        "P0Warning": p0_warning,
+        "BoundaryWarning": bool(
+            p_inf_warning or amplitude_warning or lambda_warning or p0_warning
+        ),
+    }
+
+
+def _failed_fit(n_fit_bins, message):
+    result = {
+        "P_inf": np.nan,
+        "A": np.nan,
+        "lambda": np.nan,
+        "P0": np.nan,
+        "RSS": np.nan,
+        "RMSE": np.nan,
+        "R2": np.nan,
+        "FitSuccess": False,
+        "OptimizerMessage": message,
+        "NFitBins": int(n_fit_bins),
+    }
+    result.update(parameter_warnings(np.full(3, np.nan), False))
+    return result
+
+
+def _initial_parameters(observed):
+    late = float(np.nanmean(observed[-min(3, len(observed)) :]))
+    p_inf_starts = np.clip(
+        np.array([late - 0.1, late, late + 0.1]),
+        PARAMETER_LOWER[0],
+        PARAMETER_UPPER[0],
+    )
+    return [
+        np.array([p_inf, amplitude, recovery_lambda], dtype=float)
+        for p_inf in p_inf_starts
+        for amplitude in (0.05, 0.2, 0.5)
+        for recovery_lambda in (10.0, 75.0, 200.0)
+    ]
+
+
+def fit_exponential_recovery(curve, min_bins=MIN_FIT_BINS):
+    """Fit the exponential model to finite binned observations."""
+
+    required = {"BinStart", "BinEnd", "ObservedMean"}
+    missing = required.difference(curve.columns)
+    if missing:
+        raise ValueError(f"Curve is missing required columns: {sorted(missing)}")
+
+    starts = pd.to_numeric(curve["BinStart"], errors="coerce").to_numpy(float)
+    ends = pd.to_numeric(curve["BinEnd"], errors="coerce").to_numpy(float)
+    observed = pd.to_numeric(
+        curve["ObservedMean"], errors="coerce"
+    ).to_numpy(float)
+    finite = np.isfinite(starts) & np.isfinite(ends) & np.isfinite(observed)
+    starts = starts[finite]
+    ends = ends[finite]
+    observed = observed[finite]
+    n_fit_bins = len(observed)
+    if n_fit_bins < min_bins:
+        return _failed_fit(n_fit_bins, f"Fewer than {min_bins} finite bins")
+
+    best = None
+    for initial in _initial_parameters(observed):
+        try:
+            result = least_squares(
+                lambda parameters: binned_model_prediction(
+                    starts, ends, parameters
+                )
+                - observed,
+                x0=initial,
+                bounds=(PARAMETER_LOWER, PARAMETER_UPPER),
+                method="trf",
+            )
+        except (ValueError, FloatingPointError):
+            continue
+        if not result.success or not np.all(np.isfinite(result.x)):
+            continue
+        residual = binned_model_prediction(starts, ends, result.x) - observed
+        rss = float(np.sum(residual**2))
+        if np.isfinite(rss) and (best is None or rss < best[0]):
+            best = (rss, result)
+
+    if best is None:
+        return _failed_fit(n_fit_bins, "No successful finite optimizer result")
+
+    rss, optimizer = best
+    parameters = optimizer.x
+    rmse = float(np.sqrt(rss / n_fit_bins))
+    centered = observed - observed.mean()
+    total_sum_squares = float(np.sum(centered**2))
+    r2 = (
+        float(1.0 - rss / total_sum_squares)
+        if not np.isclose(total_sum_squares, 0.0)
+        else np.nan
+    )
+    fit = {
+        "P_inf": float(parameters[0]),
+        "A": float(parameters[1]),
+        "lambda": float(parameters[2]),
+        "P0": float(parameters[0] - parameters[1]),
+        "RSS": rss,
+        "RMSE": rmse,
+        "R2": r2,
+        "FitSuccess": True,
+        "OptimizerMessage": str(optimizer.message),
+        "NFitBins": int(n_fit_bins),
+    }
+    fit.update(parameter_warnings(parameters, True))
+    return fit
+
