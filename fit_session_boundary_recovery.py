@@ -364,3 +364,142 @@ def fit_animal_curves(boundary_bins, boundary_metrics):
             | _empirical_animal_summary(metrics)
         )
     return pd.DataFrame(rows)
+
+
+def resample_animal_clusters(group_bins, rng, sampled_animals=None):
+    """Resample animals and retain every boundary row per selected cluster."""
+
+    animals = np.asarray(pd.unique(group_bins["Animal"]))
+    if not len(animals):
+        return group_bins.assign(BootstrapCluster=pd.Series(dtype=int))
+    if sampled_animals is None:
+        sampled_animals = rng.choice(animals, size=len(animals), replace=True)
+    clusters = []
+    for cluster_number, animal in enumerate(sampled_animals):
+        cluster = group_bins[group_bins["Animal"] == animal].copy()
+        cluster["BootstrapCluster"] = cluster_number
+        clusters.append(cluster)
+    return pd.concat(clusters, ignore_index=True) if clusters else pd.DataFrame()
+
+
+def bootstrap_group_fit(group_bins, n_replicates, rng):
+    """Cluster-bootstrap animals while retaining boundary-weighted group means."""
+
+    parameters = []
+    curves = []
+    trial_index = np.arange(POST_BOUNDARY_TRIALS, dtype=float)
+    for _ in range(n_replicates):
+        sample = resample_animal_clusters(group_bins, rng)
+        curve = aggregate_group_curve(sample)
+        fit = fit_exponential_recovery(curve)
+        parameter_vector = np.array(
+            [fit["P_inf"], fit["A"], fit["lambda"]], dtype=float
+        )
+        if fit["FitSuccess"] and np.all(np.isfinite(parameter_vector)):
+            parameters.append(parameter_vector)
+            curves.append(exponential_recovery(trial_index, *parameter_vector))
+
+    n_successful = len(parameters)
+    summary = {
+        "NBootstrapRequested": int(n_replicates),
+        "NBootstrapSuccessful": int(n_successful),
+        "BootstrapSuccessFraction": (
+            float(n_successful / n_replicates) if n_replicates else np.nan
+        ),
+    }
+    if n_successful:
+        parameter_array = np.asarray(parameters)
+        curve_array = np.asarray(curves)
+        for column_index, name in enumerate(("P_inf", "A", "lambda")):
+            low, high = np.percentile(
+                parameter_array[:, column_index], [2.5, 97.5]
+            )
+            summary[f"{name}_CI_low"] = float(low)
+            summary[f"{name}_CI_high"] = float(high)
+        band = np.percentile(curve_array, [2.5, 97.5], axis=0).T
+    else:
+        for name in ("P_inf", "A", "lambda"):
+            summary[f"{name}_CI_low"] = np.nan
+            summary[f"{name}_CI_high"] = np.nan
+        band = np.full((POST_BOUNDARY_TRIALS, 2), np.nan)
+    return summary, band
+
+
+def _empirical_group_summary(metrics):
+    valid = metrics["PercentDropValid"].astype(bool)
+    percent = pd.to_numeric(metrics.loc[valid, "PercentDrop"], errors="coerce")
+    return {
+        "MeanPreBoundaryBaseline": float(metrics["PreBoundaryBaseline"].mean()),
+        "MedianPreBoundaryBaseline": float(
+            metrics["PreBoundaryBaseline"].median()
+        ),
+        "MeanInitialPostPerformance": float(
+            metrics["InitialPostPerformance"].mean()
+        ),
+        "MedianInitialPostPerformance": float(
+            metrics["InitialPostPerformance"].median()
+        ),
+        "MeanDropMagnitude": float(metrics["DropMagnitude"].mean()),
+        "MedianDropMagnitude": float(metrics["DropMagnitude"].median()),
+        "MeanAbsoluteDrop": float(metrics["AbsoluteDrop"].mean()),
+        "MedianAbsoluteDrop": float(metrics["AbsoluteDrop"].median()),
+        "NPercentDropValid": int(percent.notna().sum()),
+        "MeanPercentDrop": float(percent.mean()),
+        "MedianPercentDrop": float(percent.median()),
+    }
+
+
+def fit_group_curves(boundary_bins, boundary_metrics, n_replicates, seed):
+    """Fit primary boundary-weighted group curves and cluster bootstrap CIs."""
+
+    summary_rows = []
+    curve_rows = []
+    rng = np.random.default_rng(seed)
+    for (protocol, genotype), group_bins in boundary_bins.groupby(
+        ["Protocol", "Genotype"], sort=True
+    ):
+        group_metrics = boundary_metrics[
+            (boundary_metrics["Protocol"] == protocol)
+            & (boundary_metrics["Genotype"] == genotype)
+        ]
+        curve = aggregate_group_curve(group_bins)
+        fit = fit_exponential_recovery(curve)
+        bootstrap, band = bootstrap_group_fit(group_bins, n_replicates, rng)
+        n_animals = int(group_bins["Animal"].nunique())
+        n_boundaries = int(len(group_metrics))
+        summary_rows.append(
+            {
+                "Protocol": protocol,
+                "Genotype": genotype,
+                "NAnimals": n_animals,
+                "NBoundaries": n_boundaries,
+            }
+            | fit
+            | bootstrap
+            | _empirical_group_summary(group_metrics)
+        )
+
+        curve = curve.copy()
+        if fit["FitSuccess"]:
+            parameters = np.array([fit["P_inf"], fit["A"], fit["lambda"]])
+            curve["FittedBinMean"] = binned_model_prediction(
+                curve["BinStart"].to_numpy(),
+                curve["BinEnd"].to_numpy(),
+                parameters,
+            )
+            curve["FittedAtCenter"] = exponential_recovery(
+                curve["BinCenter"].to_numpy(), *parameters
+            )
+        else:
+            curve["FittedBinMean"] = np.nan
+            curve["FittedAtCenter"] = np.nan
+        trial_index = np.arange(POST_BOUNDARY_TRIALS)
+        curve["FittedCurveCI_low"] = np.interp(
+            curve["BinCenter"], trial_index, band[:, 0]
+        )
+        curve["FittedCurveCI_high"] = np.interp(
+            curve["BinCenter"], trial_index, band[:, 1]
+        )
+        curve_rows.extend(curve.to_dict("records"))
+
+    return pd.DataFrame(summary_rows), pd.DataFrame(curve_rows)

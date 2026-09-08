@@ -176,5 +176,91 @@ class BoundaryDataTest(unittest.TestCase):
         np.testing.assert_allclose(fits["MeanPercentDrop"], 25.0)
 
 
+def make_cluster_rows():
+    starts = np.arange(0, 300, 20)
+    ends = starts + 19
+    rows = []
+    for animal, shift in ((1, -0.01), (2, 0.01), (3, 0.0)):
+        predicted = recovery.binned_model_prediction(
+            starts, ends, np.array([0.8 + shift, 0.2, 75.0])
+        )
+        for boundary in (1, 2):
+            for start, end, value in zip(starts, ends, predicted):
+                rows.append(
+                    {
+                        "Animal": animal,
+                        "Protocol": "CD",
+                        "Genotype": "HET",
+                        "Gender": "F",
+                        "BoundaryNumber": boundary,
+                        "BinStart": start,
+                        "BinEnd": end,
+                        "BinCenter": (start + end) / 2,
+                        "NTrials": 20,
+                        "Performance": value,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+class AnimalClusterBootstrapTest(unittest.TestCase):
+    def test_resampling_copies_whole_clusters_with_multiplicity(self):
+        rows = make_cluster_rows()
+        sample = recovery.resample_animal_clusters(
+            rows,
+            np.random.default_rng(7),
+            sampled_animals=np.array([1, 1]),
+        )
+        self.assertEqual(sample["Animal"].nunique(), 1)
+        expected_rows = 2 * len(rows[rows["Animal"] == 1])
+        self.assertEqual(len(sample), expected_rows)
+        self.assertEqual(sample["BootstrapCluster"].nunique(), 2)
+
+    def test_bootstrap_is_repeatable_and_returns_ordered_intervals(self):
+        rows = make_cluster_rows()
+        first_summary, first_band = recovery.bootstrap_group_fit(
+            rows, 20, np.random.default_rng(42)
+        )
+        second_summary, second_band = recovery.bootstrap_group_fit(
+            rows, 20, np.random.default_rng(42)
+        )
+        self.assertEqual(first_summary, second_summary)
+        np.testing.assert_allclose(first_band, second_band)
+        self.assertEqual(first_summary["NBootstrapRequested"], 20)
+        self.assertEqual(first_summary["NBootstrapSuccessful"], 20)
+        self.assertEqual(first_band.shape, (300, 2))
+        for parameter in ("P_inf", "A", "lambda"):
+            self.assertLessEqual(
+                first_summary[f"{parameter}_CI_low"],
+                first_summary[f"{parameter}_CI_high"],
+            )
+        self.assertTrue((first_band[:, 0] <= first_band[:, 1]).all())
+
+    def test_group_fit_outputs_summary_and_aligned_curve(self):
+        bins = make_cluster_rows()
+        metrics = (
+            bins[["Animal", "Protocol", "Genotype", "BoundaryNumber"]]
+            .drop_duplicates()
+            .assign(
+                PreBoundaryBaseline=0.8,
+                InitialPostPerformance=0.6,
+                DropMagnitude=0.2,
+                AbsoluteDrop=0.2,
+                PercentDrop=25.0,
+                PercentDropValid=True,
+            )
+        )
+        summary, curve = recovery.fit_group_curves(
+            bins, metrics, n_replicates=20, seed=42
+        )
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary.iloc[0]["NAnimals"], 3)
+        self.assertEqual(summary.iloc[0]["NBoundaries"], 6)
+        self.assertTrue(summary.iloc[0]["FitSuccess"])
+        self.assertEqual(len(curve), 15)
+        self.assertTrue(curve["FittedBinMean"].notna().all())
+        self.assertTrue(curve["FittedCurveCI_low"].notna().all())
+
+
 if __name__ == "__main__":
     unittest.main()
