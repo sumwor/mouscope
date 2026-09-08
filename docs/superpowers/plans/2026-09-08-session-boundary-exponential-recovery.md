@@ -352,4 +352,3 @@ Print and hand off Protocol, Genotype, NAnimals, NBoundaries, P_inf with
 animal-cluster bootstrap 95% CI, A with the same CI label, lambda with the same CI
 label, RMSE, and R2. State fit quality and directional comparisons separately
 from inferential claims, and explicitly discuss warning/constrained fits.
-

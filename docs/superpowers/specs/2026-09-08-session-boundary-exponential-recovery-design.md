@@ -284,4 +284,3 @@ Implementation follows test-driven development and includes:
 4. Real-data execution with 1,000 bootstrap replicates.
 5. Post-run checks for expected rows, finite values, warning consistency, CI
    ordering, bootstrap counts, plot readability, and unchanged source files.
-
