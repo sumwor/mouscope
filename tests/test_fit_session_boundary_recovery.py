@@ -8,6 +8,19 @@ import pandas as pd
 import fit_session_boundary_recovery as recovery
 
 
+def make_session(rewards, number, date):
+    return pd.DataFrame(
+        {
+            "reward": rewards,
+            "_session_number": number,
+            "_session_index": number + 10,
+            "_date": date,
+            "_protocol_day": number,
+            "_trial_in_session": np.arange(1, len(rewards) + 1),
+        }
+    )
+
+
 class ExponentialRecoveryFitTest(unittest.TestCase):
     def test_binned_prediction_is_mean_over_integer_trials(self):
         got = recovery.binned_model_prediction(
@@ -78,6 +91,89 @@ class ExponentialRecoveryFitTest(unittest.TestCase):
         self.assertFalse(warnings["LambdaWarning"])
         self.assertTrue(warnings["P0Warning"])
         self.assertTrue(warnings["BoundaryWarning"])
+
+
+class BoundaryDataTest(unittest.TestCase):
+    def test_boundary_extraction_preserves_metadata_and_empirical_drops(self):
+        previous = make_session([1, 1, 1, 1, 0] * 60, 1, "20230101")
+        following = make_session(
+            [1] * 30 + [0] * 20 + [1] * 250, 2, "20230102"
+        )
+        bins, metrics = recovery.extract_boundary_data([previous, following])
+        row = metrics.iloc[0]
+        self.assertAlmostEqual(row["PreBoundaryBaseline"], 0.8)
+        self.assertAlmostEqual(row["InitialPostPerformance"], 0.6)
+        self.assertEqual(row["AbsoluteDrop"], row["DropMagnitude"])
+        self.assertAlmostEqual(row["PercentDrop"], 25.0)
+        self.assertTrue(row["PercentDropValid"])
+        self.assertEqual(row["PreviousSession"], 1)
+        self.assertEqual(row["NextSession"], 2)
+        self.assertEqual(list(bins["BinStart"]), list(range(0, 300, 20)))
+        self.assertTrue((bins["NTrials"] == 20).all())
+
+    def test_group_curve_is_boundary_weighted_not_animal_equal(self):
+        rows = pd.DataFrame(
+            {
+                "Animal": [1, 1, 2],
+                "Protocol": ["AB"] * 3,
+                "Genotype": ["WT"] * 3,
+                "BoundaryNumber": [1, 2, 1],
+                "BinStart": [0] * 3,
+                "BinEnd": [19] * 3,
+                "BinCenter": [9.5] * 3,
+                "Performance": [0.0, 0.0, 1.0],
+            }
+        )
+        curve = recovery.aggregate_group_curve(rows)
+        self.assertAlmostEqual(curve.iloc[0]["ObservedMean"], 1 / 3)
+        self.assertEqual(curve.iloc[0]["NBoundaries"], 3)
+        self.assertEqual(curve.iloc[0]["NAnimals"], 2)
+
+    def test_animal_fit_pools_each_animals_boundaries_by_bin(self):
+        starts = np.arange(0, 300, 20)
+        ends = starts + 19
+        performance = recovery.binned_model_prediction(
+            starts, ends, np.array([0.8, 0.2, 75.0])
+        )
+        rows = []
+        metrics = []
+        for animal in (1, 2):
+            for boundary in (1, 2):
+                for start, end, value in zip(starts, ends, performance):
+                    rows.append(
+                        {
+                            "Animal": animal,
+                            "Protocol": "CD",
+                            "Genotype": "HET",
+                            "Gender": "F",
+                            "BoundaryNumber": boundary,
+                            "BinStart": start,
+                            "BinEnd": end,
+                            "BinCenter": (start + end) / 2,
+                            "Performance": value,
+                        }
+                    )
+                metrics.append(
+                    {
+                        "Animal": animal,
+                        "Protocol": "CD",
+                        "BoundaryNumber": boundary,
+                        "PreBoundaryBaseline": 0.8,
+                        "DropMagnitude": 0.2,
+                        "AbsoluteDrop": 0.2,
+                        "PercentDrop": 25.0,
+                        "PercentDropValid": True,
+                    }
+                )
+        fits = recovery.fit_animal_curves(
+            pd.DataFrame(rows), pd.DataFrame(metrics)
+        )
+        self.assertEqual(len(fits), 2)
+        self.assertTrue(fits["FitSuccess"].all())
+        self.assertTrue((fits["NBoundaries"] == 2).all())
+        self.assertTrue((fits["NFitBins"] == 15).all())
+        np.testing.assert_allclose(fits["A"], 0.2, atol=1e-5)
+        np.testing.assert_allclose(fits["MeanPercentDrop"], 25.0)
 
 
 if __name__ == "__main__":

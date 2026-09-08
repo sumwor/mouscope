@@ -36,6 +36,11 @@ from analyze_session_boundary import (
 PARAMETER_LOWER = np.array([0.0, 0.0, 1.0])
 PARAMETER_UPPER = np.array([1.0, 1.0, 300.0])
 MIN_FIT_BINS = 8
+PRE_BOUNDARY_TRIALS = 300
+POST_BOUNDARY_TRIALS = 300
+BIN_TRIALS = 20
+INITIAL_POST_TRIALS = 50
+PERCENT_BASELINE_ATOL = 1e-12
 
 
 def exponential_recovery(n, p_inf, amplitude, recovery_lambda):
@@ -197,3 +202,165 @@ def fit_exponential_recovery(curve, min_bins=MIN_FIT_BINS):
     fit.update(parameter_warnings(parameters, True))
     return fit
 
+
+def _drop_metrics(baseline, initial_post):
+    absolute_drop = float(baseline - initial_post)
+    percent_valid = bool(
+        np.isfinite(baseline)
+        and np.isfinite(initial_post)
+        and not np.isclose(
+            baseline, 0.0, rtol=0.0, atol=PERCENT_BASELINE_ATOL
+        )
+    )
+    percent_drop = (
+        float(100.0 * absolute_drop / baseline) if percent_valid else np.nan
+    )
+    return absolute_drop, percent_drop, percent_valid
+
+
+def extract_boundary_data(
+    session_frames,
+    pre_trials=PRE_BOUNDARY_TRIALS,
+    post_trials=POST_BOUNDARY_TRIALS,
+    bin_trials=BIN_TRIALS,
+):
+    """Create post-boundary bin rows and empirical boundary metrics."""
+
+    bin_rows = []
+    metric_rows = []
+    for boundary_number, (previous, next_session) in enumerate(
+        zip(session_frames[:-1], session_frames[1:]), start=1
+    ):
+        if (
+            previous.empty
+            or next_session.empty
+            or "reward" not in previous
+            or "reward" not in next_session
+        ):
+            continue
+        previous_rewarded = rewarded_vector(previous)[-pre_trials:]
+        next_rewarded = rewarded_vector(next_session)[:post_trials]
+        if not len(previous_rewarded) or not len(next_rewarded):
+            continue
+
+        metadata = {
+            "BoundaryNumber": boundary_number,
+            "PreviousSession": int(previous["_session_number"].iloc[-1]),
+            "NextSession": int(next_session["_session_number"].iloc[0]),
+            "PreviousSessionIndex": int(previous["_session_index"].iloc[-1]),
+            "NextSessionIndex": int(next_session["_session_index"].iloc[0]),
+            "PreviousDate": previous["_date"].iloc[-1],
+            "NextDate": next_session["_date"].iloc[0],
+            "PreviousProtocolDay": previous["_protocol_day"].iloc[-1],
+            "NextProtocolDay": next_session["_protocol_day"].iloc[0],
+        }
+        baseline = float(np.mean(previous_rewarded))
+        initial_post = float(
+            np.mean(next_rewarded[: min(INITIAL_POST_TRIALS, len(next_rewarded))])
+        )
+        absolute_drop, percent_drop, percent_valid = _drop_metrics(
+            baseline, initial_post
+        )
+        metric_rows.append(
+            metadata
+            | {
+                "NPreBaselineTrials": len(previous_rewarded),
+                "NPostTrials": len(next_rewarded),
+                "PreBoundaryBaseline": baseline,
+                "InitialPostPerformance": initial_post,
+                "DropMagnitude": absolute_drop,
+                "AbsoluteDrop": absolute_drop,
+                "PercentDrop": percent_drop,
+                "PercentDropValid": percent_valid,
+            }
+        )
+
+        for start in range(0, len(next_rewarded), bin_trials):
+            values = next_rewarded[start : start + bin_trials]
+            end = start + len(values) - 1
+            bin_rows.append(
+                metadata
+                | {
+                    "BinStart": start,
+                    "BinEnd": end,
+                    "BinCenter": (start + end) / 2.0,
+                    "NTrials": len(values),
+                    "Performance": float(np.mean(values)),
+                }
+            )
+
+    return pd.DataFrame(bin_rows), pd.DataFrame(metric_rows)
+
+
+def aggregate_group_curve(boundary_bins):
+    """Aggregate bin performance over boundaries, preserving boundary weighting."""
+
+    if boundary_bins.empty:
+        return pd.DataFrame()
+    group_columns = ["Protocol", "Genotype", "BinStart"]
+    return (
+        boundary_bins.groupby(group_columns, dropna=False, sort=True)
+        .agg(
+            BinEnd=("BinEnd", "max"),
+            BinCenter=("BinCenter", "max"),
+            ObservedMean=("Performance", "mean"),
+            ObservedSEM=("Performance", "sem"),
+            NBoundaries=("Performance", "size"),
+            NAnimals=("Animal", "nunique"),
+        )
+        .reset_index()
+    )
+
+
+def _empirical_animal_summary(metrics):
+    percent_valid = metrics["PercentDropValid"].astype(bool)
+    valid_percent = pd.to_numeric(
+        metrics.loc[percent_valid, "PercentDrop"], errors="coerce"
+    )
+    return {
+        "NBoundaries": int(len(metrics)),
+        "MeanPreBoundaryBaseline": float(metrics["PreBoundaryBaseline"].mean()),
+        "MedianPreBoundaryBaseline": float(
+            metrics["PreBoundaryBaseline"].median()
+        ),
+        "MeanDropMagnitude": float(metrics["DropMagnitude"].mean()),
+        "MedianDropMagnitude": float(metrics["DropMagnitude"].median()),
+        "MeanAbsoluteDrop": float(metrics["AbsoluteDrop"].mean()),
+        "MedianAbsoluteDrop": float(metrics["AbsoluteDrop"].median()),
+        "NPercentDropValid": int(valid_percent.notna().sum()),
+        "MeanPercentDrop": float(valid_percent.mean()),
+        "MedianPercentDrop": float(valid_percent.median()),
+    }
+
+
+def fit_animal_curves(boundary_bins, boundary_metrics):
+    """Pool each animal's boundaries by bin and fit its recovery curve."""
+
+    rows = []
+    grouping = boundary_metrics.groupby(["Animal", "Protocol"], sort=True)
+    for (animal, protocol), metrics in grouping:
+        animal_bins = boundary_bins[
+            (boundary_bins["Animal"] == animal)
+            & (boundary_bins["Protocol"] == protocol)
+        ]
+        curve = (
+            animal_bins.groupby("BinStart", sort=True)
+            .agg(
+                BinEnd=("BinEnd", "max"),
+                ObservedMean=("Performance", "mean"),
+            )
+            .reset_index()
+        )
+        fit = fit_exponential_recovery(curve)
+        first_bin = animal_bins.iloc[0] if not animal_bins.empty else None
+        rows.append(
+            {
+                "Animal": animal,
+                "Protocol": protocol,
+                "Genotype": first_bin["Genotype"] if first_bin is not None else np.nan,
+                "Gender": first_bin["Gender"] if first_bin is not None else np.nan,
+            }
+            | fit
+            | _empirical_animal_summary(metrics)
+        )
+    return pd.DataFrame(rows)
