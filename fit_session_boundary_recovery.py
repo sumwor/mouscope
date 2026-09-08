@@ -7,6 +7,9 @@ code.
 
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
+
 import matplotlib
 
 # Keep imports of the existing behavioral pipeline safe in headless runs.
@@ -24,6 +27,7 @@ matplotlib.use("Agg")
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
 
 from analyze_session_boundary import (
@@ -41,6 +45,15 @@ POST_BOUNDARY_TRIALS = 300
 BIN_TRIALS = 20
 INITIAL_POST_TRIALS = 50
 PERCENT_BASELINE_ATOL = 1e-12
+DEFAULT_BOOTSTRAP_REPLICATES = 1000
+DEFAULT_BOOTSTRAP_SEED = 240513
+GROUP_ORDER = (("AB", "WT"), ("AB", "HET"), ("CD", "WT"), ("CD", "HET"))
+GROUP_COLORS = {
+    ("AB", "WT"): "tab:blue",
+    ("AB", "HET"): "tab:cyan",
+    ("CD", "WT"): "tab:orange",
+    ("CD", "HET"): "tab:red",
+}
 
 
 def exponential_recovery(n, p_inf, amplitude, recovery_lambda):
@@ -503,3 +516,503 @@ def fit_group_curves(boundary_bins, boundary_metrics, n_replicates, seed):
         curve_rows.extend(curve.to_dict("records"))
 
     return pd.DataFrame(summary_rows), pd.DataFrame(curve_rows)
+
+
+def plot_protocol_recovery(group_summary, group_curve, protocol, output_path):
+    """Plot observed group means/SEM with exponential fits and bootstrap bands."""
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    annotations = []
+    for genotype in ("WT", "HET"):
+        key = (protocol, genotype)
+        color = GROUP_COLORS[key]
+        curve = group_curve[
+            (group_curve["Protocol"] == protocol)
+            & (group_curve["Genotype"].astype(str).str.upper() == genotype)
+        ].sort_values("BinStart")
+        fit_rows = group_summary[
+            (group_summary["Protocol"] == protocol)
+            & (group_summary["Genotype"].astype(str).str.upper() == genotype)
+        ]
+        if curve.empty or fit_rows.empty:
+            continue
+        fit = fit_rows.iloc[0]
+        ax.errorbar(
+            curve["BinCenter"],
+            curve["ObservedMean"],
+            yerr=curve["ObservedSEM"],
+            color=color,
+            marker="o",
+            markersize=4,
+            linewidth=1.2,
+            capsize=2,
+            linestyle="none",
+            alpha=0.85,
+            label=f"{genotype} observed mean +/- SEM",
+        )
+        if bool(fit["FitSuccess"]):
+            x = np.arange(POST_BOUNDARY_TRIALS)
+            fitted = exponential_recovery(
+                x, fit["P_inf"], fit["A"], fit["lambda"]
+            )
+            ax.plot(
+                x,
+                fitted,
+                color=color,
+                linewidth=2.2,
+                label=f"{genotype} exponential fit",
+            )
+            low = np.interp(
+                x,
+                curve["BinCenter"],
+                curve["FittedCurveCI_low"],
+                left=curve["FittedCurveCI_low"].iloc[0],
+                right=curve["FittedCurveCI_low"].iloc[-1],
+            )
+            high = np.interp(
+                x,
+                curve["BinCenter"],
+                curve["FittedCurveCI_high"],
+                left=curve["FittedCurveCI_high"].iloc[0],
+                right=curve["FittedCurveCI_high"].iloc[-1],
+            )
+            ax.fill_between(x, low, high, color=color, alpha=0.13, linewidth=0)
+        warning_suffix = " WARNING" if bool(fit["BoundaryWarning"]) else ""
+        annotations.append(
+            f"{genotype}: A={fit['A']:.3f} "
+            f"[{fit['A_CI_low']:.3f}, {fit['A_CI_high']:.3f}], "
+            f"lambda={fit['lambda']:.1f} "
+            f"[{fit['lambda_CI_low']:.1f}, {fit['lambda_CI_high']:.1f}]\n"
+            f"N={int(fit['NAnimals'])} animals, {int(fit['NBoundaries'])} boundaries"
+            f"{warning_suffix}"
+        )
+
+    ax.axvline(0, color="black", linestyle="--", linewidth=1.2)
+    ax.set_xlim(0, 300)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Post-boundary trial (zero-based)", fontsize=11)
+    ax.set_ylabel("P(correct)", fontsize=11)
+    ax.set_title(f"{protocol}: exponential post-session recovery", fontsize=15)
+    ax.text(
+        0.01,
+        0.98,
+        "animal-cluster bootstrap 95% CIs\n" + "\n".join(annotations),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "none"},
+    )
+    ax.tick_params(labelsize=10)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, fontsize=8.5, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _valid_animal_fits(animal_summary):
+    return animal_summary[
+        animal_summary["FitSuccess"].astype(bool)
+        & ~animal_summary["BoundaryWarning"].astype(bool)
+    ].copy()
+
+
+def plot_parameter_comparison(animal_summary, output_path):
+    """Show individual valid animal parameters with median and IQR."""
+
+    valid = _valid_animal_fits(animal_summary)
+    labels = [f"{protocol} {genotype}" for protocol, genotype in GROUP_ORDER]
+    rng = np.random.default_rng(7301)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    for ax, parameter, ylabel in zip(
+        axes,
+        ("A", "lambda", "P_inf"),
+        ("Fitted reset amplitude A", "Recovery timescale lambda (trials)", "P_inf"),
+    ):
+        for position, key in enumerate(GROUP_ORDER):
+            protocol, genotype = key
+            values = pd.to_numeric(
+                valid.loc[
+                    (valid["Protocol"] == protocol)
+                    & (valid["Genotype"].astype(str).str.upper() == genotype),
+                    parameter,
+                ],
+                errors="coerce",
+            ).dropna()
+            if values.empty:
+                continue
+            jitter = rng.uniform(-0.08, 0.08, len(values))
+            ax.scatter(
+                position + jitter,
+                values,
+                s=28,
+                alpha=0.7,
+                color=GROUP_COLORS[key],
+                edgecolor="white",
+                linewidth=0.4,
+            )
+            q1, median, q3 = values.quantile([0.25, 0.5, 0.75])
+            ax.vlines(position, q1, q3, color="black", linewidth=3, zorder=4)
+            ax.scatter(
+                position,
+                median,
+                marker="D",
+                s=65,
+                color="white",
+                edgecolor="black",
+                linewidth=1,
+                zorder=5,
+            )
+        ax.set_xticks(np.arange(len(labels)), labels, rotation=20, fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.tick_params(axis="y", labelsize=9)
+        ax.spines[["top", "right"]].set_visible(False)
+    excluded = int(len(animal_summary) - len(valid))
+    fig.suptitle(
+        "Animal-level recovery parameters: points with median/IQR\n"
+        f"Valid non-warning fits shown; {excluded} failed or warning fits excluded",
+        fontsize=14,
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_fitted_vs_empirical_drop(animal_summary, output_path):
+    """Compare fitted A with empirical absolute and relative reset metrics."""
+
+    valid = _valid_animal_fits(animal_summary)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for key in GROUP_ORDER:
+        protocol, genotype = key
+        rows = valid[
+            (valid["Protocol"] == protocol)
+            & (valid["Genotype"].astype(str).str.upper() == genotype)
+        ]
+        axes[0].scatter(
+            rows["A"],
+            rows["MeanAbsoluteDrop"],
+            color=GROUP_COLORS[key],
+            s=40,
+            alpha=0.75,
+            label=f"{protocol} {genotype}",
+        )
+        axes[1].scatter(
+            rows["A"],
+            rows["MeanPercentDrop"],
+            color=GROUP_COLORS[key],
+            s=40,
+            alpha=0.75,
+            label=f"{protocol} {genotype}",
+        )
+    axes[0].plot([0, 1], [0, 1], color="black", linestyle=":", linewidth=1)
+    axes[0].set_xlim(left=0)
+    axes[0].set_xlabel("Fitted A", fontsize=10)
+    axes[0].set_ylabel("Mean empirical AbsoluteDrop", fontsize=10)
+    axes[0].set_title("Same-unit comparison", fontsize=13)
+    axes[1].set_xlim(left=0)
+    axes[1].axhline(0, color="black", linestyle=":", linewidth=1)
+    axes[1].set_xlabel("Fitted A", fontsize=10)
+    axes[1].set_ylabel("Mean empirical PercentDrop (%)", fontsize=10)
+    axes[1].set_title("Relative empirical reset", fontsize=13)
+    for ax in axes:
+        ax.tick_params(labelsize=9)
+        ax.spines[["top", "right"]].set_visible(False)
+    axes[0].legend(frameon=False, fontsize=8)
+    fig.suptitle(
+        "Fitted recovery amplitude versus empirical boundary drop\n"
+        "Valid non-warning animal fits",
+        fontsize=14,
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_readme(output_dir, bootstrap_replicates, bootstrap_seed):
+    text = f"""Session-boundary exponential recovery analysis
+
+This standalone read-only diagnostic fits P(n) = P_inf - A * exp(-n/lambda)
+to post-session-boundary performance from zero-based trials 0 through 299.
+P_inf is estimated from the post-boundary trajectory and is not forced to the
+empirical pre-boundary baseline. A is the fitted recovery amplitude from P(0)
+to P_inf, and lambda is the recovery timescale in trials.
+
+Raw rewarded/correct trials are summarized in non-overlapping 20-trial bins.
+The fitted value for a bin is the mean model prediction across every integer
+trial in that bin. Fits use unweighted bounded least squares, deterministic
+multiple starts, P_inf and A bounds [0,1], lambda bounds [1,300], and at least
+8 finite bins. Predictions are not shifted, normalized, or clipped.
+
+The primary Protocol x Genotype group trajectory is boundary-weighted: every
+valid boundary-level bin is an observation, so animals with more boundaries
+contribute more rows. Uncertainty uses {bootstrap_replicates} animal-cluster
+bootstrap replicates with seed {bootstrap_seed}. Animals are resampled with
+replacement and every selected animal brings all of its boundaries. Repeated
+animal draws retain cluster multiplicity. This preserves the boundary-weighted
+estimand and does not switch to animal-equal weighting. Reported intervals are
+animal-cluster bootstrap 95% CIs.
+
+Empirical PreBoundaryBaseline uses up to 300 trials from the previous session.
+InitialPostPerformance uses the first 50 available post trials. DropMagnitude
+and AbsoluteDrop are the same absolute proportion difference. PercentDrop is
+calculated boundary-by-boundary as 100 * AbsoluteDrop / PreBoundaryBaseline
+before aggregation; baselines with absolute value <= {PERCENT_BASELINE_ATOL:g}
+are flagged invalid and not divided.
+
+PInfWarning, AWarning, and LambdaWarning identify estimates within 1% of their
+parameter bounds. P0Warning identifies fitted P(0) outside [0,1].
+BoundaryWarning is the composite of those flags and also marks failed fits.
+Failed, non-finite, insufficient-bin, and parameter-warning fits must not be
+treated as valid biological parameter estimates.
+
+Identifiability caveats:
+- P_inf, A, and lambda trade off if performance has not plateaued by trial 299.
+- Flat/noisy trajectories can put A near zero and leave lambda unidentified.
+- Each fit has at most 15 binned observations.
+- A partly extrapolates to trial zero because the first observation averages
+  trials 0-19.
+- Independent P_inf and A bounds can allow P(0) below zero; this is flagged and
+  never clipped or shifted.
+- Fitted A measures recovery toward the fitted post-session asymptote, whereas
+  empirical DropMagnitude compares the previous-session baseline with the first
+  50 post trials. Directional agreement does not require numerical equality.
+- Bootstrap intervals can be skewed or truncated by parameter bounds.
+
+This is a descriptive/modeling analysis. Animal-cluster bootstrap 95% CIs
+describe uncertainty in each group curve; they are not inferential WT/HET
+genotype-comparison tests. No statistical significance claim should be made
+without an explicit inferential analysis.
+"""
+    (output_dir / "README_session_boundary_recovery_fit.txt").write_text(
+        text, encoding="utf-8"
+    )
+
+
+def write_outputs(
+    group_summary,
+    animal_summary,
+    group_curve,
+    output_dir,
+    bootstrap_replicates,
+    bootstrap_seed,
+):
+    """Write all requested tables, static figures, and explanatory README."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    group_summary.to_csv(output_dir / "recovery_group_fit_summary.csv", index=False)
+    animal_summary.to_csv(
+        output_dir / "recovery_animal_fit_summary.csv", index=False
+    )
+    group_curve.to_csv(
+        output_dir / "recovery_group_aligned_curve.csv", index=False
+    )
+    for protocol in ("AB", "CD"):
+        plot_protocol_recovery(
+            group_summary,
+            group_curve,
+            protocol,
+            output_dir / f"{protocol}_exponential_recovery_fit.png",
+        )
+    plot_parameter_comparison(
+        animal_summary, output_dir / "recovery_parameter_comparison.png"
+    )
+    plot_fitted_vs_empirical_drop(
+        animal_summary, output_dir / "fitted_vs_empirical_drop.png"
+    )
+    write_readme(output_dir, bootstrap_replicates, bootstrap_seed)
+
+
+def run_synthetic_check():
+    """Fit a seeded noisy trajectory with known recovery parameters."""
+
+    rng = np.random.default_rng(DEFAULT_BOOTSTRAP_SEED)
+    starts = np.arange(0, POST_BOUNDARY_TRIALS, BIN_TRIALS)
+    ends = starts + BIN_TRIALS - 1
+    expected = binned_model_prediction(starts, ends, np.array([0.8, 0.2, 75.0]))
+    curve = pd.DataFrame(
+        {
+            "BinStart": starts,
+            "BinEnd": ends,
+            "ObservedMean": expected + rng.normal(0, 0.004, len(starts)),
+        }
+    )
+    return fit_exponential_recovery(curve)
+
+
+def analyze_dataset(model, bootstrap_replicates, bootstrap_seed):
+    """Extract all AB/CD boundary data and produce fitted summaries."""
+
+    bin_rows = []
+    metric_rows = []
+    animal_info = model.data_index.drop_duplicates("Animal").set_index("Animal")
+    for animal in model.data_index["Animal"].unique():
+        genotype = animal_info.loc[animal, "Genotype"]
+        gender = animal_info.loc[animal, "Gender"]
+        identity = {"Animal": animal, "Genotype": genotype, "Gender": gender}
+        for protocol in ("AB", "CD"):
+            sessions = load_protocol_sessions(model, animal, protocol)
+            bins, metrics = extract_boundary_data(sessions)
+            for row in bins.to_dict("records"):
+                bin_rows.append(identity | {"Protocol": protocol} | row)
+            for row in metrics.to_dict("records"):
+                metric_rows.append(identity | {"Protocol": protocol} | row)
+    boundary_bins = pd.DataFrame(bin_rows)
+    boundary_metrics = pd.DataFrame(metric_rows)
+    animal_summary = fit_animal_curves(boundary_bins, boundary_metrics)
+    group_summary, group_curve = fit_group_curves(
+        boundary_bins,
+        boundary_metrics,
+        n_replicates=bootstrap_replicates,
+        seed=bootstrap_seed,
+    )
+    return group_summary, animal_summary, group_curve, boundary_bins, boundary_metrics
+
+
+def expected_output_paths(output_dir):
+    return [
+        output_dir / "recovery_group_fit_summary.csv",
+        output_dir / "recovery_animal_fit_summary.csv",
+        output_dir / "recovery_group_aligned_curve.csv",
+        output_dir / "AB_exponential_recovery_fit.png",
+        output_dir / "CD_exponential_recovery_fit.png",
+        output_dir / "recovery_parameter_comparison.png",
+        output_dir / "fitted_vs_empirical_drop.png",
+        output_dir / "README_session_boundary_recovery_fit.txt",
+    ]
+
+
+def guard_against_overwrite(output_dir):
+    existing = [path for path in expected_output_paths(output_dir) if path.exists()]
+    if existing:
+        raise FileExistsError(
+            "Refusing to overwrite existing recovery-fit outputs:\n"
+            + "\n".join(str(path) for path in existing)
+        )
+
+
+def format_group_table(group_summary):
+    lines = [
+        "Protocol | Genotype | NAnimals | NBoundaries | P_inf "
+        "[animal-cluster bootstrap 95% CI] | A [animal-cluster bootstrap 95% CI] "
+        "| lambda [animal-cluster bootstrap 95% CI] | RMSE | R2"
+    ]
+    for protocol, genotype in GROUP_ORDER:
+        selected = group_summary[
+            (group_summary["Protocol"] == protocol)
+            & (group_summary["Genotype"].astype(str).str.upper() == genotype)
+        ]
+        if selected.empty:
+            continue
+        row = selected.iloc[0]
+        lines.append(
+            f"{protocol} | {genotype} | {int(row['NAnimals'])} | "
+            f"{int(row['NBoundaries'])} | {row['P_inf']:.3f} "
+            f"[{row['P_inf_CI_low']:.3f}, {row['P_inf_CI_high']:.3f}] | "
+            f"{row['A']:.3f} [{row['A_CI_low']:.3f}, {row['A_CI_high']:.3f}] | "
+            f"{row['lambda']:.1f} "
+            f"[{row['lambda_CI_low']:.1f}, {row['lambda_CI_high']:.1f}] | "
+            f"{row['RMSE']:.4f} | {row['R2']:.3f}"
+        )
+    return lines
+
+
+def qualitative_findings(group_summary):
+    lookup = group_summary.set_index(["Protocol", "Genotype"])
+    comparisons = []
+    for genotype in ("WT", "HET"):
+        if ("AB", genotype) in lookup.index and ("CD", genotype) in lookup.index:
+            comparisons.append(
+                f"CD {genotype} A {'>' if lookup.at[('CD', genotype), 'A'] > lookup.at[('AB', genotype), 'A'] else '<='} AB {genotype} A"
+            )
+    valid_group = group_summary[
+        group_summary["FitSuccess"].astype(bool)
+        & ~group_summary["BoundaryWarning"].astype(bool)
+    ]
+    largest_a = (
+        valid_group.loc[valid_group["A"].idxmax(), ["Protocol", "Genotype"]]
+        if not valid_group.empty
+        else None
+    )
+    largest_lambda = (
+        valid_group.loc[
+            valid_group["lambda"].idxmax(), ["Protocol", "Genotype"]
+        ]
+        if not valid_group.empty
+        else None
+    )
+    all_directional = bool(
+        (
+            np.sign(group_summary["A"])
+            == np.sign(group_summary["MeanAbsoluteDrop"])
+        ).all()
+        and (
+            np.sign(group_summary["A"])
+            == np.sign(group_summary["MeanPercentDrop"])
+        ).all()
+    )
+    return (
+        "; ".join(comparisons)
+        + (f"; largest valid A={largest_a['Protocol']} {largest_a['Genotype']}" if largest_a is not None else "; no valid non-warning A")
+        + (f"; longest valid lambda={largest_lambda['Protocol']} {largest_lambda['Genotype']}" if largest_lambda is not None else "; no valid non-warning lambda")
+        + f"; fitted A agrees in sign with empirical drops={all_directional}. "
+        "Descriptive comparisons only; no genotype-effect inference."
+    )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root-dir")
+    parser.add_argument("--output-dir")
+    parser.add_argument("--strain")
+    parser.add_argument(
+        "--bootstrap-replicates", type=int, default=DEFAULT_BOOTSTRAP_REPLICATES
+    )
+    parser.add_argument("--bootstrap-seed", type=int, default=DEFAULT_BOOTSTRAP_SEED)
+    parser.add_argument("--synthetic-test-only", action="store_true")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.synthetic_test_only:
+        fit = run_synthetic_check()
+        print(
+            "Synthetic recovery fit: "
+            f"P_inf={fit['P_inf']:.4f} (target 0.80), "
+            f"A={fit['A']:.4f} (target 0.20), "
+            f"lambda={fit['lambda']:.2f} (target 75), "
+            f"success={fit['FitSuccess']}"
+        )
+        return
+    if not args.root_dir or not args.output_dir:
+        raise SystemExit("--root-dir and --output-dir are required")
+    if args.bootstrap_replicates < 1:
+        raise SystemExit("--bootstrap-replicates must be at least 1")
+
+    root_dir = Path(args.root_dir).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    guard_against_overwrite(output_dir)
+    strain = args.strain or root_dir.name
+    model = ReadOnlyBehDataOdor(str(root_dir), strain)
+    group_summary, animal_summary, group_curve, _, _ = analyze_dataset(
+        model,
+        bootstrap_replicates=args.bootstrap_replicates,
+        bootstrap_seed=args.bootstrap_seed,
+    )
+    write_outputs(
+        group_summary,
+        animal_summary,
+        group_curve,
+        output_dir,
+        bootstrap_replicates=args.bootstrap_replicates,
+        bootstrap_seed=args.bootstrap_seed,
+    )
+    print("Session-boundary exponential recovery analysis complete: " + str(output_dir))
+    print("\n".join(format_group_table(group_summary)))
+    print("Qualitative findings: " + qualitative_findings(group_summary))
+
+
+if __name__ == "__main__":
+    main()
