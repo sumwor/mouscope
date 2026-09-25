@@ -711,9 +711,9 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
         running_reward_prob[:n_trials - window_size + 1] = (
             csum[window_size:] - csum[:-window_size]
         ) / window_size
-    pCorrect_data_smooth = pd.Series(running_reward_prob).rolling(60, center=True, min_periods=1).mean().to_numpy()
+    #pCorrect_data_smooth = pd.Series(running_reward_prob).rolling(20, center=True, min_periods=1).mean().to_numpy()
 
-    if model_label == 'Policy Gradient':
+    if model_label == 'policy_gradient':
         w_mode = np.asarray(latent_fit["wMode"], dtype=float)
         if w_mode.ndim == 1:
             w_mode = w_mode[None, :]
@@ -732,7 +732,7 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
         pR = latent_fit['pR_fit']
         # convert pR to pCorrect_fit
         pCorrect_fit = [1 - pR[i] if sti[i]<0 else pR[i] for i in range(len(pR))]
-        pCorrect_fit_smooth = pd.Series(pCorrect_fit).rolling(60, center=True, min_periods=1).mean().to_numpy()
+        pCorrect_fit_smooth = pd.Series(pCorrect_fit).rolling(50, center=True, min_periods=1).mean().to_numpy()
 
         # calculate the derivative of the fitted weights, looking for peaks
         w_mode_derivative = np.gradient(w_mode, axis=1)
@@ -753,7 +753,7 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
 
         pCorrect_fit_smooth = (
             pd.Series(latent_fit["pCorrect_fit"])
-            .rolling(60, center=True, min_periods=1)
+            .rolling(50, center=True, min_periods=1)
             .mean()
             .to_numpy()
         )
@@ -764,8 +764,8 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
     fig, axs = plt.subplots(3, 1, figsize=(10, 6), sharex=True)
     # first subplot: running reward probability of data and fit
     #axs[0].plot(x, running_reward_prob, color="black", linewidth=2)
-    axs[0].plot(x_plot, pCorrect_data_smooth, color="black", linewidth=4, label="Data")
-    axs[0].plot(x_plot, pCorrect_fit_smooth, color=[0.7, 0.7, 0.7], linestyle="--", linewidth=4, label="Fit")
+    axs[0].plot(x_plot, running_reward_prob, color="black", linewidth=2, label="Data")
+    axs[0].plot(x_plot, pCorrect_fit_smooth, color=[0.7, 0.7, 0.7], linestyle="--", linewidth=2, label="Fit")
     axs[0].set_ylim([0, 1])
     axs[0].legend(frameon=False)
     axs[0].set_ylabel("P(reward)")
@@ -777,7 +777,7 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
         latent_x = np.arange(1, w_mode.shape[1] + 1)
         for ii in range(w_mode.shape[0]):
             label = weights[ii] if ii < len(weights) else f"weight_{ii + 1}"
-            axs[1].plot(latent_x, w_mode[ii], linewidth=3, label=label)
+            axs[1].plot(latent_x, w_mode[ii], linewidth=2, label=label)
         axs[1].set_ylabel("Latent weight")
         axs[1].set_xlabel("Trial")
         axs[1].spines["top"].set_visible(False)
@@ -785,8 +785,8 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
         axs[1].legend(frameon=False)
     elif model_label == 'hybrid_Q':
         latent_x = np.arange(1, q_diff.shape[0] + 1)
-        axs[1].plot(latent_x, q_diff[:,0], linewidth=3)
-        axs[1].plot(latent_x, q_diff[:,1], linewidth=3)
+        axs[1].plot(latent_x, q_diff[:,0], linewidth=2)
+        axs[1].plot(latent_x, q_diff[:,1], linewidth=2)
         axs[1].set_ylabel("Delta Q")
         axs[1].set_xlabel("Trial")
         axs[1].set_ylim([-0.5, 0.5])
@@ -795,7 +795,7 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
         #axs[1].legend(frameon=False)
 
         # plot p_engaged
-        axs[2].plot(latent_x, p_engaged[:,1], linewidth=3)
+        axs[2].plot(latent_x, p_engaged[:,1], linewidth=2)
         axs[2].set_ylabel("P(engaged)")
         axs[2].set_xlabel("Trial")
         axs[2].set_ylim([0, 1])
@@ -804,6 +804,8 @@ def plot_latent_session(resultdf, latent_fit, model_label,savefigpath):
 
     fig.tight_layout()
     fig.savefig(savefigpath+'.png', format="png",dpi=300, bbox_inches="tight")
-    fig.savefig(savefigpath+'.svg',  format="svg", bbox_inches="tight")    
+    for a in axs.flat:
+        a.patch.set_visible(False)
+    fig.savefig(savefigpath+'.svg',  format="svg", bbox_inches="tight", transparent=True)
     plt.close(fig)
     #return fig

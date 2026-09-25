@@ -51,7 +51,12 @@ class StartPlots:
         if not os.path.exists(figpath):
             os.makedirs(figpath)
 
-        self.fig.savefig(os.path.join(figpath,title), format=type)
+        if type == 'svg':
+            for a in self.fig.axes:
+                a.patch.set_visible(False)
+            self.fig.savefig(os.path.join(figpath,title), format=type, transparent=True)
+        else:
+            self.fig.savefig(os.path.join(figpath,title), format=type)
 
 # another class to generate subplots
 class StartSubplots(StartPlots):

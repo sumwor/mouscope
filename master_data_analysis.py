@@ -19,14 +19,31 @@ run_odor = True
 run_rotarod = True
 count_animals = False
 if_QC = False
+plot_all_strains = False
 
 notebook_url_path = r'Y:\HongliWang\Odor\url_individual_notebook.csv'
 
+color_dict = {
+    'TSC2': '#1f77b4',
+    'Shank3B': '#ff7f0e',
+    'Nlgn3': '#2ca02c',
+    'ChD8': '#8c564b',
+    'Cntnap2': '#9467bd',
+    'Scn2A': '#d62728',
+    'Syngap': '#e377c2'
+}
+
 if run_odor:
+
+    if plot_all_strains:
+        odor_dir = r'Y:\HongliWang\Odor'
+        strains = ['TSC2', 'Shank3B', 'Nlgn3', 'ChD8', 'Cntnap2', 'Scn2A', 'Syngap']
+        plot_all_strains_learning_curves(odor_dir, strains, age='adol', color_dict=color_dict)
+
 
     if count_animals:
         odor_dir = r'Y:\HongliWang\Odor'
-        strains = ['TSC2', 'Shank3B', 'Nlgn3', 'Chd8', 'Cntnap2', 'Scn2A', 'Syngap']
+        strains = ['TSC2', 'Shank3B', 'Nlgn3', 'ChD8', 'Cntnap2', 'Scn2A', 'Syngap']
         ages = ['adol', 'adult']
 
         #%% count the number of animals and trials for each strain, age, and genotype
@@ -71,13 +88,12 @@ if run_odor:
 
     #%% for odor behavioral data
     # analyze the TSC2 behavioral recording data
-    #strain_list = ['TSC2_adol', 'TSC2_adult', 'ChD8_adol', 'Cntnap2_adol', 'Scn2a_adol', 'Scn2a_adult', 'Syngap(SGR)_adult', 'Syngap_adol']
+    #strain_list = ['TSC2_adol', 'TSC2_adult', 'Nlgn3_adol', 'ChD8_adol', 'Cntnap2_adol', 'Scn2a_adol', 'Scn2a_adult', 'Syngap(SGR)_adult', 'Syngap_adol']
     #for strain in strain_list:
-    strain = 'Syngap_adol'
+    strain =  'Syngap(SGR)_adult'
     root_dir = os.path.join(r'Y:\HongliWang\Odor', strain)
 
     Odor = BehDataOdor(root_dir, strain)
-    Odor.load_data()
 
     # QC: compare loaded data with notebook data (saved in google sheet url)
     if if_QC:
@@ -86,12 +102,12 @@ if run_odor:
         Odor.compare_notebook(strain_url[0])
 
     #Odor.session_analysis()
-    Odor.plot_performance()
+    Odor.plot_performance(color_dict=color_dict)
     
     #%% model fitting (only implemented policy gradient for now)
-    #Odor.model_fitting(fit_mode='session', model_name='policy_gradient')
+    Odor.model_fitting(fit_mode='session', model_name='policy_gradient', color_dict=color_dict)
 
-    Odor.model_fitting(fit_mode='session', model_name='hybrid_Q')
+    Odor.model_fitting(fit_mode='session', model_name='hybrid_Q', color_dict=color_dict)
     #Odor.model_fitting(fit_mode='concat')
     Odor.model_comparison()
 
@@ -99,8 +115,14 @@ if run_odor:
     #Odor.plot_performance()
     #Odor.plot_response_times()
 
-    Odor.align_timeStamps()
-    Odor.DLC_analysis()
+    #Odor.align_timeStamps()
+    #Odor.DLC_analysis()
+
+    if plot_all_strains:
+        odor_dir = r'Y:\HongliWang\Odor'
+        strains = ['TSC2', 'Shank3B', 'Nlgn3', 'ChD8', 'Cntnap2', 'Scn2A', 'Syngap']
+        plot_all_strains_learning_curves(odor_dir, strains, age='adol', color_dict=color_dict)
+
 
 #%% for rotarod analysis
 
@@ -186,10 +208,14 @@ if run_rotarod:
 
                 # check if there is data
                 Rotarod = BehDataRotarod(root_dir, strain_folder)
+
+               
+
                 #Rotarod.plot_performance()
                 if len(Rotarod.Animals) > 0:
+                    Rotarod.quality_control()
                     #Rotarod.load_DLC_data()
-                    Rotarod.plot_performance()
+                    Rotarod.plot_performance(color_dict=color_dict)
 
 
     # check one strain first
@@ -203,7 +229,7 @@ if run_rotarod:
     Rotarod.load_DLC_data()
     Rotarod.align_timeStamps()
     
-    Rotarod.process_for_moseq()
+    #Rotarod.process_for_moseq()
 
 
 
@@ -212,4 +238,4 @@ if run_rotarod:
 
     Rotarod.stride_session(back_keypoints, front_keypoints)
 
-    Rotarod.stride_summary()
+    Rotarod.stride_summary(color_dict=color_dict)

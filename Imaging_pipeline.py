@@ -912,7 +912,9 @@ class Imaging:
                 
                 # save the figure in png and vector format
                 plt.savefig(os.path.join(savefigfolder, 'MLR_results.png'), dpi=300, bbox_inches='tight')
-                plt.savefig(os.path.join(savefigfolder, 'MLR_results.svg'), bbox_inches='tight')
+                for a in axes:
+                    a.patch.set_visible(False)
+                plt.savefig(os.path.join(savefigfolder, 'MLR_results.svg'), bbox_inches='tight', transparent=True)
 
     def MLR_orthogonal(self):
         # orthogonalize the predictors and disentangle stimulus/choice/outcome

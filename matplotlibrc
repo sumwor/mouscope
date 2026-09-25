@@ -1,0 +1,9 @@
+## Repository-wide default font settings.
+## Matplotlib reads this file automatically for any script run with this
+## directory as the current working directory (before its own rcParams
+## overrides, such as the ones set in utils_beh.py, take effect).
+font.family: sans-serif
+font.sans-serif: Arial
+font.size: 9
+axes.titlesize: 10
+figure.titlesize: 10

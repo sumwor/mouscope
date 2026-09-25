@@ -12,38 +12,63 @@ plt.ion()
 from utils_beh import extract_behavior_df
 from utils_imaging import iso_to_timeofday, AI_timeStamp_correction
 
+#%% load data from separate chunks
 dataPath = r'Y:\HongliWang\Miniscope\ASD\Data\ASDC003\ASDC003_260812'
 
 AITimeStamps = [f for f in os.listdir(dataPath) if 'AITimeStamp' in f]
 AIFiles = [f for f in os.listdir(dataPath) if 'AITTL' in f]
 matFiles = r'Y:\HongliWang\Miniscope\ASD\Data\ASDC003\ASDC003_20260812_AB.mat'
 
+videoTimeStamp = [f for f in os.listdir(dataPath) if 'ImgTimeStamp' in f]
+
 behDF = extract_behavior_df(matFiles)
 
 AI_channels = 2
 AI_freq = 1000
+n_valid_sum = 0
+for AI_file in AIFiles:
+    AI_matrix = np.fromfile(os.path.join(dataPath, AI_file))
+    AI_matrix = AI_matrix.reshape(-1, AI_channels)
+    is_high = AI_matrix[:,0] > 4
+    edges = np.diff(is_high.astype(int))
+    rising = np.where(edges == 1)[0] + 1
+    falling = np.where(edges == -1)[0] + 1
+    durations = (falling - rising) / AI_freq
+    # exclude durations longer than 0.2 seconds (manual valve opening)
+    valid_pulses = durations < 0.2
+    n_valid_events = np.sum(valid_pulses)
+    n_valid_sum += n_valid_events
 
-AI_matrix_1 = np.fromfile(os.path.join(dataPath, AIFiles[0]), dtype=np.float32)
-AI_TimeStamp_1 = pd.read_csv(os.path.join(dataPath, AITimeStamps[0]), header=None).values.squeeze()  # unit in ms
-# unit in ms
 
+# plt.figure()
+# plt.plot(AI_matrix_2[:,1])
 ## lunghao code for AI timestamp correction
-AI_TS_interp = AI_timeStamp_correction(AI_TimeStamp_1)
 
-# rearange AI_matrix to two channels (one is ground)
-AI_matrix_1 = AI_matrix_1.reshape(-1, AI_channels)
-# look for rising edges of high voltage and get the time every 3 events
-is_high = AI_matrix_1[:,0] > 4
-edges = np.diff(is_high.astype(int))
-rising = np.where(edges == 1)[0] + 1
-falling = np.where(edges == -1)[0] + 1
-durations = (falling - rising) / AI_freq
-# exclude durations longer than 0.2 seconds (manual valve opening)
-valid_pulses = durations < 0.2
-n_valid_events = np.sum(valid_pulses)
+
+
+gaps = (rising_1[1:] - falling_1[:-1])/AI_freq
+
+# For each pulse:
+# prev_gap[i] = gap from previous pulse
+# next_gap[i] = gap to next pulse
+
+prev_gap = np.r_[np.inf, gaps]
+next_gap = np.r_[gaps, np.inf]
+
+# A pulse is "isolated" if it is >1 s away from both
+# available neighbors.
+isolated_idx = np.where(
+    (prev_gap > 1) & (next_gap > 1)
+)[0]
+
+# if the isolated pulse is in the very beginning, set to 0
+if len(isolated_idx) > 0 and isolated_idx[0] == 0:
+    AI_matrix_1[rising_1[0]:falling_1[0],0] = 0
+    # reshape the matrix back to 1-D
+    AI_matrix_1D = AI_matrix_1.reshape(-1)
+
 
 # read behavior csv files
-behDF = pd.read_csv(self.data_index['BehCSV'][ii])
 
 # look for left correct trials
 nLeftCorrect = np.sum(np.logical_and(behDF['schedule'] == 1, behDF['reward'] > 0))
@@ -59,11 +84,119 @@ if not nPulses == n_valid_events:
 # if match, align behDF timestamp with AI timestamp
 # make a scatter plot to show time stamp of every left correct trial aligns with each other
 
+#%% concatenate filesAI_matrix = np.concatenate([AI_matrix_1, AI_matrix_2], axis=0)
+
+output_file = os.path.join(dataPath, 'ASDC004_260812_AITTL_concat')
+AI_matrix = np.concatenate([AI_matrix_1D, AI_matrix_2], axis=0)
+AI_matrix.tofile(output_file)
+
+# concat AI_timestamp, probably alignment issue
+AI_timestamp_concat = np.concatenate([AI_TimeStamp_1, AI_TimeStamp_2])
+# save to csv
+output_file_timestamp = os.path.join(dataPath, 'ASDC004_260812_AITimeStamp_concat.csv')
+pd.DataFrame(AI_timestamp_concat).to_csv(output_file_timestamp, index=False, header=False)
+
+# concat Imaging video timestamp
+videoTimestamp_df = pd.DataFrame()
+for ts in videoTimeStamp:
+    df = pd.read_csv(os.path.join(dataPath, ts), header=None)
+    videoTimestamp_df = pd.concat([videoTimestamp_df, df], ignore_index=True)
+output_file_video_timestamp = os.path.join(dataPath, 'ASDC004_260812_ImgTimeStamp_concat.csv')
+videoTimestamp_df.to_csv(output_file_video_timestamp, index=False, header=False)
+
+# concat videos 
+ImgVideoFiles = [f for f in os.listdir(dataPath) if 'ImgVideo' in f]
+import subprocess
+
+# Create concat list
+list_file = os.path.join(dataPath, 'video_concat_list.txt')
+
+with open(list_file, 'w') as f:
+    for video in ImgVideoFiles:
+        path = os.path.abspath(os.path.join(dataPath, video))
+        f.write(f"file '{path}'\n")
+
+output_file = os.path.join(dataPath, 'ASDC004_260812_ImgVideo_concat.avi')
+
+subprocess.run([
+    'ffmpeg',
+    '-f', 'concat',
+    '-safe', '0',
+    '-i', list_file,
+    '-c', 'copy',
+    output_file
+], check=True)
+
+print(f'Saved: {output_file}')
+
+# concat behavior video time stamp
+behTimestamp_df = pd.DataFrame()
+behTimestamp = [f for f in os.listdir(dataPath) if '.csv' in f and 'TimeStamp' not in f]
+for ts in behTimestamp:
+    df = pd.read_csv(os.path.join(dataPath, ts), header=None)
+    behTimestamp_df = pd.concat([behTimestamp_df, df], ignore_index=True)
+output_file_beh_timestamp = os.path.join(dataPath, 'ASDC004_260812_concat.csv')
+behTimestamp_df.to_csv(output_file_beh_timestamp, index=False, header=False)
+
+# concat behavior video
+behVideoFiles = [f for f in os.listdir(dataPath) if '.mp4' in f]
+
+# Create concat list
+list_file = os.path.join(dataPath, 'video_concat_list.txt')
+
+with open(list_file, 'w') as f:
+    for video in behVideoFiles:
+        path = os.path.abspath(os.path.join(dataPath, video))
+        f.write(f"file '{path}'\n")
+
+output_file = os.path.join(dataPath, 'ASDC004_260812_concat.mp4')
+
+subprocess.run([
+    'ffmpeg',
+    '-f', 'concat',
+    '-safe', '0',
+    '-i', list_file,
+    '-c', 'copy',
+    output_file
+], check=True)
+
+print(f'Saved: {output_file}')
+
+
+#%% check if the concatenated files can be processed by the analysis pipeline
+AI_TimeStamp = pd.read_csv(output_file_timestamp, header=None).values.squeeze()  # unit in ms
+AI_TS_interp = AI_timeStamp_correction(AI_TimeStamp)
+
 LC_Mask = np.logical_and(behDF['schedule'] == 1, behDF['reward'] > 0)
 trialNumber = np.arange(behDF.shape[0])
 LC_trialNum = trialNumber[LC_Mask]
 
-# 
+#load concate AI matrix
+AI_matrix= np.fromfile(output_file)
+AI_matrix = AI_matrix.reshape(-1, AI_channels)
+# look for rising edges of high voltage and get the time every 3 events
+is_high = AI_matrix[:,0] > 4
+edges = np.diff(is_high.astype(int))
+rising = np.where(edges == 1)[0] + 1
+falling = np.where(edges == -1)[0] + 1
+durations = (falling - rising) / AI_freq
+# exclude durations longer than 0.2 seconds (manual valve opening)
+valid_pulses = durations < 0.2
+n_valid_events = np.sum(valid_pulses)
+
+
+# look for left correct trials
+nLeftCorrect = np.sum(np.logical_and(behDF['schedule'] == 1, behDF['reward'] > 0))
+
+# make a plot, go over behDF, if a left choice reward = 3, count 3 high voltage event
+# if a left choice reward = 2, count 2 high voltage event
+nPulses = np.sum(behDF['reward'][np.logical_or(behDF['schedule']==1, behDF['schedule']==3)])
+
+# if not nPulses == n_valid_events:
+#     print(f"Session file {self.data_index['Animal'][ii]}_{self.data_index['Date'][ii]}")
+#     print("Mismatching between AI pulses and left correct trials, check!!!")
+
+
 indices = (np.concatenate(([0], np.cumsum(behDF['reward'][LC_Mask][:-1])))).astype(int)
 matched = rising[indices]
 
@@ -91,8 +224,7 @@ if nClips > 1:
             behDF.loc[clip_s:clip_e, key] += AI_time
 
 
-
-            
+      
 t_offset = AI_TS_interp[matched]/1000 - behDF['outcome'][LC_trialNum]
 AI_TS_aligned = np.zeros_like(AI_TS_interp)
 # based on the offset, evenly distribute the AI_TS_interp between the trials
@@ -120,9 +252,9 @@ for tt in range(len(behDF['outcome'][LC_trialNum])-1):
 # load behavior recording timestamp if exists
 # check if it is aligned
 
-if not os.path.exists(self.data_index['behTimeStamp'][ii]):
-    behTimeStamp = pd.read_csv(self.data_index['behTimeStamp'][ii], header=None)
-    header = ['TimeStamp']
+
+behTimeStamp = pd.read_csv()
+header = ['TimeStamp']
     behTimeStamp.columns = header
     # for each timestamp in behTimeStamp, find the closest timestamp in AI_TS_interp, 
     # then replace it with the corresponding timestamp in AI_TS_aligned

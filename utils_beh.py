@@ -11,6 +11,15 @@ import imageio
 from skimage import color
 
 import matplotlib
+matplotlib.rcParams['svg.fonttype'] = 'none'
+# default figure text: Arial, 9pt everywhere except the main title (10pt) -
+# axes.titlesize covers a single-axes figure's title (ax.set_title), and
+# figure.titlesize covers a multi-panel figure's overall title (fig.suptitle)
+matplotlib.rcParams['font.family'] = 'sans-serif'
+matplotlib.rcParams['font.sans-serif'] = ['Arial']
+matplotlib.rcParams['font.size'] = 9
+matplotlib.rcParams['axes.titlesize'] = 10
+matplotlib.rcParams['figure.titlesize'] = 10
 #matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
 plt.ion()
@@ -28,7 +37,7 @@ from scipy.signal import butter, filtfilt
 from pygam import LinearGAM, s, f
 from scipy.io import loadmat
 import statsmodels.api as sm
-from scipy.stats import chi2, shapiro
+from scipy.stats import chi2, norm, shapiro
 from rpy2 import robjects as ro
 from rpy2.robjects import default_converter, pandas2ri
 from rpy2.robjects.conversion import localconverter
@@ -549,15 +558,15 @@ def run_learning_glmm(perf_df, behavior, save_name, summary_path):
         if (data[outcome] > 0).all() and len(data) >= 3:
             sample = data[outcome].sample(min(len(data), 5000), random_state=0)
             if shapiro(np.log(sample)).pvalue > shapiro(sample).pvalue:
-                data['_model_performance'] = np.log(data[outcome])
+                data['model_performance'] = np.log(data[outcome])
                 distribution = 'lognormal'
             else:
-                data['_model_performance'] = data[outcome]
+                data['model_performance'] = data[outcome]
                 distribution = 'gaussian'
         else:
-            data['_model_performance'] = data[outcome]
+            data['model_performance'] = data[outcome]
             distribution = 'gaussian'
-        response = '_model_performance'
+        response = 'model_performance'
     else:
         successes = np.rint(data[outcome] * 100).astype(int)
         if ((data[outcome] < 0) | (data[outcome] > 1) |
@@ -609,12 +618,11 @@ def run_learning_glmm(perf_df, behavior, save_name, summary_path):
         return {'term': term, 'lr_stat': float(row['Chisq']),
                 'df': int(row['Df']), 'p_value': float(row['Pr(>Chisq)'])}
 
-    # do one full model only
-    full_model_fit = lme4.glmer(
-        formulas['full_model'],
-        data=r_data,
-        family=stats.binomial()
-    )
+    # the full model was already fit above with the family matching this
+    # behavior's distribution (binomial GLMM for odor, gaussian/lognormal LMM
+    # for rotarod) -- reuse it instead of refitting as a binomial GLMM, which
+    # only makes sense for a 0/1 success-rate outcome like odor's.
+    full_model_fit = models['full_model']
     summary = ro.r['summary'](full_model_fit)
     #print(summary)
 
@@ -629,21 +637,36 @@ def run_learning_glmm(perf_df, behavior, save_name, summary_path):
             columns=list(summary.rx2('coefficients').colnames)
         )
 
+    # base lme4::lmer (used for rotarod's continuous outcome) doesn't report
+    # a p-value column at all, unlike glmer's Wald z-test for the odor
+    # binomial GLMM. Approximate it the same way (Wald test) from the t value.
+    if 'Pr(>|z|)' in coef_table.columns:
+        p_col = 'Pr(>|z|)'
+    elif 'Pr(>|t|)' in coef_table.columns:
+        p_col = 'Pr(>|t|)'
+    else:
+        coef_table['Pr(>|z|)'] = 2 * norm.sf(np.abs(coef_table['t value']))
+        p_col = 'Pr(>|z|)'
+
+    non_reference = next(level for level in levels if level != reference)
+    genotype_term = f'genotype{non_reference}'
+    interaction_term = f'{genotype_term}:trial'
+
     stats_df = pd.DataFrame([
         {
             'term': 'genotype',
-            'estimate': coef_table.loc['genotypeHET', 'Estimate'],
-            'p_value': coef_table.loc['genotypeHET', 'Pr(>|z|)']
+            'estimate': coef_table.loc[genotype_term, 'Estimate'],
+            'p_value': coef_table.loc[genotype_term, p_col]
         },
         {
             'term': 'trial',
             'estimate': coef_table.loc['trial', 'Estimate'],
-            'p_value': coef_table.loc['trial', 'Pr(>|z|)']
+            'p_value': coef_table.loc['trial', p_col]
         },
         {
             'term': 'genotype:trial',
-            'estimate': coef_table.loc['genotypeHET:trial', 'Estimate'],
-            'p_value': coef_table.loc['genotypeHET:trial', 'Pr(>|z|)']
+            'estimate': coef_table.loc[interaction_term, 'Estimate'],
+            'p_value': coef_table.loc[interaction_term, p_col]
         }
     ])
     # stats_df = pd.DataFrame([
@@ -814,6 +837,8 @@ def run_learning_gamm(perf_df, summary_path):
     ].copy()
 
     return stats_df, models, model_data
+
+
 
 
 def run_learning_FDA(
@@ -1017,11 +1042,12 @@ def plot_learning_curve(
     title='Learning Curve',
     ax=None,
     show_raw=True,
+    color_dict=None,
 ):
 
-    if trial_col == 'Block':
+    if trial_col.lower() == 'block':
         beh = 'odor'
-    elif trial_col == 'Trial':
+    elif trial_col.lower() == 'trial':
         beh = 'rotarod'
 
     plot_df = perf_df.copy()
@@ -1098,11 +1124,13 @@ def plot_learning_curve(
 
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(7, 5))
+        fig, ax = plt.subplots(figsize=(4.2, 3))
     else:
         fig = ax.figure
 
     colors = {'WT': 'black', 'HET': 'red', 'KO': 'red'}
+    if color_dict:
+        colors.update(color_dict)
     for genotype in genotype_order:
         genotype_data = summary_df[summary_df['genotype'] == genotype]
         if genotype_data.empty:
@@ -1115,7 +1143,7 @@ def plot_learning_curve(
         label = f'{genotype} (n={genotype_counts.get(genotype, 0)})'
         ax.errorbar(
             x, y, yerr=sem, marker='o', linewidth=2, capsize=3,
-            color=color, label=label
+            color=color, label=label, zorder=2 if genotype == 'WT' else 3
         )
 
         if show_raw:
@@ -1143,9 +1171,9 @@ def plot_learning_curve(
             f"GLMM p interaction = {p_values.get('genotype:trial', np.nan):.3g}"
         )
         ax.text(
-            0.98, 0.98, stats_text,
+            0.98, 0.02, stats_text,
             transform=ax.transAxes,
-            va='top',
+            va='bottom',
             ha='right',
             fontsize=9
         )
@@ -1159,26 +1187,98 @@ def plot_learning_curve(
     #     )
 
     # plot 0.5 and 0.7 line in the plot
-    ax.axhline(y=0.5, color=[0.7, 0.7, 0,.7], linestyle='--')
-    ax.axhline(y=0.7, color=[0.7, 0.7, 0,.7], linestyle='--')
+    ax.axhline(y=0.5, color='grey', linestyle='--', linewidth=1.5)
+    ax.axhline(y=0.7, color=[0.7, 0.7, 0,.7], linestyle='--', linewidth=1.5)
     ax.set_xticks(np.arange(len(trial_order)))
     ax.set_xticklabels([str(t) for t in trial_order])
-    ax.set_xlabel('Trial / Block')
+    ax.set_xlabel('100-trial block' if beh == 'odor' else 'Trial')
     ax.set_ylabel(ylabel)
     ax.set_ylim(0, ymax)
     ax.set_title(title)
-    ax.legend(frameon=False)
+    ax.legend(frameon=False, loc='lower left')
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(1.5)
+    ax.spines['bottom'].set_linewidth(1.5)
+    ax.tick_params(width=1.5)
     fig.tight_layout()
 
     if summary_path is not None:
         os.makedirs(os.path.join(summary_path, 'BehPlots'), exist_ok=True)
         fig.savefig(os.path.join(summary_path, 'BehPlots', f'{save_name}.png'), dpi=300)
-        fig.savefig(os.path.join(summary_path, 'BehPlots', f'{save_name}.svg'), format='svg')
+        ax.patch.set_visible(False)
+        fig.savefig(os.path.join(summary_path, 'BehPlots', f'{save_name}.svg'), format='svg', transparent=True)
 
     plt.close(fig)
     #return fig, ax, stats_df, clean_df
+
+def plot_all_strains_learning_curves(odor_dir, strains, age='adol',
+                                      session_to_compare=('AB1', 'AB2', 'AB3', 'CD1', 'CD2', 'CD3'),
+                                      color_dict=None):
+    # overlay every strain's WT vs. mutant learning curve (one color per
+    # strain, dotted = WT, solid = mutant), one figure per session - styled
+    # to match BehDataOdor.plot_performance/plot_learning_curve: mean +/- SEM
+    # error bars, 0.5/0.7 reference lines, thickened spines/ticks.
+    # Reads the per-session block performance already saved to disk by
+    # BehDataOdor.plot_performance() - run that for each strain first.
+    fallback_colors = plt.cm.tab10(np.linspace(0, 1, len(strains)))
+
+    figs = {}
+    for session in session_to_compare:
+        fig, ax = plt.subplots(figsize=(6, 4.5))
+
+        for strain, fallback_color in zip(strains, fallback_colors):
+            color = (color_dict or {}).get(strain, fallback_color)
+            strain_folder = f'{strain}_{age}'
+            results_dir = os.path.join(odor_dir, strain_folder, 'Summary', 'Results')
+            perf_path = os.path.join(results_dir, f'block_performance_{session}.csv')
+            if not os.path.exists(perf_path):
+                continue
+            perf_df = pd.read_csv(perf_path)
+            summary_df = perf_df.groupby(['Genotype', 'Block'])['RewardRate'].agg(
+                ['mean', 'std', 'count']
+            ).reset_index()
+            summary_df['sem'] = summary_df['std'] / np.sqrt(summary_df['count'])
+
+            mut_genotypes = [g for g in summary_df['Genotype'].unique() if g != 'WT']
+            mut_label = mut_genotypes[0] if mut_genotypes else None
+
+            for genotype, linestyle in (('WT', ':'), (mut_label, '-')):
+                if genotype is None:
+                    continue
+                geno_df = summary_df[summary_df['Genotype'] == genotype].sort_values('Block')
+                if geno_df.empty:
+                    continue
+                ax.fill_between(
+                    geno_df['Block'], geno_df['mean'] - geno_df['sem'], geno_df['mean'] + geno_df['sem'],
+                    color=color, alpha=0.15, linewidth=0, zorder=1,
+                )
+                ax.plot(
+                    geno_df['Block'], geno_df['mean'],
+                    color=color, linestyle=linestyle, marker='o', markersize=3,
+                    linewidth=2, label=f'{strain} {genotype}', zorder=2,
+                )
+
+        ax.axhline(y=0.5, color='grey', linestyle='--', linewidth=1.5)
+        ax.axhline(y=0.7, color='grey', linestyle='--', linewidth=1.5)
+        ax.set_title(f'{session} ({age})')
+        ax.set_xlabel('100-trial block')
+        ax.set_ylabel('Reward rate')
+        ax.legend(frameon=False, loc='lower left', fontsize=6)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_linewidth(1.5)
+        ax.spines['bottom'].set_linewidth(1.5)
+        ax.tick_params(width=1.5)
+        fig.tight_layout()
+
+        savepath = os.path.join(odor_dir, f'all_strains_learning_curves_{age}_{session}')
+        fig.savefig(savepath + '.png', dpi=300, bbox_inches='tight')
+        ax.patch.set_visible(False)
+        fig.savefig(savepath + '.svg', bbox_inches='tight', transparent=True)
+        figs[session] = fig
+
+    return figs
 
 def plot_session(resultdf, protocol, save_path=None, label=None):
     # for each odor behavior session, plot the performance
@@ -1381,7 +1481,9 @@ def plot_session(resultdf, protocol, save_path=None, label=None):
         png_path = os.path.join(save_path, f'{save_name}.png')
         svg_path = os.path.join(save_path, f'{save_name}.svg')
         fig.savefig(png_path, dpi=300, bbox_inches='tight')
-        fig.savefig(svg_path, format='svg', bbox_inches='tight')
+        for a in axs.flat:
+            a.patch.set_visible(False)
+        fig.savefig(svg_path, format='svg', bbox_inches='tight', transparent=True)
         plt.close(fig)
         return fig
     
@@ -2054,9 +2156,7 @@ def get_RLWM_EventTimes(filename):
     
     # Get start time
     try:
-        start_time_val = exper.control.param.trialstart.value
-        start_seconds = start_time_val[3] * 3600 + start_time_val[4] * 60 + start_time_val[5]
-        out['startTime'] = start_seconds
+        out['startTime'] = exper.control.param.trialstart.value
     except:
         out['startTime'] = 0
     
@@ -2104,6 +2204,38 @@ def backward_times(dmat, outcome_inds, region_func):
     
     return result
 
+def parse_session_clock(value):
+    # Parse a session start time into a datetime. Accepts either a
+    # pandas Timestamp / datetime (as stored in resultdf['startTime']
+    # when already parsed), or a MATLAB-style
+    # [year, month, day, hour, minute, second, ...] clock vector
+    # (or its stringified form, e.g. read back from a cached CSV).
+    # Returns None if it cannot be parsed.
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        return value.to_pydatetime()
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        # e.g. a Timestamp round-tripped through a cached CSV: "2026-02-19 10:42:21"
+        parsed = pd.to_datetime(value, errors='coerce')
+        if not pd.isna(parsed):
+            return parsed.to_pydatetime()
+        # fall back to a stringified clock vector, e.g. "[2024. 1. 15. 10. 30. 15.]"
+        nums = re.findall(r'-?\d+\.?\d*', value)
+        value = [float(n) for n in nums]
+    elif isinstance(value, (list, tuple, np.ndarray)):
+        value = list(np.ravel(value))
+    else:
+        return None
+    if len(value) < 6:
+        return None
+    try:
+        year, month, day, hour, minute, second = value[:6]
+        return datetime(int(year), int(month), int(day), int(hour), int(minute), int(second))
+    except (ValueError, TypeError):
+        return None
 
 def extract_behavior_df(filename):
     """
@@ -2234,7 +2366,10 @@ def extract_behavior_df(filename):
     result_dict['schedule'] = data['schedule']
     result_dict['odor_name'] = data['odor_name']
     result_dict['odor_dur'] = data['odor_dur']
-    result_dict['start_time'] = np.full(n_trials, data.get('startTime', 0))
+    y, mo, d, h, m, s = data.get('startTime', [0]*6)
+    start_dt = pd.Timestamp(int(y), int(mo), int(d), int(h), int(m), int(s))
+    result_dict['start_time'] = start_dt
+    #result_dict['start_time'] = np.tile(data.get('startTime', np.zeros(6)), (n_trials, 1))
     
     # Create DataFrame
     df = pd.DataFrame(result_dict)

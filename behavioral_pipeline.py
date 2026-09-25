@@ -26,13 +26,14 @@ from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
 import ruptures as rpt
-import statsmodels.stats.api as smf
+import statsmodels.formula.api as smf
 
 from scipy.optimize import minimize
 from scipy.signal import correlate, find_peaks, hilbert, spectrogram
 from scipy.special import expit
 from scipy.stats import mannwhitneyu, pearsonr, wilcoxon
 from statsmodels.stats.multitest import multipletests
+from statsmodels.multivariate.manova import MANOVA
 
 # Project-local utilities
 from pyPlotHW import StartPlots
@@ -52,7 +53,10 @@ class BehData:
         self.analysis = os.path.join(self.root_path, 'Analysis')
         self.summary = os.path.join(self.root_path, 'Summary')
         self.AnimalInfo = pd.read_csv(os.path.join(self.data, 'AnimalList.csv'))
-        self.Animals = [str(x) for x in self.AnimalInfo['AnimalID']]
+        self.Animals = [
+            '0' + str(x) if str(x).isdigit() and len(str(x)) == 2 else str(x)
+            for x in self.AnimalInfo['AnimalID']
+        ]
         self.Genotypes = self.AnimalInfo['Genotype']
         if 'Gender' in self.AnimalInfo.columns:
             self.Gender = self.AnimalInfo['Gender']
@@ -66,13 +70,17 @@ class BehData:
             self.ImageCell = [None] * len(self.Animals)
         if 'hemisphere' in self.AnimalInfo.columns:
             self.Hemisphere = self.AnimalInfo['hemisphere']
-        else:   
+        else:
             self.Hemisphere = [None] * len(self.Animals)
+        if strain == 'TSC2_adult' and 'Note' in self.AnimalInfo.columns:
+            self.Note = self.AnimalInfo['Note']
+        else:
+            self.Note = pd.Series([None] * len(self.Animals))
 
         strain_parts = strain.split('_')
         if any(part in ['Cntnap2'] for part in strain_parts):
             self.Mut = 'KO'
-        elif any(part in ['TSC2', 'Shank3B', 'ChD8', 'Syngap', 'Scn2A'] for part in strain_parts):
+        elif any(part in ['TSC2', 'Shank3B', 'ChD8', 'Syngap', 'Syngap(SGR)', 'Scn2A'] for part in strain_parts):
             self.Mut = 'HET'
         elif any(part in ['Nlgn3'] for part in strain_parts):
             self.Mut = 'HEM'
@@ -200,7 +208,8 @@ class BehDataOF(BehData):
         ax.set_xlabel('Group')
         ax.set_title('Total time in the center')
         plt.savefig(savefigpath + '\\violin_center_time.png', dpi=300)
-        plt.savefig(savefigpath + '\\violin_center_time.svg', dpi=300)
+        ax.patch.set_visible(False)
+        plt.savefig(savefigpath + '\\violin_center_time.svg', dpi=300, transparent=True)
         plt.close()
 
         ax=sns.violinplot(data=[totalCross[self.WTIdx], totalCross[self.MutIdx]],palette=custom_palette)
@@ -209,7 +218,8 @@ class BehDataOF(BehData):
         ax.set_xlabel('Group')
         ax.set_title('Total cross time')
         plt.savefig(savefigpath + '/violin_cross_time.png', dpi=300)
-        plt.savefig(savefigpath + '/violin_cross_time.svg', dpi=300)
+        ax.patch.set_visible(False)
+        plt.savefig(savefigpath + '/violin_cross_time.svg', dpi=300, transparent=True)
         plt.close()
 
         data = {'animalID':self.Animals,
@@ -715,7 +725,7 @@ class BehDataOdor(BehData):
                     'water_left': np.nan,              # water dispensed from left port
                     'water_right': np.nan,             # water dispensed from right port
                     'odor_presented': [],               # actual odor presented in the raw behavior file
-                    'n_trials': np.nan,                     # total number of trials in the session
+                    'nTrials': np.nan,                     # total number of trials in the session
 
                 }
                 
@@ -739,9 +749,17 @@ class BehDataOdor(BehData):
 
         self.data_index = pd.DataFrame(rows)
 
+        
     def load_data(self):
         # Load behavior data from file
         # need to call matlab functions
+
+        # object dtype so these columns can hold either an 'HH:MM' string or NaN
+        # without pandas raising a LossySetitemError when the two are mixed.
+        for col in ('SessionStartTime', 'SessionEndTime_mat', 'SessionEndTime_file'):
+            if col not in self.data_index.columns:
+                self.data_index[col] = pd.Series(index=self.data_index.index, dtype=object)
+
         for bIdx, behFiles in enumerate(self.data_index['BehaviorPath']):
             csvPath = os.path.join(self.data_index['AnalysisPath'][bIdx], 
                                 self.data_index['Date'][bIdx] + 
@@ -770,20 +788,20 @@ class BehDataOdor(BehData):
             else:
                 # load the csv file
                 resultdf = pd.read_csv(csvPath)
-
+            
             self.data_index.loc[bIdx, 'BehCSV'] = csvPath
 
             # calculate AB and CD average performance
             self.data_index.at[bIdx, 'odor_presented'] = np.unique(resultdf['schedule'])
 
-            perf_A = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==1]))
-            perf_B = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==2]))
-            perf_C = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==3]))
-            perf_D = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==4]))
-            perf_rev_C = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==6]))
-            perf_rev_D = np.mean(~np.isnan(resultdf['reward'][resultdf['schedule']==5]))
-            water_left = np.sum(resultdf['reward'][resultdf['schedule'].isin([1, 3, 6])])
-            water_right = np.sum(resultdf['reward'][resultdf['schedule'].isin([2, 4, 5])])
+            perf_A = np.mean(resultdf['trial_types'][resultdf['schedule']==1]>0)
+            perf_B = np.mean(resultdf['trial_types'][resultdf['schedule']==2]>0)
+            perf_C = np.mean(resultdf['trial_types'][resultdf['schedule']==3]>0)
+            perf_D = np.mean(resultdf['trial_types'][resultdf['schedule']==4]>0)
+            perf_rev_C = np.mean(resultdf['trial_types'][resultdf['schedule']==6]>0)
+            perf_rev_D = np.mean(resultdf['trial_types'][resultdf['schedule']==5]>0)
+            water_left = np.round(np.sum(resultdf['trial_types'][resultdf['schedule'].isin([1, 3, 6])])*100)
+            water_right = np.round(np.sum(resultdf['trial_types'][resultdf['schedule'].isin([2, 4, 5])])*100)
             nTrials = resultdf.shape[0]
             self.data_index.at[bIdx, 'perf_AB'] = [perf_A, perf_B]
             self.data_index.at[bIdx, 'perf_CD'] = [perf_C, perf_D]
@@ -791,6 +809,61 @@ class BehDataOdor(BehData):
             self.data_index.at[bIdx, 'water_left'] = water_left
             self.data_index.at[bIdx, 'water_right'] = water_right
             self.data_index.at[bIdx, 'nTrials'] = nTrials
+
+            # Cross-check the session date two ways before trusting session timing:
+            # 1. the create/modified time of each raw behavior file
+            # 2. the clock start time recorded inside resultdf['startTime']
+            # If either disagrees with self.data_index['Date'], discard the timing
+            # for this session; otherwise extract start/end time in hh:mm format.
+            expected_date = str(self.data_index['Date'][bIdx])
+
+            file_dates_ok = True
+            file_mtimes = []
+            for beh in behFiles:
+                #ctime = datetime.fromtimestamp(os.path.getctime(beh))
+                mtime = datetime.fromtimestamp(os.path.getmtime(beh))
+                file_mtimes.append(mtime)
+                if mtime.strftime('%Y%m%d') != expected_date:
+                    file_dates_ok = False
+
+            start_time_col = 'startTime' if 'startTime' in resultdf.columns else 'start_time'
+            session_clock = None
+            if start_time_col in resultdf.columns and len(resultdf) > 0:
+                session_clock = parse_session_clock(resultdf[start_time_col].iloc[0])
+            resultdf_date_ok = session_clock is not None and session_clock.strftime('%Y%m%d') == expected_date
+
+            if not file_dates_ok and not resultdf_date_ok:
+                print(f"{self.data_index['Animal'][bIdx]} {expected_date}: session date mismatch, discarding session start/end time")
+                self.data_index.at[bIdx, 'SessionStartTime'] = np.nan
+                self.data_index.at[bIdx, 'SessionEndTime_mat'] = np.nan
+                self.data_index.at[bIdx, 'SessionEndTime_file'] = np.nan
+            else:
+                if resultdf_date_ok:
+                    # resultdf['startTime'] checks out: always use it for the start time,
+                    # and end time = session start clock + elapsed seconds of the last trial outcome
+                    self.data_index.at[bIdx, 'SessionStartTime'] = session_clock.strftime('%H:%M')
+
+                    last_outcome = resultdf['outcome'].iloc[-1] if 'outcome' in resultdf.columns and len(resultdf) > 0 else None
+                    if last_outcome is not None and not pd.isna(last_outcome):
+                        session_end_mat = session_clock + pd.Timedelta(seconds=float(last_outcome))
+                        self.data_index.at[bIdx, 'SessionEndTime_mat'] = session_end_mat.strftime('%H:%M')
+                    else:
+                        self.data_index.at[bIdx, 'SessionEndTime_mat'] = np.nan
+                else:
+                    # resultdf['startTime'] date didn't check out: fall back to file timestamps
+                    self.data_index.at[bIdx, 'SessionStartTime'] = np.nan
+                    self.data_index.at[bIdx, 'SessionEndTime_mat'] = np.nan
+
+                # when the file dates also check out, additionally record the file-based end time
+                # (if both checks passed, both SessionEndTime_mat and SessionEndTime_file are stored)
+                if file_dates_ok:
+                    self.data_index.at[bIdx, 'SessionEndTime_file'] = max(file_mtimes).strftime('%H:%M')
+                else:
+                    self.data_index.at[bIdx, 'SessionEndTime_file'] = np.nan
+
+        # save self.data_index to a csv file
+        data_index_path = os.path.join(self.root_path, 'data_index.csv')
+        self.data_index.to_csv(data_index_path, index=False)
 
         # Check for missing sessions based on date.
         session_dates = pd.to_datetime(self.data_index['Date'], format='%Y%m%d')
@@ -812,7 +885,9 @@ class BehDataOdor(BehData):
             animal = animal[3:]
             pipeline_data = self.data_index.loc[
                 self.data_index['Animal'].astype(str).str.strip() == animal,
-                ['Date', 'odor_presented', 'perf_AB', 'perf_CD', 'perf_DC', 'water_left', 'water_right', 'nTrials'],
+                ['Date', 'odor_presented', 'perf_AB', 'perf_CD', 'perf_DC', 
+                 'water_left', 'water_right', 'nTrials', 
+                 'SessionStartTime', 'SessionEndTime_mat', 'SessionEndTime_file'],
             ].copy()
             if pipeline_data.empty:
                 continue
@@ -841,7 +916,8 @@ class BehDataOdor(BehData):
                 ['Date', 'protocol_pipeline', 
                  'perf_A', 'perf_B', 'perf_C', 'perf_D', 
                  'perf_C_rev', 'perf_D_rev',
-                 'water_left', 'water_right', 'nTrials']
+                 'water_left', 'water_right', 'nTrials',
+                 'SessionStartTime', 'SessionEndTime_mat', 'SessionEndTime_file']
             ]
 
             comparison = pd.DataFrame({
@@ -855,7 +931,9 @@ class BehDataOdor(BehData):
                 'C': notebook_data[notebook_columns['c']] if 'c' in notebook_columns else np.nan,
                 'D': notebook_data[notebook_columns['d']] if 'd' in notebook_columns else np.nan,
                 'L_H2O': notebook_data[notebook_columns['l_h2o']] if 'l_h2o' in notebook_columns else np.nan,
-                'R_H2O': notebook_data[notebook_columns['r_h2o']] if 'r_h2o' in notebook_columns else np.nan
+                'R_H2O': notebook_data[notebook_columns['r_h2o']] if 'r_h2o' in notebook_columns else np.nan,
+                'IN_AT': notebook_data[notebook_columns['in_at']] if 'in_at' in notebook_columns else np.nan,
+                'OUT_AT': notebook_data[notebook_columns['out_at']] if 'out_at' in notebook_columns else np.nan
             })
             comparison['Date'] = pd.to_datetime(
                 comparison['Date'], format='%m/%d/%y', errors='coerce'
@@ -877,7 +955,9 @@ class BehDataOdor(BehData):
                 'C': first_value,
                 'D': first_value,
                 'L_H2O': first_value,
-                'R_H2O': first_value
+                'R_H2O': first_value,
+                'IN_AT': first_value,
+                'OUT_AT': first_value,
             })
             pipeline_data = pipeline_data.groupby('Date', as_index=False).agg({
                 'protocol_pipeline': first_value,
@@ -886,7 +966,10 @@ class BehDataOdor(BehData):
                 'perf_C': first_value,
                 'perf_D': first_value,
                 'water_left': first_value,
-                'water_right': first_value
+                'water_right': first_value,
+                'SessionStartTime': first_value,
+                'SessionEndTime_mat': first_value,
+                'SessionEndTime_file': first_value
             })
             comparison = pipeline_data.merge(comparison, on='Date', how='outer')
             for odor in 'ABCD':
@@ -908,7 +991,9 @@ class BehDataOdor(BehData):
                  'perf_A', 'A', 'diff_A', 'perf_B', 'B', 'diff_B',
                  'perf_C', 'C', 'diff_C', 'perf_D', 'D', 'diff_D', 
                  'water_left', 'L_H2O', 'diff_L_H2O', 
-                 'water_right', 'R_H2O', 'diff_R_H2O']
+                 'water_right', 'R_H2O', 'diff_R_H2O', 
+                 'IN_AT', 'SessionStartTime', 
+                 'OUT_AT', 'SessionEndTime_mat', 'SessionEndTime_file']
             ]
             comparisons = pd.concat([comparisons, comparison], ignore_index=True)
 
@@ -1156,7 +1241,7 @@ class BehDataOdor(BehData):
 
             # model fitting!
     
-    def model_fitting(self, fit_mode, model_name="policy_gradient"):
+    def model_fitting(self, fit_mode, model_name="policy_gradient", color_dict=None):
         # fit computational models to the behavioral data
         # fit mode: 'session' or 'concat'
         #          'session': fit model to each session separately
@@ -1218,17 +1303,17 @@ class BehDataOdor(BehData):
                     data['schedule'] = data['schedule']-2
 
 
-                if os.path.exists(savedatapath):
-                    # load the existing fit
-                    with open(savedatapath, 'r') as f:
-                        latent_fit = json.load(f)
-                else:
-                    if model_name == 'policy_gradient':
-                        latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
-                    elif model_name == 'hybrid_Q':
-                        #latent_fit = fit_hybrid(data,animalID=animalID, savedatapath=savedatapath)
-                        latent_fit = fit_hybrid_bias_model(data,animalID=animalID, 
-                                                           savedatapath=savedatapath, n_starts=1)
+                # if os.path.exists(savedatapath):
+                #     # load the existing fit
+                #     with open(savedatapath, 'r') as f:
+                #         latent_fit = json.load(f)
+                # else:
+                if model_name == 'policy_gradient':
+                    latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
+                elif model_name == 'hybrid_Q':
+                    #latent_fit = fit_hybrid(data,animalID=animalID, savedatapath=savedatapath)
+                    latent_fit = fit_hybrid_bias_model(data,animalID=animalID, 
+                                                        savedatapath=savedatapath, n_starts=1)
 
                 # if model_name == 'hybrid':
                 #     model_label = 'Hybrid RL'
@@ -1249,20 +1334,42 @@ class BehDataOdor(BehData):
                     temp['animal'] = fit_params['animal'][ss]
                     temp['choice'] = latent_fit['args']['dat']['y']
                     temp['gender'] = fit_params['gender'][ss]
-                    fit_psychometric[pp]= pd.concat(
-                        (fit_psychometric[pp], temp))
+                    pDay = protocol[-2:]+str(protocolDay)
+                    if pDay in protocols:
+                        fit_psychometric[pDay]= pd.concat(
+                            (fit_psychometric[pDay], temp))
                         
-                    #model_label = 'Policy Gradient'
-                    
+                    #model_label = 'Policy Gradient' 
 
                 elif model_name == 'hybrid_Q':
-                    pass
+                    params_list = list(latent_fit['params'].keys())
+                    for pname in params_list:
+                        fit_params.loc[ss, pname] = latent_fit['params'][pname]
+
+                    # engaged / disengaged psychometric curve data
+                    schedules_arr = pd.to_numeric(data['schedule'], errors='coerce').to_numpy(dtype=float)
+                    actions_arr = pd.to_numeric(data['actions'], errors='coerce').to_numpy(dtype=float)
+                    valid_trials = np.isfinite(schedules_arr) & np.isfinite(actions_arr)
+                    p_engaged = np.asarray(latent_fit['state_probability'], dtype=float)[:, 1]
+                    pRight_fit = np.asarray(latent_fit['pRight_fit'], dtype=float)
+                    temp_hybrid = pd.DataFrame()
+                    temp_hybrid['weighted_sum'] = np.log(pRight_fit / (1 - pRight_fit))
+                    temp_hybrid['genotype'] = fit_params['genotype'][ss]
+                    temp_hybrid['animal'] = fit_params['animal'][ss]
+                    temp_hybrid['choice'] = actions_arr[valid_trials]
+                    temp_hybrid['gender'] = fit_params['gender'][ss]
+                    temp_hybrid['p_engaged'] = p_engaged
+                    pDay = protocol[-2:]+str(protocolDay)
+                    if pDay in protocols:
+                        fit_psychometric[pDay] = pd.concat(
+                            (fit_psychometric[pDay], temp_hybrid))
 
                 fit_params.loc[ss, f'AIC'] = latent_fit['AIC']
                 fit_params.loc[ss, f'BIC'] = latent_fit['BIC']
 
                 savefigpath = os.path.join(save_path, f'{animalID}_{protocol}_{model_name}_latent_fit')
-                plot_latent_session(data, latent_fit, model_name,savefigpath)
+                if not os.path.exists(savefigpath+'.png'):
+                    plot_latent_session(data, latent_fit, model_name,savefigpath)
 
         elif fit_mode == 'concat':
             protocols = ['AB', 'CD']
@@ -1383,16 +1490,40 @@ class BehDataOdor(BehData):
         #%% 1. plot fitted parameters. to do: make this work for both fit_mode
         
         if not fit_params.empty:
-            metrics = [
-                ('alpha', 'bias'),
-                ('alpha', 'stim'),
-                ('alpha', 'stick'),
-                ('sigma', 'bias'),
-                ('sigma', 'stim'),
-                ('sigma', 'stick'),
-            ]
-            
+            if model_name == 'policy_gradient':
+                metrics = [
+                    ('alpha', 'bias'),
+                    ('alpha', 'stim'),
+                    ('alpha', 'stick'),
+                    ('sigma', 'bias'),
+                    ('sigma', 'stim'),
+                    ('sigma', 'stick'),
+                ]
+            elif model_name == 'hybrid_Q':
+                metrics = [
+                    ('alpha', ''),
+                    ('beta', ''),
+                    ('stick', ''),
+                    ('lapse', ''),
+                    ('ret', ''),
+                    ('bias', ''),
+                ]
+
             all_stats = []
+            manova_rows = []
+
+            # color_dict, if given, maps strain name (e.g. 'Scn2A') to a
+            # color - used for the mutant genotype's violins so it matches
+            # that strain's color elsewhere (e.g. plot_performance), instead
+            # of plain red
+            mut_color = None
+            if color_dict:
+                strain_base = self.strain.split('_')[0]
+                for key, color in color_dict.items():
+                    if key.lower() == strain_base.lower():
+                        mut_color = color
+                        break
+            genotype_colors = {'WT': 'black', self.Mut: mut_color or 'red'}
 
             genders = fit_params['gender'].dropna().unique()
             genders = [g for g in genders if str(g).strip() != '']
@@ -1412,16 +1543,44 @@ class BehDataOdor(BehData):
                         genotype_groups = sorted(genotype_groups, key=lambda x: str(x))
 
 
-                    fig, axes = plt.subplots(2, 3, figsize=(18, 10), squeeze=False)
+                    fig, axes = plt.subplots(2, 3, figsize=(9, 5.5), squeeze=False)
                     stats_rows = []
+                    metric_cols = []
 
-                    color_map = {'WT': 'tab:blue', 'HET': 'tab:orange', 'KO': 'tab:green'}
+                    color_map = genotype_colors
                     legend_handles = []
+
+                    # fixed, shared y-limits for alpha and sigma: each spans 3
+                    # subplots (bias/stim/stick), so compute one range per family
+                    # from the real fitted values instead of autoscaling each
+                    # subplot to its own narrower range
+                    opt_ylim = {}
+                    for opt_name in ('alpha', 'sigma'):
+                        opt_cols = [
+                            (f'{w}_{opt_name}' if w else opt_name) if fit_mode == 'session'
+                            else (f'{w}_{opt_name}_{protocol}' if w else f'{opt_name}_{protocol}')
+                            for o, w in metrics if o == opt_name
+                        ]
+                        opt_cols = [c for c in opt_cols if c in gender_df.columns]
+                        if not opt_cols:
+                            continue
+                        opt_values = pd.to_numeric(gender_df[opt_cols].stack(), errors='coerce').dropna()
+                        if opt_values.empty:
+                            continue
+                        lo, hi = float(opt_values.min()), float(opt_values.max())
+                        if opt_name == 'alpha':
+                            lo = max(lo, 1e-6)
+                            opt_ylim[opt_name] = (lo / 1.5, hi * 1.5)
+                        else:
+                            pad = (hi - lo) * 0.1 if hi > lo else max(abs(hi), 1) * 0.1
+                            opt_ylim[opt_name] = (lo - pad, hi + pad)
+
                     for ax, (opt, weight) in zip(axes.flatten(), metrics):
                         if fit_mode == 'session':
-                            col = f'{weight}_{opt}'
+                            col = f'{weight}_{opt}' if weight else opt
                         elif fit_mode == 'concat':
-                            col = f'{weight}_{opt}_{protocol}'
+                            col = f'{weight}_{opt}_{protocol}' if weight else f'{opt}_{protocol}'
+                        metric_cols.append(col)
                         plot_data = []
                         labels = []
                         for gt in genotype_groups:
@@ -1435,33 +1594,34 @@ class BehDataOdor(BehData):
                             plot_data.append(values)
                             labels.append(gt)
 
-                        bp = ax.boxplot(
-                            plot_data,
-                            labels=labels,
-                            patch_artist=True,
-                            showfliers=False,
-                            medianprops={'color': 'black', 'linewidth': 1.5},
-                            whiskerprops={'color': 'black'},
-                            capprops={'color': 'black'},
-                            flierprops={'marker': 'o', 'markerfacecolor': 'gray', 'markersize': 4},
-                        )
-                        colors = [color_map.get(gt, 'lightgray') for gt in labels]
-                        for patch, color in zip(bp['boxes'], colors):
-                            patch.set_facecolor(color)
-                            patch.set_edgecolor('black')
-                        for whisker in bp['whiskers']:
-                            whisker.set_color('black')
-                        for cap in bp['caps']:
-                            cap.set_color('black')
-                        for median in bp['medians']:
-                            median.set_color('black')
+                        # keep the two genotype groups close together within
+                        # each parameter (narrow gap instead of the default
+                        # unit spacing between categories)
+                        positions = 1 + 0.4 * np.arange(len(labels))
+                        violin_idx = [i for i, values in enumerate(plot_data) if values.size > 1]
+                        if violin_idx:
+                            violin = ax.violinplot(
+                                [plot_data[i] for i in violin_idx],
+                                positions=positions[violin_idx],
+                                widths=0.3,
+                                showmedians=True,
+                            )
+                            for i, body in zip(violin_idx, violin['bodies']):
+                                color = color_map.get(labels[i], 'lightgray')
+                                body.set_facecolor(color)
+                                body.set_edgecolor(color)
+                                body.set_alpha(0.35)
+                            for part_name in ('cmedians', 'cmins', 'cmaxes', 'cbars'):
+                                if part_name in violin:
+                                    violin[part_name].set_color('black')
+                                    violin[part_name].set_linewidth(1)
 
                         #ax.set_facecolor('#fbfbfb')
                         #ax.grid(axis='y', color='gray', alpha=0.2, linestyle='--')
 
-                        for x_pos, (gt, values) in enumerate(zip(labels, plot_data), start=1):
+                        for x_pos, gt, values in zip(positions, labels, plot_data):
                             if values.size:
-                                jitter = np.random.uniform(-0.08, 0.08, size=values.size)
+                                jitter = np.random.uniform(-0.05, 0.05, size=values.size)
                                 ax.scatter(
                                     np.full(values.size, x_pos) + jitter,
                                     values,
@@ -1476,8 +1636,15 @@ class BehDataOdor(BehData):
                             legend_handles = [Patch(facecolor=color_map[labels[0]], edgecolor='black', label=labels[0]),
                                                 Patch(facecolor=color_map[labels[1]], edgecolor='black', label=labels[1])]
 
-                        ax.set_title(f'{opt}_{weight}', fontsize=15)
-                        ax.set_ylabel(opt, fontsize=10)
+                        ax.set_xticks(positions)
+                        ax.set_xticklabels(labels)
+                        ax.set_xlim(positions[0] - 0.3, positions[-1] + 0.3)
+                        ax.set_title(f'{opt}_{weight}' if weight else opt, fontsize=10)
+                        ax.set_ylabel(opt, fontsize=9)
+                        if opt == 'alpha':
+                            ax.set_yscale('log')
+                        if opt in opt_ylim:
+                            ax.set_ylim(*opt_ylim[opt])
                         ax.tick_params(axis='both', labelsize=9)
                         ax.spines['top'].set_visible(False)
                         ax.spines['right'].set_visible(False)
@@ -1517,57 +1684,92 @@ class BehDataOdor(BehData):
 
                         all_stats.append(stats_df)
 
+                        print(f'[{model_name}] {protocol} gender={gender} Mann-Whitney (WT vs {self.Mut}), FDR-corrected:')
+                        print(stats_df[['Opt', 'Weight', 'PValue', 'AdjustedPValue', 'Significant']].to_string(index=False))
+
                         for ax, (opt, weight) in zip(axes.flatten(), metrics):
-                            col = f'{weight}_{opt}_{protocol}'
-                            subset = stats_df[(stats_df['Opt'] == opt) & (stats_df['Weight'] == weight)]
-                            if subset.empty:
+                            row = stats_df[(stats_df['Opt'] == opt) & (stats_df['Weight'] == weight)]
+                            if row.empty:
                                 continue
-                            annotations = []
-                            for _, row in subset.iterrows():
-                                if np.isfinite(row['AdjustedPValue']):
-                                    annotations.append(
-                                        f"FDR p={row['AdjustedPValue']:.3g}"
-                                    )
-                                else:
-                                    annotations.append(
-                                        f"FDR p=nan"
-                                    )
-                            annotation_text = '\n'.join(annotations)
+                            adj_p = row['AdjustedPValue'].iloc[0]
+                            fdr_text = f'FDR p = {adj_p:.3g}' if np.isfinite(adj_p) else 'FDR p = n/a'
                             ax.text(
-                                0.5,
-                                0.95,
-                                annotation_text,
-                                transform=ax.transAxes,
-                                ha='center',
-                                va='top',
-                                fontsize=15,
+                                0.5, 0.98, fdr_text, transform=ax.transAxes,
+                                ha='center', va='top', fontsize=8,
                                 bbox=dict(facecolor='white', edgecolor='none', alpha=0.8)
                             )
 
+                    # MANOVA: does genotype have a significant multivariate effect
+                    # across all fitted parameters jointly? Six separate univariate
+                    # tests (above) inflate the false-positive rate and ignore
+                    # correlations between parameters - MANOVA tests the genotype
+                    # effect on the whole parameter vector at once.
+                    manova_p = np.nan
+                    manova_cols = [c for c in dict.fromkeys(metric_cols) if c in gender_df.columns]
+                    if len(genotype_groups) == 2 and manova_cols:
+                        manova_df = gender_df[manova_cols + ['genotype']].copy()
+                        for c in manova_cols:
+                            manova_df[c] = pd.to_numeric(manova_df[c], errors='coerce')
+                        manova_df = manova_df.dropna()
+                        if (
+                            manova_df['genotype'].nunique() == 2
+                            and manova_df.shape[0] > len(manova_cols) + 1
+                        ):
+                            try:
+                                formula = ' + '.join(f'Q("{c}")' for c in manova_cols) + ' ~ genotype'
+                                manova_fit = MANOVA.from_formula(formula, data=manova_df).mv_test()
+                                manova_p = manova_fit.results['genotype']['stat'].loc["Wilks' lambda", 'Pr > F']
+                            except Exception:
+                                manova_p = np.nan
+                        manova_rows.append({
+                            'Protocol': protocol,
+                            'Gender': gender,
+                            'N_animals': manova_df.shape[0],
+                            'N_params': len(manova_cols),
+                            'WilksLambda_PValue': manova_p,
+                        })
+
                     if legend_handles:
-                        fig.legend(handles=legend_handles, loc='upper right', fontsize=10, frameon=False)
-                    fig.subplots_adjust(top=0.88)
-                    fig.tight_layout(rect=[0, 0, 1, 0.88])
-                    fig.suptitle(f'{protocol} fitted params by gender {gender}', y=0.95, fontsize=20)
+                        fig.legend(handles=legend_handles, loc='upper right', fontsize=9, frameon=False)
+                    fig.subplots_adjust(top=0.82, wspace=0.35, hspace=0.5)
+                    fig.tight_layout(rect=[0, 0, 1, 0.82])
+                    fig.suptitle(f'{protocol} fitted params by gender {gender}', y=0.97, fontsize=10)
+                    manova_text = (
+                        f"MANOVA genotype effect: p = {manova_p:.3g}"
+                        if np.isfinite(manova_p) else 'MANOVA genotype effect: p = n/a'
+                    )
+                    fig.text(0.5, 0.90, manova_text, ha='center', va='top', fontsize=9, weight='bold')
                     os.makedirs(f'{self.summary}/latent', exist_ok=True)
                     fig.savefig(
-                        os.path.join(self.summary,'latent', f'{protocol}_fitted_params_by_gender_{gender}_{fit_mode}.png'),
+                        os.path.join(self.summary,'latent', f'{protocol}_fitted_params_by_gender_{gender}_{fit_mode}_{model_name}.png'),
                         dpi=300,
                         bbox_inches='tight',
                         pad_inches=0.2
                     )
+                    for a in axes.flat:
+                        a.patch.set_visible(False)
                     fig.savefig(
-                        os.path.join(self.summary,'latent', f'{protocol}_fitted_params_by_gender_{gender}_{fit_mode}.svg'),
+                        os.path.join(self.summary,'latent', f'{protocol}_fitted_params_by_gender_{gender}_{fit_mode}_{model_name}.svg'),
                         bbox_inches='tight',
-                        pad_inches=0.2
+                        pad_inches=0.2,
+                        transparent=True
                     )
                     plt.close(fig)
 
             if all_stats:
                 pd.concat(all_stats, ignore_index=True).to_csv(
-                    os.path.join(self.summary, 'latent', 'fitted_params_mannwhitney.csv'),
+                    os.path.join(self.summary, 'latent', f'fitted_params_mannwhitney_{model_name}.csv'),
                     index=False
                 )
+            if manova_rows:
+                pd.DataFrame(manova_rows).to_csv(
+                    os.path.join(self.summary, 'latent', f'fitted_params_manova_{model_name}.csv'),
+                    index=False
+                )
+
+            if fit_mode == 'session':
+                manova_results = self._test_fitted_params_manova_across_sessions(fit_params, metrics, model_name)
+                self._plot_fitted_params_by_session(fit_params, metrics, model_name, manova_results)
 
         # 2. plot psychometric curves
         # protocols = ['AB', 'CD']
@@ -1580,150 +1782,498 @@ class BehDataOdor(BehData):
         max_weight = 9.95
         min_weight = -9.95
         step_weight = 0.1
-
-        for protocol in protocols:
-            for gender in genders:
-                # calculate binned weighted sum
-                pR_data = pd.DataFrame() # calculate average right choice percentage for each animal
-                pR_geno = []
-                animals_plot = np.unique(self.data_index['Animal'][self.data_index['Gender'] == gender])
-                bins = np.arange(
-                    min_weight - step_weight/2,
-                    max_weight + step_weight,
-                    step_weight
-                )
-                # calculate average right choice percentage for each animal
-                for animal in animals_plot:
-                    pR_geno.append(self.Genotypes[np.array(self.Animals)==animal].values[0])
-                    #pR_data[animals] = np.full(len(bins), np.nan)
-                    weights = fit_psychometric[protocol].loc[
-                            fit_psychometric[protocol]['animal'] == animal,
-                            'weighted_sum'
-                        ].to_numpy()
-                    choices = fit_psychometric[protocol].loc[
-                            fit_psychometric[protocol]['animal'] == animal,
-                            'choice'
-                        ].to_numpy()
-                   
-                    temp_psy = pd.DataFrame({
-                        'weight': weights,
-                        'choice_right': np.array(choices)   # convert -0.5/0.5 to 0/1
-                    })
-
-                    # assign each trial to a bin
-                    temp_psy['bin'] = pd.cut(
-                        temp_psy['weight'],
-                        bins=bins,
-                        labels=(bins[:-1] + bins[1:]) / 2
+        if model_name == 'policy_gradient':
+            for protocol in protocols:
+                for gender in genders:
+                    # calculate binned weighted sum
+                    pR_data = pd.DataFrame() # calculate average right choice percentage for each animal
+                    pR_geno = []
+                    animals_plot = np.unique(self.data_index['Animal'][self.data_index['Gender'] == gender])
+                    bins = np.arange(
+                        min_weight - step_weight/2,
+                        max_weight + step_weight,
+                        step_weight
                     )
+                    # calculate average right choice percentage for each animal
+                    for animal in animals_plot:
+                        pR_geno.append(self.Genotypes[np.array(self.Animals)==animal].values[0])
+                        #pR_data[animals] = np.full(len(bins), np.nan)
+                        weights = fit_psychometric[protocol].loc[
+                                fit_psychometric[protocol]['animal'] == animal,
+                                'weighted_sum'
+                            ].to_numpy()
+                        choices = fit_psychometric[protocol].loc[
+                                fit_psychometric[protocol]['animal'] == animal,
+                                'choice'
+                            ].to_numpy()
+                    
+                        temp_psy = pd.DataFrame({
+                            'weight': weights,
+                            'choice_right': np.array(choices)   # convert -0.5/0.5 to 0/1
+                        })
 
-                    # mean choice in each bin = P(right)
-                    p_right = (
-                            temp_psy.groupby('bin', observed=True)['choice_right']
-                            .mean()
-                            .reindex(
-                                (bins[:-1] + bins[1:]) / 2
-                            )
+                        # assign each trial to a bin
+                        temp_psy['bin'] = pd.cut(
+                            temp_psy['weight'],
+                            bins=bins,
+                            labels=(bins[:-1] + bins[1:]) / 2
                         )
 
-        #             # bin centers and corresponding percentages
-        #             bin_centers = p_right.index.astype(float)
-        #             p_right = p_right.to_numpy()
-        #             pR_data[animal] = p_right
+                        # mean choice in each bin = P(right)
+                        p_right = (
+                                temp_psy.groupby('bin', observed=True)['choice_right']
+                                .mean()
+                                .reindex(
+                                    (bins[:-1] + bins[1:]) / 2
+                                )
+                            )
 
-        #         plotMask = fit_psychometric[protocol]['gender'] == gender
-        #         temp = fit_psychometric[protocol].loc[plotMask].copy()
+                        # bin centers and corresponding percentages
+                        bin_centers = p_right.index.astype(float)
+                        p_right = p_right.to_numpy()
+                        pR_data[animal] = p_right
 
-        #         temp['Weight'] = pd.cut(
-        #             temp['weighted_sum'],
-        #             bins=bins,
-        #             labels=np.arange(min_weight, max_weight + step_weight, step_weight)
-        #         )
+                    plotMask = fit_psychometric[protocol]['gender'] == gender
+                    temp = fit_psychometric[protocol].loc[plotMask].copy()
 
-        #         binned_weight_count = (
-        #             temp.groupby(['Weight', 'genotype'])
-        #                 .size()
-        #                 .unstack(fill_value=0)
-        #                 .reset_index()
-        #         )
-
-        #         # calculate average reward to choose right 
-        #         # calculate average reward to choose right
-        #         fig, ax = plt.subplots(1, 2, figsize=(12, 5))
-
-        #         for gidx, geno in enumerate(genotypes):
-        #             nGeno = np.sum(np.array(pR_geno) == geno)
-
-                    # histogram
-                    ax[gidx].bar(
-                        binned_weight_count['Weight'],
-                        binned_weight_count[geno]/np.sum(binned_weight_count),
-                        width=step_weight,
-                        color='black',
-                        align='center'
+                    temp['Weight'] = pd.cut(
+                        temp['weighted_sum'],
+                        bins=bins,
+                        labels=np.arange(min_weight, max_weight + step_weight, step_weight)
                     )
 
-                    # remove top and right spines of main axis
-                    ax[gidx].spines['top'].set_visible(False)
-                    ax[gidx].spines['right'].set_visible(False)
-                    ax[gidx].set_ylim([0, 0.025])
-                    # left y-label only on left plot
-                    if gidx == 0:
-                        ax[gidx].set_ylabel('Percentage of trials')
+                    binned_weight_count = (
+                        temp.groupby(['Weight', 'genotype'])
+                            .size()
+                            .unstack(fill_value=0)
+                            .reset_index()
+                    )
+                    genotypes = np.unique(self.Genotypes.dropna())
+                    # calculate average reward to choose right
+                    # calculate average reward to choose right
+                    fig, ax = plt.subplots(1, 2, figsize=(7, 3.2))
 
-        #             # second y-axis
-        #             ax2 = ax[gidx].twinx()
+                    for gidx, geno in enumerate(genotypes):
+                        nGeno = np.sum(np.array(pR_geno) == geno)
 
-        #             mean_pR = np.nanmean(
-        #                 pR_data.loc[:, np.array(pR_geno) == geno],
-        #                 axis=1
-        #             )
-        #             ste_pR = (
-        #                 np.nanstd(
-        #                     pR_data.loc[:, np.array(pR_geno) == geno],
-        #                     axis=1
-        #                 ) / np.sqrt(nGeno)
-        #             )
+                        # histogram
+                        ax[gidx].bar(
+                            binned_weight_count['Weight'],
+                            binned_weight_count[geno]/np.sum(binned_weight_count),
+                            width=step_weight,
+                            color='black',
+                            align='center'
+                        )
 
-        #             ax2.errorbar(
-        #                 bin_centers,
-        #                 mean_pR,
-        #                 yerr=ste_pR,
-        #                 fmt='o',
-        #                 color='C0'
-        #             )
+                        # remove top and right spines of main axis
+                        ax[gidx].spines['top'].set_visible(False)
+                        ax[gidx].spines['right'].set_visible(False)
+                        ax[gidx].set_ylim([0, 0.025])
+                        # left y-label only on left plot
+                        if gidx == 0:
+                            ax[gidx].set_ylabel('Percentage of trials', fontsize=20)
+                        ax[gidx].tick_params(axis='both', labelsize=16)
 
-        #             # theoretical probability (softmax)
-        #             ax2.plot(bin_centers, expit(bin_centers), 'r-')
+                        # second y-axis
+                        ax2 = ax[gidx].twinx()
 
-        #             # remove top spine of right axis
-        #             ax2.spines['top'].set_visible(False)
+                        mean_pR = np.nanmean(
+                            pR_data.loc[:, np.array(pR_geno) == geno],
+                            axis=1
+                        )
+                        ste_pR = (
+                            np.nanstd(
+                                pR_data.loc[:, np.array(pR_geno) == geno],
+                                axis=1
+                            ) / np.sqrt(nGeno)
+                        )
 
-        #             # show right y-label only on right plot
-        #             if gidx == 1:
-        #                 ax2.set_ylabel('P(choice right)')
-        #             else:
-        #                 ax2.set_yticklabels([])
+                        ax2.errorbar(bin_centers,mean_pR, yerr=ste_pR,fmt='o',color='C0')
 
-                    ax[gidx].set_xlabel('Weighted sum')
-                    ax[gidx].set_title(geno)
-                    
-                fig.subplots_adjust(top=0.88)
-                fig.tight_layout(rect=[0, 0, 1, 0.88])
-                fig.suptitle(f'{protocol} psychometric curve {gender}', y=0.95, fontsize=20)
-                os.makedirs(f'{self.summary}/latent', exist_ok=True)
-                fig.savefig(
-                    os.path.join(self.summary,'latent', f'{protocol}_psychometric_curve_by_gender_{gender}_{fit_mode}.png'),
-                    dpi=300,
-                    bbox_inches='tight',
-                    pad_inches=0.2
+                        # theoretical probability (softmax)
+                        ax2.plot(bin_centers, expit(bin_centers), 'r-')
+
+                        # remove top spine of right axis
+                        ax2.spines['top'].set_visible(False)
+
+                        # show right y-label only on right plot
+                        if gidx == 1:
+                            ax2.set_ylabel('P(choice right)', fontsize=20)
+                        else:
+                            ax2.set_yticklabels([])
+                        ax2.tick_params(axis='both', labelsize=16)
+
+                        ax[gidx].set_xlabel('Weighted sum', fontsize=20)
+                        ax[gidx].set_title(geno, fontsize=24)
+
+                    fig.subplots_adjust(top=0.88)
+                    fig.tight_layout(rect=[0, 0, 1, 0.88])
+                    fig.suptitle(f'{protocol} psychometric curve {gender}', y=0.95, fontsize=32)
+                    os.makedirs(f'{self.summary}/latent', exist_ok=True)
+                    fig.savefig(
+                        os.path.join(self.summary,'latent', f'{protocol}_psychometric_curve_by_gender_{gender}_{fit_mode}_{model_name}.png'),
+                        dpi=300,
+                        bbox_inches='tight',
+                        pad_inches=0.2
+                    )
+                    for a in ax.flat:
+                        a.patch.set_visible(False)
+                    fig.savefig(
+                        os.path.join(self.summary,'latent', f'{protocol}_psychometric_curve_by_gender_{gender}_{fit_mode}_{model_name}.svg'),
+                        bbox_inches='tight',
+                        pad_inches=0.2,
+                        transparent=True
+                    )
+                    plt.close(fig)
+
+        #%% 3. plot psychometric curve split by engagement state (hybrid_Q only)
+        if model_name == 'hybrid_Q':
+            engagement_bins = {
+                'engaged': lambda p: p > 0.8,
+                'disengaged': lambda p: p < 0.2,
+            }
+
+            for protocol in protocols:
+                for gender in genders:
+                    plotMask = fit_psychometric[protocol]['gender'] == gender
+                    temp_all = fit_psychometric[protocol].loc[plotMask].copy()
+                    if 'p_engaged' not in temp_all.columns or temp_all.empty:
+                        continue
+
+                    for engagement_label, engagement_test in engagement_bins.items():
+                        temp = temp_all[engagement_test(temp_all['p_engaged'])].copy()
+                        if temp.empty:
+                            continue
+
+                        pR_data = pd.DataFrame()
+                        pR_geno = []
+                        animals_plot = np.unique(temp['animal'])
+                        bins = np.arange(
+                            min_weight - step_weight/2,
+                            max_weight + step_weight,
+                            step_weight
+                        )
+
+                        for animal in animals_plot:
+                            pR_geno.append(self.Genotypes[np.array(self.Animals)==animal].values[0])
+                            weights = temp.loc[temp['animal'] == animal, 'weighted_sum'].to_numpy()
+                            choices = temp.loc[temp['animal'] == animal, 'choice'].to_numpy()
+
+                            temp_psy = pd.DataFrame({
+                                'weight': weights,
+                                'choice_right': np.array(choices)
+                            })
+                            temp_psy['bin'] = pd.cut(
+                                temp_psy['weight'],
+                                bins=bins,
+                                labels=(bins[:-1] + bins[1:]) / 2
+                            )
+                            p_right = (
+                                temp_psy.groupby('bin', observed=True)['choice_right']
+                                .mean()
+                                .reindex(
+                                    (bins[:-1] + bins[1:]) / 2
+                                )
+                            )
+                            bin_centers = p_right.index.astype(float)
+                            p_right = p_right.to_numpy()
+                            pR_data[animal] = p_right
+
+                        temp['Weight'] = pd.cut(
+                            temp['weighted_sum'],
+                            bins=bins,
+                            labels=np.arange(min_weight, max_weight + step_weight, step_weight)
+                        )
+                        binned_weight_count = (
+                            temp.groupby(['Weight', 'genotype'])
+                                .size()
+                                .unstack(fill_value=0)
+                                .reset_index()
+                        )
+                        genotypes = np.unique(self.Genotypes.dropna())
+                        fig, ax = plt.subplots(1, 2, figsize=(7, 3.2))
+
+                        for gidx, geno in enumerate(genotypes):
+                            nGeno = np.sum(np.array(pR_geno) == geno)
+                            if geno not in binned_weight_count.columns or nGeno == 0:
+                                continue
+
+                            ax[gidx].bar(
+                                binned_weight_count['Weight'],
+                                binned_weight_count[geno]/np.sum(binned_weight_count),
+                                width=step_weight,
+                                color='black',
+                                align='center'
+                            )
+
+                            ax[gidx].spines['top'].set_visible(False)
+                            ax[gidx].spines['right'].set_visible(False)
+                            ax[gidx].set_ylim([0, 0.025])
+                            if gidx == 0:
+                                ax[gidx].set_ylabel('Percentage of trials', fontsize=20)
+                            ax[gidx].tick_params(axis='both', labelsize=16)
+
+                            ax2 = ax[gidx].twinx()
+
+                            mean_pR = np.nanmean(
+                                pR_data.loc[:, np.array(pR_geno) == geno],
+                                axis=1
+                            )
+                            ste_pR = (
+                                np.nanstd(
+                                    pR_data.loc[:, np.array(pR_geno) == geno],
+                                    axis=1
+                                ) / np.sqrt(nGeno)
+                            )
+
+                            ax2.errorbar(bin_centers, mean_pR, yerr=ste_pR, fmt='o', color='C0')
+                            ax2.plot(bin_centers, expit(bin_centers), 'r-')
+                            ax2.spines['top'].set_visible(False)
+
+                            if gidx == 1:
+                                ax2.set_ylabel('P(choice right)', fontsize=20)
+                            else:
+                                ax2.set_yticklabels([])
+                            ax2.tick_params(axis='both', labelsize=16)
+
+                            ax[gidx].set_xlabel('Weighted sum', fontsize=20)
+                            ax[gidx].set_title(geno, fontsize=24)
+
+                        fig.subplots_adjust(top=0.88)
+                        fig.tight_layout(rect=[0, 0, 1, 0.88])
+                        fig.suptitle(
+                            f'{protocol} psychometric curve {gender} ({engagement_label})',
+                            y=0.95, fontsize=32
+                        )
+                        os.makedirs(f'{self.summary}/latent', exist_ok=True)
+                        fig.savefig(
+                            os.path.join(
+                                self.summary, 'latent',
+                                f'{protocol}_psychometric_curve_by_gender_{gender}_{fit_mode}_{model_name}_{engagement_label}.png'
+                            ),
+                            dpi=300,
+                            bbox_inches='tight',
+                            pad_inches=0.2
+                        )
+                        for a in ax.flat:
+                            a.patch.set_visible(False)
+                        fig.savefig(
+                            os.path.join(
+                                self.summary, 'latent',
+                                f'{protocol}_psychometric_curve_by_gender_{gender}_{fit_mode}_{model_name}_{engagement_label}.svg'
+                            ),
+                            bbox_inches='tight',
+                            pad_inches=0.2,
+                            transparent=True
+                        )
+                        plt.close(fig)
+
+    def _plot_fitted_params_by_session(self, fit_params, metrics, model_name, manova_results=None):
+        # one figure per gender: 6 subplots, one per fitted parameter, each
+        # showing that parameter's mean +/- SEM across all 6 sessions, split
+        # by genotype - the same data the cross-session MANOVA test
+        # summarizes. (label, protocol value) pairs: fit_mode='session'
+        # stores the AB-CD
+        # sessions as 'AB-CD1'/'AB-CD2'/'AB-CD3' in fit_params['protocol'],
+        # not 'CD1'/'CD2'/'CD3'.
+        session_protocols = [
+            ('AB1', 'AB1'), ('AB2', 'AB2'), ('AB3', 'AB3'),
+            ('CD1', 'AB-CD1'), ('CD2', 'AB-CD2'), ('CD3', 'AB-CD3'),
+        ]
+        color_map = {'WT': 'black', 'HET': 'red', 'KO': 'red'}
+        manova_results = manova_results or {}
+
+        genders = fit_params['gender'].dropna().unique()
+        genders = [g for g in genders if str(g).strip() != '']
+
+        for gender in genders:
+            gender_df = fit_params[fit_params['gender'] == gender]
+            gender_df = gender_df[gender_df['genotype'].isin(['WT', self.Mut])]
+            if gender_df.empty:
+                continue
+
+            genotype_groups = [g for g in ['WT', self.Mut] if g in gender_df['genotype'].unique()]
+
+            # first pass: compute each subplot's mean +/- SEM series, so the
+            # shared y-limits for alpha and sigma (each spans 3 subplots) can
+            # be set from the actual error-bar extent rather than the raw
+            # per-animal data range
+            series_by_metric = {}
+            for opt, weight in metrics:
+                col = f'{weight}_{opt}' if weight else opt
+                if col not in gender_df.columns:
+                    continue
+                series = {}
+                for genotype in genotype_groups:
+                    geno_df = gender_df[gender_df['genotype'] == genotype]
+                    x, means, sems = [], [], []
+                    for sidx, (label, protocol) in enumerate(session_protocols):
+                        values = pd.to_numeric(
+                            geno_df.loc[geno_df['protocol'] == protocol, col], errors='coerce'
+                        ).dropna()
+                        if values.empty:
+                            continue
+                        x.append(sidx)
+                        means.append(values.mean())
+                        sems.append(values.std(ddof=1) / np.sqrt(len(values)) if len(values) > 1 else 0)
+                    series[genotype] = (x, means, sems)
+                series_by_metric[(opt, weight)] = series
+
+            opt_bounds = {}
+            for (opt, weight), series in series_by_metric.items():
+                if opt not in ('alpha', 'sigma'):
+                    continue
+                for genotype, (x, means, sems) in series.items():
+                    if not means:
+                        continue
+                    lo = min(m - s for m, s in zip(means, sems))
+                    hi = max(m + s for m, s in zip(means, sems))
+                    prev_lo, prev_hi = opt_bounds.get(opt, (lo, hi))
+                    opt_bounds[opt] = (min(lo, prev_lo), max(hi, prev_hi))
+
+            opt_ylim = {}
+            for opt_name, (lo, hi) in opt_bounds.items():
+                if opt_name == 'alpha':
+                    lo = max(lo, 1e-6)
+                    # extra headroom (log-scale) so points don't sit flush against the axes
+                    opt_ylim[opt_name] = (lo / 2.0, hi * 2.0)
+                else:
+                    pad = (hi - lo) * 0.2 if hi > lo else max(abs(hi), 1) * 0.2
+                    opt_ylim[opt_name] = (lo - pad, hi + pad)
+
+            fig, axes = plt.subplots(2, 3, figsize=(9, 5.5), squeeze=False)
+            for ax, (opt, weight) in zip(axes.flatten(), metrics):
+                col = f'{weight}_{opt}' if weight else opt
+                if col not in gender_df.columns:
+                    continue
+
+                for genotype, (x, means, sems) in series_by_metric.get((opt, weight), {}).items():
+                    if x:
+                        ax.errorbar(
+                            x, means, yerr=sems, marker='o', linewidth=1.5, capsize=3,
+                            color=color_map.get(genotype, 'gray'), label=genotype,
+                        )
+
+                ax.set_xticks(range(len(session_protocols)))
+                ax.set_xticklabels([label for label, _ in session_protocols])
+                ax.set_title(f'{opt}_{weight}' if weight else opt, fontsize=10)
+                ax.set_ylabel(opt, fontsize=9)
+                if opt == 'alpha':
+                    ax.set_yscale('log')
+                if opt in opt_ylim:
+                    ax.set_ylim(*opt_ylim[opt])
+                ax.tick_params(axis='both', labelsize=9)
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+
+            handles, labels = axes.flatten()[0].get_legend_handles_labels()
+            if handles:
+                fig.legend(handles, labels, loc='upper right', fontsize=9, frameon=False)
+
+            fig.subplots_adjust(top=0.8, wspace=0.35, hspace=0.5)
+            fig.tight_layout(rect=[0, 0, 1, 0.8])
+            fig.suptitle(f'{model_name} fitted params across sessions by gender {gender}', y=0.97, fontsize=10)
+
+            manova_stats = manova_results.get(gender)
+            if manova_stats is not None and 'p_value' in manova_stats.columns:
+                p_by_term = manova_stats.set_index('term')['p_value']
+                manova_text = (
+                    f"MANOVA (Wilks' lambda, all parameters jointly): "
+                    f"genotype p = {p_by_term.get('genotype', np.nan):.3g}, "
+                    f"session p = {p_by_term.get('session', np.nan):.3g}, "
+                    f"genotype x session p = {p_by_term.get('genotype:session', np.nan):.3g}"
                 )
-                fig.savefig(
-                    os.path.join(self.summary,'latent', f'{protocol}_psychometric_curve_by_gender_{gender}_{fit_mode}.svg'),
-                    bbox_inches='tight',
-                    pad_inches=0.2
-                )
-                plt.close(fig)
+                fig.text(0.5, 0.90, manova_text, ha='center', va='top', fontsize=8, weight='bold')
+
+            os.makedirs(os.path.join(self.summary, 'latent'), exist_ok=True)
+            fig.savefig(
+                os.path.join(self.summary, 'latent', f'fitted_params_by_session_{gender}_{model_name}.png'),
+                dpi=300, bbox_inches='tight', pad_inches=0.2
+            )
+            for a in axes.flat:
+                a.patch.set_visible(False)
+            fig.savefig(
+                os.path.join(self.summary, 'latent', f'fitted_params_by_session_{gender}_{model_name}.svg'),
+                bbox_inches='tight', pad_inches=0.2,
+                transparent=True
+            )
+            plt.close(fig)
+
+    def _test_fitted_params_manova_across_sessions(self, fit_params, metrics, model_name):
+        # Does genotype and/or session affect the 6 fitted RL parameters
+        # jointly, combining all sessions into one test - rather than the
+        # per-session MANOVAs above (which each test genotype within a
+        # single session and never test session at all)? This fits a
+        # standard MANOVA with genotype * session as fixed factors and the 6
+        # raw fitted parameters as the multivariate response. Each
+        # (animal, session) row is treated as an independent observation, so
+        # unlike a true repeated-measures MANOVA it doesn't explicitly model
+        # the same animal contributing multiple sessions - there's no
+        # ready-made repeated-measures MANOVA available here.
+        metric_cols = [f'{weight}_{opt}' if weight else opt for opt, weight in metrics]
+        metric_cols = [c for c in metric_cols if c in fit_params.columns]
+        if not metric_cols:
+            return {}
+
+        genders = fit_params['gender'].dropna().unique()
+        genders = [g for g in genders if str(g).strip() != '']
+        # fit_mode='session' stores the AB-CD sessions as 'AB-CD1'/'AB-CD2'/
+        # 'AB-CD3' in fit_params['protocol']; map them to the plain 'CD1'/
+        # 'CD2'/'CD3' labels used everywhere else (model_comparison, the
+        # by-session plot).
+        protocol_to_session = {
+            'AB1': 'AB1', 'AB2': 'AB2', 'AB3': 'AB3',
+            'AB-CD1': 'CD1', 'AB-CD2': 'CD2', 'AB-CD3': 'CD3',
+        }
+
+        manova_results = {}
+        for gender in genders:
+            gender_df = fit_params[fit_params['gender'] == gender].copy()
+            gender_df = gender_df[gender_df['genotype'].isin(['WT', self.Mut])]
+            if gender_df.empty:
+                continue
+
+            gender_df['session'] = gender_df['protocol'].map(protocol_to_session)
+            manova_df = gender_df[metric_cols + ['genotype', 'session']].copy()
+            for c in metric_cols:
+                manova_df[c] = pd.to_numeric(manova_df[c], errors='coerce')
+            manova_df = manova_df.dropna()
+            if (
+                manova_df['genotype'].nunique() < 2
+                or manova_df['session'].nunique() < 2
+                or manova_df.shape[0] <= len(metric_cols) + 1
+            ):
+                continue
+
+            try:
+                formula = ' + '.join(f'Q("{c}")' for c in metric_cols) + ' ~ genotype * session'
+                manova_fit = MANOVA.from_formula(formula, data=manova_df).mv_test()
+                stats_df = pd.DataFrame([
+                    {
+                        'term': term,
+                        'p_value': manova_fit.results[term]['stat'].loc["Wilks' lambda", 'Pr > F'],
+                    }
+                    for term in ('genotype', 'session', 'genotype:session')
+                    if term in manova_fit.results
+                ])
+            except Exception:
+                continue
+            if stats_df.empty:
+                continue
+
+            stats_df['n_animals'] = manova_df.shape[0]
+            stats_df['n_params'] = len(metric_cols)
+
+            os.makedirs(os.path.join(self.summary, 'latent'), exist_ok=True)
+            stats_df.to_csv(
+                os.path.join(
+                    self.summary, 'latent', f'fitted_params_{model_name}_{gender}_MANOVA_across_sessions.csv'
+                ),
+                index=False
+            )
+            manova_results[gender] = stats_df
+
+        return manova_results
 
     def model_comparison(self):
         # compare AIC result for hybrid model and policy gradient model
@@ -1734,166 +2284,310 @@ class BehDataOdor(BehData):
         delta_AIC = {} # policy - hybrid
         subject_ID = {}
         genotypes = {}
+        self.model_comparison_lmm = {}
+        self.model_comparison_lmm_anova = {}
+        self.model_comparison_delta_lmm = {}
+        self.model_comparison_delta_lmm_anova = {}
 
         genders = ['M', 'F']
         for gender in genders:
             genderIDs = np.array(self.Animals)[np.array(self.Gender) == gender]
+            lmm_records = []
+            delta_records = []
 
             for ses in session_to_compare:
-                # load hybrid model results
-                from scipy.io import loadmat
-                hybrid_name = os.path.join(self.summary, 'Results', 'hybrid_fit_' + ses + '.mat')
-                mat = loadmat(hybrid_name)
-                fit_result = mat['fit_result']
-                subjects = fit_result['subjects'][0][0]
-                tempSub = []
-                tempAIC = []
-                tempGeno = []
-                for sub in subjects:
-                    if str(sub[0]) in genderIDs:
-                        tempSub.append(sub)
-                        tempAIC.append(fit_result['All_fits'][0][0][np.where(fit_result['subjects'][0][0] == sub)[0][0], 2])
-                        tempGeno.append(fit_result['genotypes'][0][0][np.where(fit_result['subjects'][0][0] == sub)[0][0]])
-
-                subject_ID[ses] = tempSub
-                genotypes[ses] = tempGeno
-                AIC_hybrid = np.array(tempAIC)
-                #all_params = fit_result['All_params']
-
-                # load policy gradient model results
+                # load hybrid and policy gradient model results (produced by model_fitting)
                 if 'AB' in ses:
                     target_ses = ses[0:2]
                 elif 'CD' in ses:
                     target_ses = 'AB-' + ses[0:2]
 
-
+                tempSub = []
+                tempAIC = []
+                tempGeno = []
                 AIC_policy = []
                 subject_policy = []
-                for sub in tempSub:
-                    
-                    animal_mask = self.data_index['Animal'] == str(sub[0])
+                for animalID in genderIDs:
+                    animal_mask = self.data_index['Animal'] == str(animalID)
                     protocol_mask = self.data_index['Protocol'] == target_ses
                     day_mask = self.data_index['ProtocolDay'] == int(ses[2])
                     match_idx = self.data_index.index[animal_mask & protocol_mask & day_mask]
 
                     if len(match_idx) == 0:
                         continue
-                    subject_policy.append(str(sub[0]))
                     ss = match_idx[0]
                     save_path = os.path.join(self.data_index.loc[ss, 'AnalysisPath'], 'latent')
 
-                    savedatapath = os.path.join(save_path, 'policy_gradient_fit.json')
-                    # load json file
-                    with open(savedatapath, 'r') as f:
+                    hybrid_datapath = os.path.join(save_path, 'hybrid_Q_fit.json')
+                    policy_datapath = os.path.join(save_path, 'policy_gradient_fit.json')
+                    if not (os.path.exists(hybrid_datapath) and os.path.exists(policy_datapath)):
+                        continue
+
+                    with open(hybrid_datapath, 'r') as f:
+                        hybrid_fit = json.load(f)
+                    with open(policy_datapath, 'r') as f:
                         policy_gradient_fit = json.load(f)
-                        AIC_policy.append(policy_gradient_fit['AIC'])
-                        # animal_PG.append(self.data_index['Animal'][ss])
+
+                    # AIC scales with the number of trials the model was fit on
+                    # (it's built from a summed log-likelihood), so raw AIC isn't
+                    # comparable across sessions of different length; normalize
+                    # to AIC per trial using each model's own fitted trial count
+                    try:
+                        n_trials_hybrid = len(hybrid_fit['pRight_fit'])
+                        n_trials_policy = len(policy_gradient_fit['args']['dat']['y'])
+                    except (KeyError, TypeError):
+                        continue
+                    if n_trials_hybrid == 0 or n_trials_policy == 0:
+                        continue
+
+                    tempSub.append(animalID)
+                    tempAIC.append(hybrid_fit['AIC'] / n_trials_hybrid)
+                    tempGeno.append(self.data_index.loc[ss, 'Genotype'])
+                    AIC_policy.append(policy_gradient_fit['AIC'] / n_trials_policy)
+                    subject_policy.append(animalID)
+
+                subject_ID[ses] = tempSub
+                genotypes[ses] = np.array(tempGeno)
+                AIC_hybrid = np.array(tempAIC)
+
                 mAIC_policy[ses] = np.array(AIC_policy) - (np.array(AIC_policy) + np.array(AIC_hybrid))/2
                 mAIC_hybrid[ses] = np.array(AIC_hybrid) - (np.array(AIC_hybrid) + np.array(AIC_policy))/2
 
-            fig, ax = plt.subplots(figsize=(10, 6))
-            x = np.arange(len(session_to_compare))
-            offset = 0.18
-            colors = {'Policy gradient': 'C0', 'Hybrid': 'C1'}
+                delta_AIC[ses] = np.array(AIC_policy) - np.array(AIC_hybrid)
+                for subj, delta, geno in zip(tempSub, delta_AIC[ses], tempGeno):
+                    delta_records.append({
+                        'subject': str(subj), 'genotype': geno,
+                        'session': ses, 'delta_AIC_per_trial': delta,
+                    })
+            if len(delta_records) > 0:
+                delta_df, delta_result, delta_anova = self._test_delta_AIC_genotype_lmm(delta_records, gender)
+                self.model_comparison_delta_lmm[gender] = delta_result
+                self.model_comparison_delta_lmm_anova[gender] = delta_anova
+                if delta_result is not None:
+                    self._plot_delta_AIC_genotype(delta_df, delta_anova, session_to_compare, gender)
 
-            for idx, ses in enumerate(session_to_compare):
-                policy_values = mAIC_policy[ses][np.isfinite(mAIC_policy[ses])]
-                hybrid_values = mAIC_hybrid[ses][np.isfinite(mAIC_hybrid[ses])]
+    def _test_delta_AIC_genotype_lmm(self, delta_records, gender):
+        # does the fit-quality gap between the two models (policy gradient minus
+        # hybrid-Q, per-trial AIC) depend on genotype? Taking the per-animal
+        # paired difference cancels out each animal's overall, model-agnostic
+        # fit level, turning the question into a simple genotype effect (and
+        # genotype x session interaction) on that difference. A random
+        # intercept per subject accounts for the same animal contributing a
+        # difference score at multiple sessions (repeated measures).
+        delta_df = pd.DataFrame(delta_records)
+        delta_df = delta_df[delta_df['genotype'].isin(['WT', self.Mut])].dropna(subset=['delta_AIC_per_trial'])
+        if delta_df.empty:
+            return delta_df, None, None
 
-                for values, label, position in (
-                    (policy_values, 'Policy gradient', x[idx] - offset),
-                    (hybrid_values, 'Hybrid', x[idx] + offset),
-                ):
-                    if values.size:
-                        box = ax.boxplot(
-                            values, positions=[position], widths=0.3, patch_artist=True,
-                            showfliers=False,
-                        )
-                        for element in ('boxes', 'whiskers', 'caps', 'medians'):
-                            plt.setp(box[element], color=colors[label])
-                        box['boxes'][0].set_facecolor(colors[label])
-                        box['boxes'][0].set_alpha(0.35)
-                        jitter = np.linspace(-0.06, 0.06, values.size) if values.size > 1 else [0]
-                        ax.scatter(
-                            position + jitter, values, color=colors[label], s=25,
-                            alpha=0.8, zorder=3,
-                            label=label if idx == 0 else None,
-                        )
+        delta_df['session'] = pd.Categorical(
+            delta_df['session'], categories=['AB1', 'AB2', 'AB3', 'CD1', 'CD2', 'CD3']
+        )
 
-                if policy_values.size and hybrid_values.size:
-                    _, p_value = wilcoxon(policy_values, hybrid_values, alternative='two-sided')
-                else:
-                    p_value = np.nan
-                y_max = max(
-                    np.max(policy_values) if policy_values.size else -np.inf,
-                    np.max(hybrid_values) if hybrid_values.size else -np.inf,
-                )
-                if np.isfinite(y_max):
-                    ax.annotate(
-                        f'p = {p_value:.3g}' if np.isfinite(p_value) else 'p = n/a',
-                        (x[idx], y_max), xytext=(0, 10), textcoords='offset points',
-                        ha='center', va='bottom', fontsize=9,
+        delta_model = smf.mixedlm(
+            "delta_AIC_per_trial ~ C(genotype) * C(session)",
+            data=delta_df,
+            groups=delta_df['subject'],
+        )
+        delta_result = delta_model.fit(reml=True)
+        delta_anova = delta_result.wald_test_terms(skip_single=False).summary_frame()
+
+        os.makedirs(os.path.join(self.summary, 'latent'), exist_ok=True)
+        delta_anova.to_csv(
+            os.path.join(self.summary, 'latent', f'model_comparison_deltaAIC_genotype_{self.strain}_{gender}_anova.csv')
+        )
+        with open(
+            os.path.join(self.summary, 'latent', f'model_comparison_deltaAIC_genotype_{self.strain}_{gender}_summary.txt'), 'w'
+        ) as f:
+            f.write(delta_result.summary().as_text())
+
+        return delta_df, delta_result, delta_anova
+
+    def _plot_delta_AIC_genotype(self, delta_df, anova_table, session_to_compare, gender):
+        # policy gradient - hybrid-Q per-trial AIC, by genotype, across sessions
+        fig, ax = plt.subplots(figsize=(10, 6))
+        x = np.arange(len(session_to_compare))
+        offset = 0.18
+
+        genotype_levels = [g for g in ['WT', self.Mut] if g in delta_df['genotype'].unique()]
+        color_map = {'WT': 'black', 'HET': 'red', 'KO': 'red'}
+        genotype_colors = {g: color_map.get(g, 'gray') for g in genotype_levels}
+
+        for gidx, geno in enumerate(genotype_levels):
+            position_offset = offset * (gidx - (len(genotype_levels) - 1) / 2)
+            for sidx, ses in enumerate(session_to_compare):
+                values = delta_df.loc[
+                    (delta_df['genotype'] == geno) & (delta_df['session'] == ses), 'delta_AIC_per_trial'
+                ].to_numpy()
+                if values.size:
+                    box = ax.boxplot(
+                        values, positions=[x[sidx] + position_offset], widths=0.3,
+                        patch_artist=True, showfliers=False,
+                    )
+                    for element in ('boxes', 'whiskers', 'caps', 'medians'):
+                        plt.setp(box[element], color=genotype_colors[geno])
+                    box['boxes'][0].set_facecolor(genotype_colors[geno])
+                    box['boxes'][0].set_alpha(0.35)
+                    jitter = np.linspace(-0.06, 0.06, values.size) if values.size > 1 else [0]
+                    ax.scatter(
+                        x[sidx] + position_offset + jitter, values, color=genotype_colors[geno],
+                        s=20, alpha=0.8, zorder=3,
                     )
 
-            raw_p_values = []
-            for ses in session_to_compare:
-                policy_values = mAIC_policy[ses][np.isfinite(mAIC_policy[ses])]
-                hybrid_values = mAIC_hybrid[ses][np.isfinite(mAIC_hybrid[ses])]
-                raw_p_values.append(
-                wilcoxon(policy_values, hybrid_values, alternative='two-sided').pvalue
-                    if policy_values.size and hybrid_values.size else np.nan
-                )
-            valid_p_values = np.isfinite(raw_p_values)
-            adjusted_p_values = np.full(len(raw_p_values), np.nan)
-            if np.any(valid_p_values):
-                adjusted_p_values[valid_p_values] = multipletests(
-                    np.asarray(raw_p_values)[valid_p_values], method='fdr_bh'
-                )[1]
+        ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+        ax.set_xticks(x, session_to_compare)
+        ax.set_xlabel('Session')
+        ax.set_ylabel('AIC per trial (policy gradient - hybrid-Q)')
+        ax.legend(
+            handles=[Patch(facecolor=genotype_colors[g], edgecolor=genotype_colors[g], alpha=0.35, label=g)
+                     for g in genotype_levels],
+            frameon=False,
+        )
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
 
-            annotation_idx = 0
-            for ses, adjusted_p_value in zip(session_to_compare, adjusted_p_values):
-                values = np.concatenate((mAIC_policy[ses], mAIC_hybrid[ses]))
-                if np.any(np.isfinite(values)):
-                    ax.texts[annotation_idx].set_text(
-                        f'FDR p = {adjusted_p_value:.3g}'
-                        if np.isfinite(adjusted_p_value) else 'FDR p = n/a'
+        pcol = next(c for c in anova_table.columns if c.startswith('P>'))
+
+        def term_pvalue(term_name):
+            if term_name not in anova_table.index:
+                return np.nan
+            return anova_table.loc[term_name, pcol]
+
+        terms = [
+            ('Genotype', 'C(genotype)'),
+            ('Session', 'C(session)'),
+            ('Genotype x Session', 'C(genotype):C(session)'),
+        ]
+        p_text = '   '.join(f'{label}: p = {term_pvalue(pattern):.3g}' for label, pattern in terms)
+
+        fig.suptitle(f'Policy gradient vs. hybrid-Q fit difference {self.strain} {gender}')
+        fig.text(0.5, 0.01, p_text, ha='center', va='bottom', fontsize=9, family='monospace')
+        fig.tight_layout(rect=(0, 0.06, 1, 1))
+        os.makedirs(os.path.join(self.summary, 'latent'), exist_ok=True)
+        fig.savefig(
+            os.path.join(self.summary, 'latent', f'model_comparison_deltaAIC_genotype_{self.strain}_{gender}.png'),
+            dpi=300,
+        )
+        ax.patch.set_visible(False)
+        fig.savefig(
+            os.path.join(self.summary, 'latent', f'model_comparison_deltaAIC_genotype_{self.strain}_{gender}.svg'),
+            transparent=True
+        )
+
+    def _plot_model_comparison_AIC(self, session_to_compare, mAIC_policy, mAIC_hybrid, genotypes, gender, genotype_group):
+        fig, ax = plt.subplots(figsize=(10, 6))
+        x = np.arange(len(session_to_compare))
+        offset = 0.18
+        colors = {'Policy gradient': 'C0', 'Hybrid': 'C1'}
+
+        def geno_filter(ses):
+            if genotype_group == 'All':
+                geno_mask = np.ones(genotypes[ses].shape, dtype=bool)
+            else:
+                geno_mask = genotypes[ses] == genotype_group
+            return mAIC_policy[ses][geno_mask], mAIC_hybrid[ses][geno_mask]
+
+        for idx, ses in enumerate(session_to_compare):
+            policy_values, hybrid_values = geno_filter(ses)
+            policy_values = policy_values[np.isfinite(policy_values)]
+            hybrid_values = hybrid_values[np.isfinite(hybrid_values)]
+
+            for values, label, position in (
+                (policy_values, 'Policy gradient', x[idx] - offset),
+                (hybrid_values, 'Hybrid', x[idx] + offset),
+            ):
+                if values.size:
+                    box = ax.boxplot(
+                        values, positions=[position], widths=0.3, patch_artist=True,
+                        showfliers=False,
                     )
-                    ax.texts[annotation_idx].set_fontsize(12)
-                    annotation_idx += 1
+                    for element in ('boxes', 'whiskers', 'caps', 'medians'):
+                        plt.setp(box[element], color=colors[label])
+                    box['boxes'][0].set_facecolor(colors[label])
+                    box['boxes'][0].set_alpha(0.35)
+                    jitter = np.linspace(-0.06, 0.06, values.size) if values.size > 1 else [0]
+                    ax.scatter(
+                        position + jitter, values, color=colors[label], s=25,
+                        alpha=0.8, zorder=3,
+                        label=label if idx == 0 else None,
+                    )
 
-            all_values = np.concatenate([
-                np.concatenate((mAIC_policy[ses], mAIC_hybrid[ses]))
-                for ses in session_to_compare
-            ])
-            finite_values = all_values[np.isfinite(all_values)]
-            if finite_values.size:
-                y_lower, y_upper = np.percentile(finite_values, [1, 99])
-                padding = max((y_upper - y_lower) * 0.08, 0.1)
-                ax.set_ylim(y_lower - padding, y_upper + padding)
-                for annotation in ax.texts:
-                    annotation.xy = (annotation.xy[0], y_upper - padding)
-
-            ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
-            ax.set_xticks(x, session_to_compare)
-            ax.set_xlabel('Session')
-            ax.set_ylabel('Mean-centered AIC')
-            ax.set_title(f'Policy gradient and hybrid model comparison {self.strain} {gender}')
-            ax.legend(
-                handles=[
-                    Patch(facecolor=colors['Policy gradient'], edgecolor=colors['Policy gradient'],
-                        alpha=0.35, label='Policy gradient'),
-                    Patch(facecolor=colors['Hybrid'], edgecolor=colors['Hybrid'],
-                        alpha=0.35, label='Hybrid'),
-                ],
-                frameon=False,
+            if policy_values.size and hybrid_values.size:
+                _, p_value = wilcoxon(policy_values, hybrid_values, alternative='two-sided')
+            else:
+                p_value = np.nan
+            y_max = max(
+                np.max(policy_values) if policy_values.size else -np.inf,
+                np.max(hybrid_values) if hybrid_values.size else -np.inf,
             )
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-            fig.tight_layout()
-            os.makedirs(os.path.join(self.summary, 'latent'), exist_ok=True)
-            fig.savefig(os.path.join(self.summary, 'latent', f'model_comparison_mAIC_{self.strain}_{gender}.png'), dpi=300)
-            fig.savefig(os.path.join(self.summary, 'latent', f'model_comparison_mAIC_{self.strain}_{gender}.svg'))
-            #plt.close(fig)
+            if np.isfinite(y_max):
+                ax.annotate(
+                    f'p = {p_value:.3g}' if np.isfinite(p_value) else 'p = n/a',
+                    (x[idx], y_max), xytext=(0, 10), textcoords='offset points',
+                    ha='center', va='bottom', fontsize=9,
+                )
+
+        raw_p_values = []
+        for ses in session_to_compare:
+            policy_values, hybrid_values = geno_filter(ses)
+            policy_values = policy_values[np.isfinite(policy_values)]
+            hybrid_values = hybrid_values[np.isfinite(hybrid_values)]
+            raw_p_values.append(
+                wilcoxon(policy_values, hybrid_values, alternative='two-sided').pvalue
+                if policy_values.size and hybrid_values.size else np.nan
+            )
+        valid_p_values = np.isfinite(raw_p_values)
+        adjusted_p_values = np.full(len(raw_p_values), np.nan)
+        if np.any(valid_p_values):
+            adjusted_p_values[valid_p_values] = multipletests(
+                np.asarray(raw_p_values)[valid_p_values], method='fdr_bh'
+            )[1]
+
+        annotation_idx = 0
+        for ses, adjusted_p_value in zip(session_to_compare, adjusted_p_values):
+            policy_values, hybrid_values = geno_filter(ses)
+            values = np.concatenate((policy_values, hybrid_values))
+            if np.any(np.isfinite(values)):
+                ax.texts[annotation_idx].set_text(
+                    f'FDR p = {adjusted_p_value:.3g}'
+                    if np.isfinite(adjusted_p_value) else 'FDR p = n/a'
+                )
+                ax.texts[annotation_idx].set_fontsize(12)
+                annotation_idx += 1
+
+        all_values = np.concatenate([
+            np.concatenate(geno_filter(ses))
+            for ses in session_to_compare
+        ])
+        finite_values = all_values[np.isfinite(all_values)]
+        if finite_values.size:
+            y_lower, y_upper = np.percentile(finite_values, [1, 99])
+            padding = max((y_upper - y_lower) * 0.08, 0.1)
+            ax.set_ylim(y_lower - padding, y_upper + padding)
+            for annotation in ax.texts:
+                annotation.xy = (annotation.xy[0], y_upper - padding)
+
+        ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+        ax.set_xticks(x, session_to_compare)
+        ax.set_xlabel('Session')
+        ax.set_ylabel('Mean-centered AIC per trial')
+        ax.set_title(f'Policy gradient and hybrid model comparison {self.strain} {gender} {genotype_group}')
+        ax.legend(
+            handles=[
+                Patch(facecolor=colors['Policy gradient'], edgecolor=colors['Policy gradient'],
+                    alpha=0.35, label='Policy gradient'),
+                Patch(facecolor=colors['Hybrid'], edgecolor=colors['Hybrid'],
+                    alpha=0.35, label='Hybrid'),
+            ],
+            frameon=False,
+        )
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        fig.tight_layout()
+        os.makedirs(os.path.join(self.summary, 'latent'), exist_ok=True)
+        fig.savefig(os.path.join(self.summary, 'latent', f'model_comparison_mAIC_{self.strain}_{gender}_{genotype_group}.png'), dpi=300)
+        ax.patch.set_visible(False)
+        fig.savefig(os.path.join(self.summary, 'latent', f'model_comparison_mAIC_{self.strain}_{gender}_{genotype_group}.svg'), transparent=True)
+        #plt.close(fig)
         
     def odor_summary(self):
         # plot summary figures for model fitting
@@ -2430,7 +3124,7 @@ class BehDataOdor(BehData):
             return
         
         genotypes = sorted(data_by_genotype.keys())
-        colors = {'WT': 'black', 'HET': 'orange', 'KO': 'red'}
+        colors = {'WT': 'black', 'HET': 'red', 'KO': 'red'}
         
         # Plot response times
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -2504,8 +3198,78 @@ class BehDataOdor(BehData):
         
         print(f"Response times and intertrial intervals plots saved to {self.summary}")
 
-    def plot_performance(self):
+    def compute_block_performance(self):
+        # per-animal, per-session reward rate in 100-trial blocks, populating
+        # self.perf_plot_sessions. This is the lightweight subset of
+        # plot_performance's computation (no d-prime, no 3-hour cut, no GLMM
+        # fitting/plotting), meant for callers that just need the learning
+        # curve data - e.g. overlaying multiple strains on one figure -
+        # without paying for plot_performance's per-strain plots.
+        perf_df = pd.DataFrame(columns=['Animal', 'Gender', 'Genotype', 'Protocol', 'ProtocolDay', 'RewardRate'])
+        for bIdx, behFiles in enumerate(self.data_index['BehCSV']):
+            resultdf = pd.read_csv(behFiles)
+            perf_df.loc[bIdx, 'Animal'] = self.data_index['Animal'][bIdx]
+            perf_df.loc[bIdx, 'Genotype'] = self.data_index['Genotype'][bIdx]
+            perf_df.loc[bIdx, 'Gender'] = self.data_index['Gender'][bIdx]
+            perf_df.loc[bIdx, 'Protocol'] = self.data_index['Protocol'][bIdx]
+            perf_df.loc[bIdx, 'ProtocolDay'] = self.data_index['ProtocolDay'][bIdx]
+            perf_df.at[bIdx, 'RewardRate'] = np.full(25, np.nan)
+
+            nTrials = resultdf.shape[0]
+            tBlocks = 100
+            protocol = self.data_index['Protocol'][bIdx]
+            if protocol == 'AB':
+                startTrial = 0
+            elif protocol == 'AB-CD':
+                startTrial = np.where(resultdf['schedule'] >= 3)[0][0]
+            elif protocol == 'AB-DC' or protocol == 'AB-CD-DC':
+                startTrial = np.where(resultdf['schedule'] >= 5)[0][0]
+            else:
+                continue
+
+            result = resultdf.iloc[startTrial:nTrials, :].reset_index(drop=True)
+            nBlocks = result.shape[0] // tBlocks
+
+            for bb in range(nBlocks):
+                block_df = result.iloc[bb * tBlocks:(bb + 1) * tBlocks, :]
+                perf_df.loc[bIdx, 'RewardRate'][bb] = np.sum(block_df['reward'] > 0) / tBlocks
+
+        protocol_to_session = {
+            ('AB', 1): 'AB1', ('AB', 2): 'AB2', ('AB', 3): 'AB3',
+            ('AB-CD', 1): 'CD1', ('AB-CD', 2): 'CD2', ('AB-CD', 3): 'CD3',
+        }
+        rows_by_session = {ses: [] for ses in ('AB1', 'AB2', 'AB3', 'CD1', 'CD2', 'CD3')}
+        for _, row in perf_df.iterrows():
+            session = protocol_to_session.get((row['Protocol'], row['ProtocolDay']))
+            if session is None:
+                continue
+            for bb in range(10):
+                if not np.isnan(row['RewardRate'][bb]):
+                    rows_by_session[session].append({
+                        'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'],
+                        'Block': bb, 'RewardRate': row['RewardRate'][bb],
+                    })
+
+        self.perf_plot_sessions = {
+            session: pd.DataFrame(rows, columns=['Animal', 'Gender', 'Genotype', 'Block', 'RewardRate'])
+            for session, rows in rows_by_session.items()
+        }
+        return self.perf_plot_sessions
+
+    def plot_performance(self, color_dict=None):
         # call matlab function to plot the performance
+
+        # color_dict, if given, maps strain name (e.g. 'Scn2A') to a color -
+        # used for the mutant genotype's curve so it matches that strain's
+        # color in the cross-strain comparison plot, instead of plain red
+        mut_color = None
+        if color_dict:
+            strain_base = self.strain.split('_')[0]
+            for key, color in color_dict.items():
+                if key.lower() == strain_base.lower():
+                    mut_color = color
+                    break
+        genotype_colors = {'WT': 'black', self.Mut: mut_color or 'red'}
 
         perf_df = pd.DataFrame(columns=['Animal','Gender', 'Genotype', 'Date', 'Protocol', 'ProtocolDay','TrlalNum', 'RewardRate', 'd'])
         # for 6-hour sessions, cut the time to 3 hours and calculate the performance
@@ -2518,8 +3282,8 @@ class BehDataOdor(BehData):
             perf_df.loc[bIdx, 'Date'] = self.data_index['Date'][bIdx]
             perf_df.loc[bIdx, 'Protocol'] = self.data_index['Protocol'][bIdx]
             perf_df.loc[bIdx, 'ProtocolDay'] = self.data_index['ProtocolDay'][bIdx]
-            perf_df.loc[bIdx, 'RewardRate'] = np.full((25,1), np.nan)
-            perf_df.loc[bIdx, 'd'] = np.full((25,1), np.nan)
+            perf_df.at[bIdx, 'RewardRate'] = np.full(25, np.nan)
+            perf_df.at[bIdx, 'd'] = np.full(25, np.nan)
             perf_df.loc[bIdx, 'Gender'] = self.data_index['Gender'][bIdx]
             perf_df.loc[bIdx, 'Session_length'] = self.data_index['Session_length'][bIdx]
             perf_df.loc[bIdx, 'TrialNum'] = np.nan
@@ -2530,8 +3294,8 @@ class BehDataOdor(BehData):
             perf_df_3h.loc[bIdx, 'Date'] = self.data_index['Date'][bIdx]
             perf_df_3h.loc[bIdx, 'Protocol'] = self.data_index['Protocol'][bIdx]
             perf_df_3h.loc[bIdx, 'ProtocolDay'] = self.data_index['ProtocolDay'][bIdx]
-            perf_df_3h.loc[bIdx, 'RewardRate'] = np.full((25,1), np.nan)
-            perf_df_3h.loc[bIdx, 'd'] = np.full((25,1), np.nan)
+            perf_df_3h.at[bIdx, 'RewardRate'] = np.full(25, np.nan)
+            perf_df_3h.at[bIdx, 'd'] = np.full(25, np.nan)
             perf_df_3h.loc[bIdx, 'Gender'] = self.data_index['Gender'][bIdx]
             perf_df_3h.loc[bIdx, 'Session_length'] = self.data_index['Session_length'][bIdx]
             perf_df_3h.loc[bIdx, 'TrialNum'] = np.nan
@@ -2710,45 +3474,88 @@ class BehDataOdor(BehData):
                             perf_plot_3h_CD3 = pd.concat([perf_plot_3h_CD3, pd.DataFrame([{'Animal': row['Animal'], 'Gender': row['Gender'], 'Genotype': row['Genotype'], 'Block': bb, 'RewardRate': row['RewardRate'][bb], 'd': row['d'][bb]}])], ignore_index=True)
                             trials_3h_CD3.append(row['TrialNum'])
 
+        # expose the per-session, per-animal block performance so it can be
+        # reused (e.g. to overlay multiple strains on the same learning curve),
+        # and save it to disk so other strains/sessions can just load it
+        # instead of recomputing it from the raw behavior files
+        self.perf_plot_sessions = {
+            'AB1': perf_plot_AB1, 'AB2': perf_plot_AB2, 'AB3': perf_plot_AB3,
+            'CD1': perf_plot_CD1, 'CD2': perf_plot_CD2, 'CD3': perf_plot_CD3,
+        }
+        os.makedirs(os.path.join(self.summary, 'Results'), exist_ok=True)
+        for session, session_df in self.perf_plot_sessions.items():
+            session_df.to_csv(
+                os.path.join(self.summary, 'Results', f'block_performance_{session}.csv'), index=False
+            )
+
+        # TSC2_adult only: AnimalList.csv has a 'Note' column flagging which
+        # animals were run by Juliana - plot those separately (both sexes
+        # combined, since it's a small subset), plus a matching version with
+        # those animals excluded, in addition to the full-cohort summary
+        # plots below (which combine all animals regardless of Note)
+        if self.strain == 'TSC2_adult':
+            juliana_mask = self.Note.astype(str).str.contains('juliana', case=False, na=False)
+            juliana_animals = set(np.array(self.Animals)[juliana_mask.to_numpy()])
+            if juliana_animals:
+                for ses_label, ses_df in self.perf_plot_sessions.items():
+                    juliana_df = ses_df[ses_df['Animal'].isin(juliana_animals)]
+                    if not juliana_df.empty:
+                        plot_learning_curve(
+                            juliana_df, save_name=f'{ses_label}_rewardrate_juliana',
+                            value_col='RewardRate', trial_col='Block', summary_path=self.summary,
+                            title=f'{ses_label} Reward Rate (Juliana) {self.strain}',
+                            color_dict=genotype_colors,
+                        )
+                    no_juliana_df = ses_df[~ses_df['Animal'].isin(juliana_animals)]
+                    if no_juliana_df.empty:
+                        continue
+                    plot_learning_curve(
+                        no_juliana_df, save_name=f'{ses_label}_rewardrate_no_juliana',
+                        value_col='RewardRate', trial_col='Block', summary_path=self.summary,
+                        title=f'{ses_label} Reward Rate (No Juliana) {self.strain}',
+                        color_dict=genotype_colors,
+                    )
+
+        # summary with all animals combined (regardless of Note), split by sex
         for sex in Sexes:
             plot_learning_curve(perf_plot_AB1[perf_plot_AB1['Gender'] == sex], save_name = 'AB1_rewardrate_' + sex, 
                                 value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = 'AB1 Reward Rate '+ sex + ' ' + self.strain)
+                                title = 'AB1 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
             plot_learning_curve(perf_plot_AB2[perf_plot_AB2['Gender'] == sex], save_name = 'AB2_rewardrate_' + sex, 
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = 'AB2 Reward Rate '+ sex + ' ' + self.strain)
+                                title = 'AB2 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
             plot_learning_curve(perf_plot_AB3[perf_plot_AB3['Gender'] == sex], save_name = 'AB3_rewardrate_' + sex,
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = 'AB3 Reward Rate '+ sex + ' ' + self.strain)
+                                title = 'AB3 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
             plot_learning_curve(perf_plot_CD1[perf_plot_CD1['Gender'] == sex], save_name = 'CD1_rewardrate_' + sex,
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = 'CD1 Reward Rate '+ sex + ' ' + self.strain)
+                                title = 'CD1 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
             plot_learning_curve(perf_plot_CD2[perf_plot_CD2['Gender'] == sex], save_name = 'CD2_rewardrate_' + sex,
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = 'CD2 Reward Rate '+ sex + ' ' + self.strain)
+                                title = 'CD2 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
             plot_learning_curve(perf_plot_CD3[perf_plot_CD3['Gender'] == sex], save_name = 'CD3_rewardrate_' + sex,
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = 'CD3 Reward Rate '+ sex + ' ' + self.strain)
+                                title = 'CD3 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
 
             # 3h performance
             plot_learning_curve(perf_plot_3h_AB1[perf_plot_3h_AB1['Gender'] == sex], save_name = '3h_AB1_rewardrate_' + sex, 
                                 value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = '3h AB1 Reward Rate '+ sex + ' ' + self.strain)
+                                title = '3h AB1 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
             plot_learning_curve(perf_plot_3h_AB2[perf_plot_3h_AB2['Gender'] == sex], save_name = '3h_AB2_rewardrate_' + sex, 
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = '3h AB2 Reward Rate '+ sex + ' ' + self.strain)
+                                title = '3h AB2 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
             plot_learning_curve(perf_plot_3h_AB3[perf_plot_3h_AB3['Gender'] == sex], save_name = '3h_AB3_rewardrate_' + sex,
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = '3h AB3 Reward Rate '+ sex + ' ' + self.strain)
+                                title = '3h AB3 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
             plot_learning_curve(perf_plot_3h_CD1[perf_plot_3h_CD1['Gender'] == sex], save_name = '3h_CD1_rewardrate_' + sex,
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = '3h CD1 Reward Rate '+ sex + ' ' + self.strain)
+                                title = '3h CD1 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
             plot_learning_curve(perf_plot_3h_CD2[perf_plot_3h_CD2['Gender'] == sex], save_name = '3h_CD2_rewardrate_' + sex,
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = '3h CD2 Reward Rate '+ sex + ' ' + self.strain)
+                                title = '3h CD2 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
             plot_learning_curve(perf_plot_3h_CD3[perf_plot_3h_CD3['Gender'] == sex], save_name = '3h_CD3_rewardrate_' + sex,
                         value_col = 'RewardRate', trial_col = 'Block', summary_path = self.summary,
-                                title = '3h CD3 Reward Rate '+ sex + ' ' + self.strain)
+                                title = '3h CD3 Reward Rate '+ sex + ' ' + self.strain, color_dict = genotype_colors)
 
 
         trial_sets = [
@@ -2796,7 +3603,7 @@ class BehDataOdor(BehData):
         for row in trial_stats:
             row['AdjustedPValue'] = next(adjusted_p_values) if np.isfinite(row['PValue']) else np.nan
 
-        fig, axes = plt.subplots(2, 3, figsize=(15, 9), sharey=True)
+        fig, axes = plt.subplots(2, 3, figsize=(9, 5.4), sharey=True)
         for ax, row in zip(axes.flat, trial_stats):
             data = [row['RegularTrials'], row['ThreeHourTrials']]
             if all(values.size > 1 for values in data):
@@ -2825,6 +3632,9 @@ class BehDataOdor(BehData):
             ax.set_ylim(0, 2000)
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
+            ax.spines['left'].set_linewidth(1.5)
+            ax.spines['bottom'].set_linewidth(1.5)
+            ax.tick_params(width=1.5)
         fig.suptitle('Trials performed: 6h vs 3h condition')
         fig.tight_layout()
         fig.savefig(os.path.join(self.summary, 'trials_6h_vs_3h.png'), dpi=300,
@@ -3212,6 +4022,150 @@ class BehDataOdor(BehData):
                 # # frame is a numpy array (H x W x 3)
                 # print(frame.shape)
 
+    def PCA_prep(self):
+        # prepare the data into a matrix for PCA analysis
+        # to do: the matrix will be a 2D matrix, with each animal is a row
+        # the column will be: subjectID, age (adol or adult), genotype, gender, the the 100-trial block performance for AB1-3 and AB-CD 1-3
+        # for all the 6 sessions, the blocks are caped at 20. if a session is longer than 2000 trials, trials past 2000 is ignored. if a session 
+        # is less than 2000, missing blocks are filled with NaN. The performance is the reward rate with in the 100 trials. if the last block has
+        # less than 50 trials, the performance will also be NaN. For AB-CD sessions, the performance will only be calculated within CD trials
+        # for each animal, two more columns will be needed. one is number of AB sessions until the animal moved to the first AB-CD session
+        # the second is number of retrain AB sessions between AB-CD1 and AB-CD3.
+        # For each AB-CD sessions, one more column is included. it is the number of AB trials until the session progress to CD trials
+        # for each animal, fitted parameter from the RL model will be included. 6 parameters from hybrid-Q, and 6 parameters from policy-gradient
+        #
+        session_labels = ['AB1', 'AB2', 'AB3', 'CD1', 'CD2', 'CD3']
+        nBlocks = 20
+        tBlocks = 100
+        maxTrials = nBlocks * tBlocks
+
+        strain_parts = self.strain.split('_')
+        if 'adol' in strain_parts:
+            age = 'adol'
+        elif 'adult' in strain_parts:
+            age = 'adult'
+        else:
+            age = None
+
+        hybrid_params = ['beta', 'alpha', 'stick', 'lapse', 'ret', 'bias']
+        policy_hypers = ['alpha', 'sigma']
+        policy_weights = ['bias', 'stim', 'stick']
+
+        rows = []
+        for aIdx, animalID in enumerate(self.Animals):
+            row = {
+                'subjectID': animalID,
+                'age': age,
+                'genotype': self.Genotypes[aIdx],
+                'gender': self.Gender[aIdx],
+            }
+
+            animal_sessions = self.data_index[self.data_index['Animal'] == animalID]
+            ab_sessions = animal_sessions[animal_sessions['Protocol'] == 'AB'].sort_values('Date')
+            ab_cd_sessions = animal_sessions[animal_sessions['Protocol'] == 'AB-CD'].sort_values('Date')
+
+            if not ab_cd_sessions.empty:
+                first_ab_cd_date = ab_cd_sessions['Date'].iloc[0]
+                row['nAB_before_first_ABCD'] = int(np.sum(ab_sessions['Date'] < first_ab_cd_date))
+            else:
+                row['nAB_before_first_ABCD'] = np.nan
+
+            if len(ab_cd_sessions) >= 3:
+                abcd1_date = ab_cd_sessions['Date'].iloc[0]
+                abcd3_date = ab_cd_sessions['Date'].iloc[2]
+                row['nAB_retrain_between_ABCD1_ABCD3'] = int(np.sum(
+                    (ab_sessions['Date'] > abcd1_date) & (ab_sessions['Date'] < abcd3_date)
+                ))
+            else:
+                row['nAB_retrain_between_ABCD1_ABCD3'] = np.nan
+
+            # fits are saved per-session by model_fitting; use the animal's
+            # most advanced available session as its overall fitted parameters
+            latest_fit_session = None
+            for ses in session_labels:
+                protocol = 'AB-CD' if 'CD' in ses else 'AB'
+                day = int(ses[-1])
+                match = animal_sessions.index[
+                    (animal_sessions['Protocol'] == protocol) & (animal_sessions['ProtocolDay'] == day)
+                ]
+
+                block_perf = np.full(nBlocks, np.nan)
+                if len(match):
+                    ss = match[0]
+                    latest_fit_session = ss
+                    behFiles = self.data_index.loc[ss, 'BehCSV']
+                    if isinstance(behFiles, str) and os.path.exists(behFiles):
+                        resultdf = pd.read_csv(behFiles)
+
+                        if protocol == 'AB-CD':
+                            # AB-CD sessions start with AB trials (schedule 1/2) before
+                            # switching to CD (schedule 3/4); only CD trials count
+                            cd_start = np.where(resultdf['schedule'] >= 3)[0]
+                            if cd_start.size:
+                                row[f'{ses}_AB_trials_before_CD'] = int(cd_start[0])
+                                resultdf = resultdf.iloc[cd_start[0]:].reset_index(drop=True)
+                            else:
+                                row[f'{ses}_AB_trials_before_CD'] = np.nan
+                                resultdf = resultdf.iloc[0:0]
+
+                        resultdf = resultdf.iloc[:maxTrials]
+
+                        nFullBlocks = min(resultdf.shape[0] // tBlocks, nBlocks)
+                        for bb in range(nFullBlocks):
+                            block_df = resultdf.iloc[bb * tBlocks:(bb + 1) * tBlocks]
+                            block_perf[bb] = np.sum(block_df['reward'] > 0) / tBlocks
+
+                        remainder = resultdf.shape[0] - nFullBlocks * tBlocks
+                        if nFullBlocks < nBlocks and remainder >= 50:
+                            block_df = resultdf.iloc[nFullBlocks * tBlocks: nFullBlocks * tBlocks + remainder]
+                            block_perf[nFullBlocks] = np.sum(block_df['reward'] > 0) / remainder
+                    elif protocol == 'AB-CD':
+                        row[f'{ses}_AB_trials_before_CD'] = np.nan
+                elif protocol == 'AB-CD':
+                    row[f'{ses}_AB_trials_before_CD'] = np.nan
+
+                for bb in range(nBlocks):
+                    row[f'{ses}_block{bb + 1}'] = block_perf[bb]
+
+            hybrid_fit = None
+            policy_fit = None
+            if latest_fit_session is not None:
+                save_path = os.path.join(self.data_index.loc[latest_fit_session, 'AnalysisPath'], 'latent')
+                hybrid_datapath = os.path.join(save_path, 'hybrid_Q_fit.json')
+                policy_datapath = os.path.join(save_path, 'policy_gradient_fit.json')
+                if os.path.exists(hybrid_datapath):
+                    with open(hybrid_datapath, 'r') as f:
+                        hybrid_fit = json.load(f)
+                if os.path.exists(policy_datapath):
+                    with open(policy_datapath, 'r') as f:
+                        policy_fit = json.load(f)
+
+            if hybrid_fit is not None:
+                for pname in hybrid_params:
+                    row[f'hybridQ_{pname}'] = hybrid_fit['params'][pname]
+            else:
+                for pname in hybrid_params:
+                    row[f'hybridQ_{pname}'] = np.nan
+
+            if policy_fit is not None:
+                weights = policy_fit['weight']
+                opt_vars = policy_fit['args']['optList']
+                for widx, ww in enumerate(weights):
+                    for vv in opt_vars:
+                        row[f'policyGrad_{vv}_{ww}'] = policy_fit['opt_hyper'][vv][widx]
+            else:
+                for vv in policy_hypers:
+                    for ww in policy_weights:
+                        row[f'policyGrad_{vv}_{ww}'] = np.nan
+
+            rows.append(row)
+
+        pca_df = pd.DataFrame(rows)
+        os.makedirs(self.summary, exist_ok=True)
+        pca_df.to_csv(os.path.join(self.summary, f'PCA_prep_{self.strain}.csv'), index=False)
+
+        return pca_df
+
 class BehDataRotarod(BehData):
 
     def __init__(self, root_file, strain):
@@ -3326,11 +4280,123 @@ class BehDataRotarod(BehData):
             #self.data=sorted_df
             self.nSessions = len(self.data_index['Animal'])
 
-    def plot_performance(self):
+    def quality_control(self):
+        # Flag subjects with excessive falls-by-turning and plot their
+        # performance separately from subjects that pass QC.
+        #   condition1: >=2 falls among the first 3 trials
+        #   condition2: >=6 falls among all trials (nominally 12)
+        df = self.data_index[['Animal', 'Genotype', 'Trial', 'Performance', 'FallByTurning']].copy()
+        df['Performance'] = pd.to_numeric(df['Performance'], errors='coerce')
+        df['Trial'] = pd.to_numeric(df['Trial'], errors='coerce')
+
+        if df['FallByTurning'].dtype == bool:
+            fbt_mask = df['FallByTurning'].fillna(False)
+        else:
+            fbt_numeric = pd.to_numeric(df['FallByTurning'], errors='coerce') == 1
+            fbt_text = df['FallByTurning'].astype(str).str.lower().isin(['true', '1', 'yes'])
+            fbt_mask = fbt_numeric | fbt_text
+        df['FBT'] = fbt_mask
+
+        trial_order = np.sort(df['Trial'].dropna().unique())
+        first_three_trials = set(trial_order[:3])
+
+        subj_stats = []
+        for (animal, genotype), g in df.groupby(['Animal', 'Genotype'], observed=True):
+            n_fall_first3 = g.loc[g['Trial'].isin(first_three_trials), 'FBT'].sum()
+            n_fall_total = g['FBT'].sum()
+            subj_stats.append({
+                'Animal': animal,
+                'Genotype': genotype,
+                'condition1': n_fall_first3 >= 2,
+                'condition2': n_fall_total >= 6,
+            })
+        subj_df = pd.DataFrame(subj_stats)
+
+        # performance used for the QC plot: exclude fall trials, cap at 300
+        plot_df = df.copy()
+        plot_df.loc[plot_df['FBT'], 'Performance'] = np.nan
+        plot_df.loc[plot_df['Performance'] > 300, 'Performance'] = 300
+
+        genotype_order = [g for g in ['WT', 'HET', 'KO'] if g in set(df['Genotype'].dropna())]
+        genotype_order += [g for g in df['Genotype'].dropna().unique() if g not in genotype_order]
+
+        trial_codes = {t: i for i, t in enumerate(trial_order)}
+
+        os.makedirs(self.summary, exist_ok=True)
+        subj_df.to_csv(os.path.join(self.summary, f'Rotarod {self.strain}_QC_subjects.csv'), index=False)
+
+        for genotype in genotype_order:
+            gdf = plot_df[plot_df['Genotype'] == genotype]
+            subj_g = subj_df[subj_df['Genotype'] == genotype]
+            if gdf.empty or subj_g.empty:
+                continue
+
+            groups = [
+                ('Condition1: >=2/3 falls (first 3 trials)', subj_g.loc[subj_g['condition1'], 'Animal'], 'crimson'),
+                ('Condition2: >=6/12 falls (all trials)', subj_g.loc[subj_g['condition2'], 'Animal'], 'darkorange'),
+                ('Neither condition', subj_g.loc[~subj_g['condition1'] & ~subj_g['condition2'], 'Animal'], 'black'),
+            ]
+
+            fig, ax = plt.subplots(figsize=(7, 5))
+            for label, animals, color in groups:
+                sub = gdf[gdf['Animal'].isin(animals)]
+                sub = sub.dropna(subset=['Trial', 'Performance'])
+                if sub.empty:
+                    continue
+
+                summary = sub.groupby('Trial')['Performance'].agg(['mean', 'std', 'count']).reset_index()
+                summary['sem'] = summary['std'] / np.sqrt(summary['count'])
+                x = summary['Trial'].map(trial_codes).astype(float).to_numpy()
+                y = summary['mean'].to_numpy(dtype=float)
+                sem = summary['sem'].to_numpy(dtype=float)
+                n_subjects = animals.nunique()
+                ax.errorbar(
+                    x, y, yerr=sem, marker='o', linewidth=2, capsize=3,
+                    color=color, label=f'{label} (n={n_subjects})'
+                )
+
+                for animal, adf in sub.groupby('Animal', observed=True):
+                    adf = adf.sort_values('Trial')
+                    subject_x = adf['Trial'].map(trial_codes).astype(float).to_numpy()
+                    subject_y = adf['Performance'].to_numpy(dtype=float)
+                    ax.plot(
+                        subject_x, subject_y, color=color,
+                        linestyle='--', linewidth=0.5, alpha=0.35
+                    )
+
+            ax.set_xticks(np.arange(len(trial_order)))
+            ax.set_xticklabels([str(t) for t in trial_order])
+            ax.set_xlabel('Trial')
+            ax.set_ylabel('Performance')
+            ax.set_title(f'Rotarod QC {self.strain} {genotype}')
+            ax.legend(frameon=False, fontsize=8)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            fig.tight_layout()
+
+            os.makedirs(os.path.join(self.summary, 'BehPlots'), exist_ok=True)
+            figure_label = f'Rotarod {self.strain} {genotype}_QC'
+            fig.savefig(os.path.join(self.summary, 'BehPlots', f'{figure_label}.png'), dpi=300)
+            ax.patch.set_visible(False)
+            fig.savefig(os.path.join(self.summary, 'BehPlots', f'{figure_label}.svg'), format='svg', transparent=True)
+            plt.close(fig)
+
+    def plot_performance(self, color_dict=None):
         # looks for gender groups
         sexes = self.data_index['Gender'].unique()
 
-          
+        # color_dict, if given, maps strain name (e.g. 'TSC2') to a color -
+        # used for the mutant genotype's curve, matching
+        # BehDataOdor.plot_performance/model_fitting's convention
+        mut_color = None
+        if color_dict:
+            strain_base = self.strain.split('_')[0]
+            for key, color in color_dict.items():
+                if key.lower() == strain_base.lower():
+                    mut_color = color
+                    break
+        genotype_colors = {'WT': 'black', self.Mut: mut_color or 'red'}
+
         for sex in sexes:
             perf_df = self.data_index[['Animal', 'Genotype', 'Gender','Trial', 'Performance', 'FallByTurning']].copy()
             #if 'Cntnap' in self.strain:
@@ -3377,9 +4443,9 @@ class BehDataRotarod(BehData):
 
             # if performance larger than 300, make it 300
             perf_df.loc[perf_df['performance'] > 300, 'performance'] = 300
-            plot_learning_curve(perf_df, save_name = figure_label, 
+            plot_learning_curve(perf_df, save_name = figure_label,
                         value_col = 'performance', trial_col = 'trial', summary_path = self.summary,
-                                title = figure_label)
+                                title = figure_label, color_dict = genotype_colors)
 
             #return perf_df, stats_df
     
@@ -3789,9 +4855,21 @@ class BehDataRotarod(BehData):
             if (self.data_index['DLC'][idx] is not None) and (len(self.data_index['DLC'][idx])>0):
                 obj.get_stride(front_kp, back_kp, self.data_index.iloc[idx])
 
-    def stride_summary(self):
+    def stride_summary(self, color_dict=None):
                 # things to do:
         # 1. foot amplitude and frequency in the beginning (5-20 rpm)
+
+        # color_dict, if given, maps strain name (e.g. 'TSC2') to a color -
+        # used for the mutant genotype's curves, matching plot_performance's
+        # convention
+        mut_color = None
+        if color_dict:
+            strain_base = self.strain.split('_')[0]
+            for key, color in color_dict.items():
+                if key.lower() == strain_base.lower():
+                    mut_color = color
+                    break
+        genotype_colors = {'WT': 'black', self.Mut: mut_color or 'red'}
 
         #%% average cross correlation
         """ calculate the average cross correlation with in speed interval """
@@ -4117,7 +5195,8 @@ class BehDataRotarod(BehData):
             savefigpath = os.path.join(self.summary, 'Performance vs ' + key + ' Amplitude SD.png')
             plt.savefig(savefigpath, dpi=300)
             savefigpath = os.path.join(self.summary, 'Performance vs ' + key + ' Amplitude SD.svg')
-            plt.savefig(savefigpath, format='svg')
+            ax.patch.set_visible(False)
+            plt.savefig(savefigpath, format='svg', transparent=True)
 
         #%% plot running std vs rod speed for different gnotype
 
@@ -4169,11 +5248,11 @@ class BehDataRotarod(BehData):
             # plot_speed: array of speeds
 
             genotypes_unique = ['WT', 'HET']
-            colors = {'WT': 'black', 'HET': 'red'}
+            colors = genotype_colors
 
             plt.figure(figsize=(15, 8))
             genotypes_unique = ['WT', 'HET']
-            colors = {'WT': 'black', 'HET': 'red'}
+            colors = genotype_colors
 
             # 1️⃣ Left plot: rod_speed
             ax1 = plt.subplot(1, 2, 1)
@@ -4228,7 +5307,9 @@ class BehDataRotarod(BehData):
             savefigpath = os.path.join(self.summary, 'Changes of ' + key + ' Amplitude SD.png')
             plt.savefig(savefigpath, dpi=300)
             savefigpath = os.path.join(self.summary, 'Changes of  ' + key + ' Amplitude SD.svg')
-            plt.savefig(savefigpath, format='svg')
+            ax1.patch.set_visible(False)
+            ax2.patch.set_visible(False)
+            plt.savefig(savefigpath, format='svg', transparent=True)
 
         #%% plot average frequency and amplitude vs rod speed
         for key in bp_keys:
@@ -4278,11 +5359,11 @@ class BehDataRotarod(BehData):
             # plot_speed: array of speeds
 
             genotypes_unique = ['WT', 'HET']
-            colors = {'WT': 'black', 'HET': 'red'}
+            colors = genotype_colors
 
             plt.figure(figsize=(15, 8))
             genotypes_unique = ['WT', 'HET']
-            colors = {'WT': 'black', 'HET': 'red'}
+            colors = genotype_colors
 
             # 1️⃣ Left plot: rod_speed
             ax1 = plt.subplot(1, 2, 1)
@@ -4337,7 +5418,9 @@ class BehDataRotarod(BehData):
             savefigpath = os.path.join(self.summary, 'Changes of ' + key + ' Average Amplitude.png')
             plt.savefig(savefigpath, dpi=300)
             savefigpath = os.path.join(self.summary, 'Changes of  ' + key + 'Average Amplitude.svg')
-            plt.savefig(savefigpath, format='svg')
+            ax1.patch.set_visible(False)
+            ax2.patch.set_visible(False)
+            plt.savefig(savefigpath, format='svg', transparent=True)
 
         for key in bp_keys:
 
@@ -4386,11 +5469,11 @@ class BehDataRotarod(BehData):
             # plot_speed: array of speeds
 
             genotypes_unique = ['WT', 'HET']
-            colors = {'WT': 'black', 'HET': 'red'}
+            colors = genotype_colors
 
             plt.figure(figsize=(15, 8))
             genotypes_unique = ['WT', 'HET']
-            colors = {'WT': 'black', 'HET': 'red'}
+            colors = genotype_colors
 
             # 1️⃣ Left plot: rod_speed
             ax1 = plt.subplot(1, 2, 1)
@@ -4445,7 +5528,9 @@ class BehDataRotarod(BehData):
             savefigpath = os.path.join(self.summary, 'Changes of ' + key + ' Average Frequency.png')
             plt.savefig(savefigpath, dpi=300)
             savefigpath = os.path.join(self.summary, 'Changes of  ' + key + 'Average Frequency.svg')
-            plt.savefig(savefigpath, format='svg')
+            ax1.patch.set_visible(False)
+            ax2.patch.set_visible(False)
+            plt.savefig(savefigpath, format='svg', transparent=True)
 
         #%% plot average correlation vs rod speed for different genotype
         for key in corr_keys:
@@ -4495,11 +5580,11 @@ class BehDataRotarod(BehData):
             # plot_speed: array of speeds
 
             genotypes_unique = ['WT', 'HET']
-            colors = {'WT': 'black', 'HET': 'red'}
+            colors = genotype_colors
 
             plt.figure(figsize=(15, 8))
             genotypes_unique = ['WT', 'HET']
-            colors = {'WT': 'black', 'HET': 'red'}
+            colors = genotype_colors
 
             # 1️⃣ Left plot: rod_speed
             ax1 = plt.subplot(1, 2, 1)
@@ -4554,7 +5639,9 @@ class BehDataRotarod(BehData):
             savefigpath = os.path.join(self.summary, 'Changes of ' + key + '.png')
             plt.savefig(savefigpath, dpi=300)
             savefigpath = os.path.join(self.summary, 'Changes of  ' + key + '.svg')
-            plt.savefig(savefigpath, format='svg')
+            ax1.patch.set_visible(False)
+            ax2.patch.set_visible(False)
+            plt.savefig(savefigpath, format='svg', transparent=True)
 
         #%% plot average amplitude/frequency at 5-20 RPM within trial 1-3, 4-6, 7-9, and 10-12
         
