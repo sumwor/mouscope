@@ -1,0 +1,140 @@
+PCA_prep column dictionary
+==========================
+
+
+1. PER-ANIMAL COLUMNS
+---------------------
+
+subjectID
+    Animal ID.
+
+age
+    'adol' or 'adult'
+
+genotype
+    Genotype of the animal WT/HET/KO depending on the strains.
+
+gender
+    Sex of the animal M/F (male/female).
+
+nAB_before_first_ABCD
+    Number of AB sessions dated before the animal's first AB-CD session.
+    NaN if the animal never reached AB-CD.
+
+nAB_retrain_between_ABCD1_ABCD3
+    Number of AB retraining sessions dated strictly between the 1st and 3rd
+    AB-CD sessions. NaN if the animal has fewer than 3 AB-CD sessions.
+
+final_stage
+    The furthest stage the animal reached, in training order:
+    AB1 < AB2 < AB3 < ABCD1 < ABCD2 < ABCD3.
+    It is based on ProtocolDay, so AB retraining sessions (AB day > 3) and
+    AB-CD sessions after day 3 do not change it. NaN if none was reached.
+    Note: this column uses 'ABCD1' etc., while the per-session column
+    prefixes below use 'CD1' etc. for the same sessions.
+
+
+2. PER-SESSION COLUMNS
+----------------------
+
+The session prefix <ses> is one of:
+    AB1, AB2, AB3   = AB protocol, ProtocolDay 1, 2, 3
+    CD1, CD2, CD3   = AB-CD protocol, ProtocolDay 1, 2, 3
+
+The columns appear in the order below for each session, and the sessions
+appear in the order AB1, AB2, AB3, CD1, CD2, CD3.
+
+"Performance" always means the fraction of trials with reward > 0.
+
+2a. Trial counts
+
+  AB sessions only (1 column):
+    <ses>_nTrials
+        Total number of trials in the session.
+
+  AB-CD sessions only (3 columns):
+    <ses>_AB_trials_before_CD
+        Number of AB trials (schedule 1 or 2) before the first CD trial
+        (schedule 3 or 4), i.e. the index of the first CD trial. NaN if the
+        session never reached CD trials.
+    <ses>_nTrials_AB
+        Total number of AB trials (schedule < 3) in the session.
+    <ses>_nTrials_CD
+        Total number of CD trials (schedule >= 3) in the session.
+
+  For AB-CD sessions, all performance columns below (blocks and quantiles)
+  use only the trials from the first CD trial onward. The AB warm-up trials
+  at the start are dropped.
+
+2b. Block performance (20 columns)
+
+    <ses>_block1 ... <ses>_block20
+        Performance in consecutive 100-trial blocks.
+        - Only the first 2000 trials (20 blocks x 100) are used. Trials
+          after 2000 are ignored.
+        - If the session is shorter, the blocks that are not reached are NaN.
+        - The last, partial block is kept only if it has at least 50 trials.
+          Its performance is then rewarded trials / trials in that block.
+          If it has fewer than 50 trials, it is NaN.
+
+2c. Quantile performance (4 columns)
+
+    <ses>_quantile1 ... <ses>_quantile4
+        Performance in each quarter of the session. The whole session is
+        split into 4 chunks of (nearly) equal size (numpy.array_split).
+        Unlike the blocks, this is NOT capped at 2000 trials. All 4 are NaN
+        if the session (or the CD part, for AB-CD) has fewer than 4 trials.
+
+2d. Hybrid-Q model parameters (6 columns)
+
+    <ses>_hybridQ_beta
+        Inverse temperature of the softmax in the RL state. Higher values
+        mean more deterministic choices. Bounds 1e-6 to 20.
+    <ses>_hybridQ_alpha
+        Learning rate for Q-value updates after rewarded trials. (The
+        learning rate after unrewarded trials is fixed near 0.) Bounds 1e-6
+        to 1.
+    <ses>_hybridQ_stick
+        Stickiness after a rewarded trial. Positive values mean a tendency to
+        repeat the previous rewarded choice; negative values mean a tendency
+        to switch. Bounds -1 to 1.
+    <ses>_hybridQ_lapse
+        Probability per trial of moving from the RL state to the random
+        state. Bounds 1e-6 to 1.
+    <ses>_hybridQ_ret
+        Probability per trial of returning from the random state to the RL
+        state. Bounds 1e-6 to 1.
+    <ses>_hybridQ_bias
+        Probability of choosing right while in the random state (0.5 means
+        no side bias). Bounds 1e-6 to 1.
+
+2e. Policy-gradient model parameters (6 columns)
+
+
+        bias  = side bias (constant input)
+        stim  = stimulus input (average of the two tone values, s_a and s_b)
+        stick = previous choice, only if it was rewarded
+    Each weight has its own two hyperparameters:
+        alpha = learning rate: how much that weight is updated by the
+                REINFORCE rule after each trial
+        sigma = noise: standard deviation of the random trial-to-trial drift
+                of that weight
+
+    <ses>_policyGrad_alpha_bias
+    <ses>_policyGrad_alpha_stim
+    <ses>_policyGrad_alpha_stick
+    <ses>_policyGrad_sigma_bias
+    <ses>_policyGrad_sigma_stim
+    <ses>_policyGrad_sigma_stick
+
+2f. Model fit quality (2 columns)
+
+    <ses>_hybridQ_AIC_per_trial
+        AIC of the hybrid-Q fit divided by the number of trials it was fit
+        on 
+    <ses>_policyGrad_AIC_per_trial
+        AIC of the policy-gradient fit  divided by the
+        number of trials it was fit on 
+
+
+

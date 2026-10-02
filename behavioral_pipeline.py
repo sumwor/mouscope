@@ -1303,17 +1303,17 @@ class BehDataOdor(BehData):
                     data['schedule'] = data['schedule']-2
 
 
-                # if os.path.exists(savedatapath):
-                #     # load the existing fit
-                #     with open(savedatapath, 'r') as f:
-                #         latent_fit = json.load(f)
-                # else:
-                if model_name == 'policy_gradient':
-                    latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
-                elif model_name == 'hybrid_Q':
-                    #latent_fit = fit_hybrid(data,animalID=animalID, savedatapath=savedatapath)
-                    latent_fit = fit_hybrid_bias_model(data,animalID=animalID, 
-                                                        savedatapath=savedatapath, n_starts=1)
+                if os.path.exists(savedatapath):
+                    # load the existing fit
+                    with open(savedatapath, 'r') as f:
+                        latent_fit = json.load(f)
+                else:
+                    if model_name == 'policy_gradient':
+                        latent_fit = fit_policy_gradient(data,animalID=animalID, savedatapath=savedatapath)
+                    elif model_name == 'hybrid_Q':
+                        #latent_fit = fit_hybrid(data,animalID=animalID, savedatapath=savedatapath)
+                        latent_fit = fit_hybrid_bias_model(data,animalID=animalID, 
+                                                            savedatapath=savedatapath, n_starts=1)
 
                 # if model_name == 'hybrid':
                 #     model_label = 'Hybrid RL'
@@ -1529,12 +1529,19 @@ class BehDataOdor(BehData):
             genders = [g for g in genders if str(g).strip() != '']
 
             for protocol in protocols:
+                # fit_params stores the CD sessions under their full protocol
+                # name ('AB-CD1'), but every other output (psychometric curves,
+                # plot_performance, model_comparison) labels them 'CD1' - keep
+                # the short label for titles/filenames so all six sessions read
+                # as 3 AB + 3 CD
                 if 'CD' in protocol and 'AB' not in protocol:
-                    protocol = 'AB-'+protocol
+                    protocol_key = 'AB-'+protocol
+                else:
+                    protocol_key = protocol
                 for gender in genders:
                     gender_df = fit_params[fit_params['gender'] == gender]
                     if fit_mode == 'session':
-                        gender_df = gender_df[gender_df['protocol']==protocol]
+                        gender_df = gender_df[gender_df['protocol']==protocol_key]
                     genotype_groups = gender_df['genotype'].dropna().unique()
                     genotype_groups = [g for g in genotype_groups if str(g).strip() != '']
                     if {'WT', 'HET'}.issubset(set(genotype_groups)):
@@ -4033,11 +4040,15 @@ class BehDataOdor(BehData):
         # the second is number of retrain AB sessions between AB-CD1 and AB-CD3.
         # For each AB-CD sessions, one more column is included. it is the number of AB trials until the session progress to CD trials
         # for each animal, fitted parameter from the RL model will be included. 6 parameters from hybrid-Q, and 6 parameters from policy-gradient
+        # per session: quantile performance (session split into 4 equal chunks, CD trials only for AB-CD),
+        # total trials (AB and CD counted separately for AB-CD), and per-trial AIC for both models.
+        # per animal: final_stage, the furthest of AB1-AB3/ABCD1-ABCD3 reached (AB retrain doesn't count)
         #
         session_labels = ['AB1', 'AB2', 'AB3', 'CD1', 'CD2', 'CD3']
         nBlocks = 20
         tBlocks = 100
         maxTrials = nBlocks * tBlocks
+        nQuantiles = 4
 
         strain_parts = self.strain.split('_')
         if 'adol' in strain_parts:
@@ -4079,9 +4090,16 @@ class BehDataOdor(BehData):
             else:
                 row['nAB_retrain_between_ABCD1_ABCD3'] = np.nan
 
-            # fits are saved per-session by model_fitting; use the animal's
-            # most advanced available session as its overall fitted parameters
-            latest_fit_session = None
+            # furthest stage reached, in training order; AB retrain sessions
+            # (AB day > 3) and anything past AB-CD3 don't move the stage
+            final_stage = np.nan
+            for ses in session_labels:
+                protocol = 'AB-CD' if 'CD' in ses else 'AB'
+                if np.any((animal_sessions['Protocol'] == protocol) &
+                          (animal_sessions['ProtocolDay'] == int(ses[-1]))):
+                    final_stage = ses.replace('CD', 'ABCD')
+            row['final_stage'] = final_stage
+
             for ses in session_labels:
                 protocol = 'AB-CD' if 'CD' in ses else 'AB'
                 day = int(ses[-1])
@@ -4089,10 +4107,16 @@ class BehDataOdor(BehData):
                     (animal_sessions['Protocol'] == protocol) & (animal_sessions['ProtocolDay'] == day)
                 ]
 
+                if protocol == 'AB-CD':
+                    row[f'{ses}_nTrials_AB'] = np.nan
+                    row[f'{ses}_nTrials_CD'] = np.nan
+                else:
+                    row[f'{ses}_nTrials'] = np.nan
+                quantile_perf = np.full(nQuantiles, np.nan)
+
                 block_perf = np.full(nBlocks, np.nan)
                 if len(match):
                     ss = match[0]
-                    latest_fit_session = ss
                     behFiles = self.data_index.loc[ss, 'BehCSV']
                     if isinstance(behFiles, str) and os.path.exists(behFiles):
                         resultdf = pd.read_csv(behFiles)
@@ -4100,13 +4124,21 @@ class BehDataOdor(BehData):
                         if protocol == 'AB-CD':
                             # AB-CD sessions start with AB trials (schedule 1/2) before
                             # switching to CD (schedule 3/4); only CD trials count
+                            row[f'{ses}_nTrials_AB'] = int(np.sum(resultdf['schedule'] < 3))
+                            row[f'{ses}_nTrials_CD'] = int(np.sum(resultdf['schedule'] >= 3))
                             cd_start = np.where(resultdf['schedule'] >= 3)[0]
                             if cd_start.size:
-                                row[f'{ses}_AB_trials_before_CD'] = int(cd_start[0])
                                 resultdf = resultdf.iloc[cd_start[0]:].reset_index(drop=True)
                             else:
-                                row[f'{ses}_AB_trials_before_CD'] = np.nan
                                 resultdf = resultdf.iloc[0:0]
+                        else:
+                            row[f'{ses}_nTrials'] = int(resultdf.shape[0])
+
+                        # quantile performance uses the whole session (not capped
+                        # at maxTrials), split into nQuantiles equal-sized chunks
+                        if resultdf.shape[0] >= nQuantiles:
+                            for qq, q_idx in enumerate(np.array_split(np.arange(resultdf.shape[0]), nQuantiles)):
+                                quantile_perf[qq] = np.mean(resultdf['reward'].iloc[q_idx] > 0)
 
                         resultdf = resultdf.iloc[:maxTrials]
 
@@ -4119,44 +4151,58 @@ class BehDataOdor(BehData):
                         if nFullBlocks < nBlocks and remainder >= 50:
                             block_df = resultdf.iloc[nFullBlocks * tBlocks: nFullBlocks * tBlocks + remainder]
                             block_perf[nFullBlocks] = np.sum(block_df['reward'] > 0) / remainder
-                    elif protocol == 'AB-CD':
-                        row[f'{ses}_AB_trials_before_CD'] = np.nan
-                elif protocol == 'AB-CD':
-                    row[f'{ses}_AB_trials_before_CD'] = np.nan
 
                 for bb in range(nBlocks):
                     row[f'{ses}_block{bb + 1}'] = block_perf[bb]
 
-            hybrid_fit = None
-            policy_fit = None
-            if latest_fit_session is not None:
-                save_path = os.path.join(self.data_index.loc[latest_fit_session, 'AnalysisPath'], 'latent')
-                hybrid_datapath = os.path.join(save_path, 'hybrid_Q_fit.json')
-                policy_datapath = os.path.join(save_path, 'policy_gradient_fit.json')
-                if os.path.exists(hybrid_datapath):
-                    with open(hybrid_datapath, 'r') as f:
-                        hybrid_fit = json.load(f)
-                if os.path.exists(policy_datapath):
-                    with open(policy_datapath, 'r') as f:
-                        policy_fit = json.load(f)
+                for qq in range(nQuantiles):
+                    row[f'{ses}_quantile{qq + 1}'] = quantile_perf[qq]
 
-            if hybrid_fit is not None:
-                for pname in hybrid_params:
-                    row[f'hybridQ_{pname}'] = hybrid_fit['params'][pname]
-            else:
-                for pname in hybrid_params:
-                    row[f'hybridQ_{pname}'] = np.nan
+                # model_fitting saves one fit per session, so read each
+                # session's own fit rather than carrying a single session's
+                # parameters for the whole animal
+                hybrid_fit = None
+                policy_fit = None
+                if len(match):
+                    save_path = os.path.join(self.data_index.loc[match[0], 'AnalysisPath'], 'latent')
+                    hybrid_datapath = os.path.join(save_path, 'hybrid_Q_fit.json')
+                    policy_datapath = os.path.join(save_path, 'policy_gradient_fit.json')
+                    if os.path.exists(hybrid_datapath):
+                        with open(hybrid_datapath, 'r') as f:
+                            hybrid_fit = json.load(f)
+                    if os.path.exists(policy_datapath):
+                        with open(policy_datapath, 'r') as f:
+                            policy_fit = json.load(f)
 
-            if policy_fit is not None:
-                weights = policy_fit['weight']
-                opt_vars = policy_fit['args']['optList']
-                for widx, ww in enumerate(weights):
-                    for vv in opt_vars:
-                        row[f'policyGrad_{vv}_{ww}'] = policy_fit['opt_hyper'][vv][widx]
-            else:
+                for pname in hybrid_params:
+                    row[f'{ses}_hybridQ_{pname}'] = (
+                        hybrid_fit['params'][pname] if hybrid_fit is not None else np.nan
+                    )
+
                 for vv in policy_hypers:
                     for ww in policy_weights:
-                        row[f'policyGrad_{vv}_{ww}'] = np.nan
+                        row[f'{ses}_policyGrad_{vv}_{ww}'] = np.nan
+                if policy_fit is not None:
+                    for widx, ww in enumerate(policy_fit['weight']):
+                        for vv in policy_fit['args']['optList']:
+                            row[f'{ses}_policyGrad_{vv}_{ww}'] = policy_fit['opt_hyper'][vv][widx]
+
+                # AIC per trial, normalized by each model's own fitted trial
+                # count (same as model_comparison)
+                row[f'{ses}_hybridQ_AIC_per_trial'] = np.nan
+                row[f'{ses}_policyGrad_AIC_per_trial'] = np.nan
+                try:
+                    n_trials_hybrid = len(hybrid_fit['pRight_fit'])
+                    if n_trials_hybrid > 0:
+                        row[f'{ses}_hybridQ_AIC_per_trial'] = hybrid_fit['AIC'] / n_trials_hybrid
+                except (KeyError, TypeError):
+                    pass
+                try:
+                    n_trials_policy = len(policy_fit['args']['dat']['y'])
+                    if n_trials_policy > 0:
+                        row[f'{ses}_policyGrad_AIC_per_trial'] = policy_fit['AIC'] / n_trials_policy
+                except (KeyError, TypeError):
+                    pass
 
             rows.append(row)
 

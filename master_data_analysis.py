@@ -90,7 +90,7 @@ if run_odor:
     # analyze the TSC2 behavioral recording data
     #strain_list = ['TSC2_adol', 'TSC2_adult', 'Nlgn3_adol', 'ChD8_adol', 'Cntnap2_adol', 'Scn2a_adol', 'Scn2a_adult', 'Syngap(SGR)_adult', 'Syngap_adol']
     #for strain in strain_list:
-    strain =  'Syngap(SGR)_adult'
+    strain =  'TSC2_adol'
     root_dir = os.path.join(r'Y:\HongliWang\Odor', strain)
 
     Odor = BehDataOdor(root_dir, strain)
@@ -111,6 +111,8 @@ if run_odor:
     #Odor.model_fitting(fit_mode='concat')
     Odor.model_comparison()
 
+    Odor.PCA_prep()
+    
 
     #Odor.plot_performance()
     #Odor.plot_response_times()
