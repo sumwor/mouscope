@@ -102,8 +102,12 @@ if run_odor:
         Odor.compare_notebook(strain_url[0])
 
     #Odor.session_analysis()
-    Odor.plot_performance(color_dict=color_dict)
+    #Odor.plot_performance(color_dict=color_dict)
     
+    #Odor.session_aware()
+    for protocol in ('AB', 'CD'):
+        Odor.session_learning_model(protocol=protocol, color_dict=color_dict)
+        
     #%% model fitting (only implemented policy gradient for now)
     Odor.model_fitting(fit_mode='session', model_name='policy_gradient', color_dict=color_dict)
 

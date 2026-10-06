@@ -28,10 +28,10 @@ import pandas as pd
 import ruptures as rpt
 import statsmodels.formula.api as smf
 
-from scipy.optimize import minimize
+from scipy.optimize import least_squares, minimize
 from scipy.signal import correlate, find_peaks, hilbert, spectrogram
 from scipy.special import expit
-from scipy.stats import mannwhitneyu, pearsonr, wilcoxon
+from scipy.stats import chi2, mannwhitneyu, pearsonr, wilcoxon
 from statsmodels.stats.multitest import multipletests
 from statsmodels.multivariate.manova import MANOVA
 
@@ -3089,6 +3089,1213 @@ class BehDataOdor(BehData):
 
         eureka_learning_stats.to_csv(os.path.join(self.summary, 'eureka_learning_mannwhitney.csv'), index=False)
         self.eureka_learning_stats = eureka_learning_stats
+
+    def session_aware(self, boundary_window=100, running_window=60, smooth_window=500,
+                      bootstrap_replicates=1000, bootstrap_seed=240513):
+        """Analyze performance around behavioral-session boundaries.
+
+        Sessions are grouped the same way as find_eureka(): AB sessions before
+        the first AB-CD session, and CD trials of AB-CD days 1-3. Miss trials
+        are removed; performance is the fraction of rewarded trials.
+        For each pair of consecutive sessions (a boundary):
+        1. performance change: last/first boundary_window trials around the boundary
+        2. boundary-aligned trace: last 300 trials of the previous session and
+           first 500 trials of the next, in 20-trial bins; drop magnitude and the
+           trial at which performance recovers to the pre-boundary baseline
+        3. exponential recovery fit: P(n) = P_inf - A*exp(-n/lambda) fitted to the
+           first 300 post-boundary trials, per animal and per protocol x genotype
+           group, with animal-cluster bootstrap 95% CIs
+        Results are saved in <summary>/session_boundary (existing files are overwritten).
+        """
+        pre_trials = 300       # previous-session trials aligned before the boundary
+        post_trials = 500      # next-session trials aligned after the boundary
+        fit_trials = 300       # post-boundary trials used for the exponential fit
+        bin_trials = 20
+        recovery_window = 50   # initial post performance and trailing window for RecoveryTrial
+
+        savefigpath = os.path.join(self.summary, 'session_boundary')
+        fitpath = os.path.join(savefigpath, 'recovery_fit')
+        os.makedirs(fitpath, exist_ok=True)
+
+        session_rows, change_rows, aligned_rows, recovery_rows, fit_bin_rows = [], [], [], [], []
+        for animal in self.data_index['Animal'].unique():
+            animal_sessions = self.data_index[self.data_index['Animal'] == animal]
+            identity = {'Animal': animal,
+                        'Genotype': animal_sessions['Genotype'].iloc[0],
+                        'Gender': animal_sessions['Gender'].iloc[0]}
+
+            for protocol in ('AB', 'CD'):
+                sessions = self._sb_load_sessions(animal_sessions, protocol)
+                if not sessions:
+                    continue
+                pid = identity | {'Protocol': protocol}
+
+                for ses in sessions:
+                    session_rows.append(pid | {'SessionNumber': ses['SessionNumber'],
+                                               'Date': ses['Date'],
+                                               'ProtocolDay': ses['ProtocolDay'],
+                                               'NTrials': len(ses['rewarded']),
+                                               'SessionPerformance': np.mean(ses['rewarded'])})
+
+                rewarded = np.concatenate([ses['rewarded'] for ses in sessions])
+                boundaries = np.cumsum([len(ses['rewarded']) for ses in sessions])[:-1]
+
+                for bNum, (boundary, prev, nxt) in enumerate(
+                        zip(boundaries, sessions[:-1], sessions[1:]), start=1):
+                    meta = pid | {'BoundaryNumber': bNum,
+                                  'PreviousSession': prev['SessionNumber'],
+                                  'NextSession': nxt['SessionNumber'],
+                                  'PreviousSessionIndex': prev['SessionIndex'],
+                                  'NextSessionIndex': nxt['SessionIndex'],
+                                  'PreviousDate': prev['Date'],
+                                  'NextDate': nxt['Date'],
+                                  'PreviousProtocolDay': prev['ProtocolDay'],
+                                  'NextProtocolDay': nxt['ProtocolDay']}
+
+                    # 1. performance change, taken from the concatenated trials
+                    # (a previous session shorter than the window borrows from the one before)
+                    before = rewarded[max(0, boundary - boundary_window):boundary]
+                    after = rewarded[boundary:boundary + boundary_window]
+                    change_rows.append(meta | {'BoundaryGlobalTrial': int(boundary),
+                                               'NBefore': len(before),
+                                               'NAfter': len(after),
+                                               'BeforePerformance': np.mean(before),
+                                               'AfterPerformance': np.mean(after),
+                                               'PerformanceChange': np.mean(after) - np.mean(before),
+                                               'PerformanceDrop': np.mean(before) - np.mean(after)})
+
+                    # 2. boundary-aligned trace (trial -300..-1 | 0..499), 20-trial bins
+                    pre = prev['rewarded'][-pre_trials:]
+                    post = nxt['rewarded'][:post_trials]
+                    aligned_trial = np.concatenate([np.arange(-len(pre), 0), np.arange(len(post))])
+                    aligned_rewarded = np.concatenate([pre, post])
+                    aligned_bin = aligned_trial // bin_trials * bin_trials
+                    for bin_start in np.unique(aligned_bin):
+                        values = aligned_rewarded[aligned_bin == bin_start]
+                        aligned_rows.append(meta | {'Period': 'Pre' if bin_start < 0 else 'Post',
+                                                    'AlignedTrialStart': int(bin_start),
+                                                    'AlignedTrialEnd': int(bin_start) + bin_trials - 1,
+                                                    'AlignedTrial': bin_start + (bin_trials - 1) / 2,
+                                                    'NTrials': len(values),
+                                                    'Performance': np.mean(values)})
+
+                    baseline = np.mean(pre)
+                    initial_post = np.mean(post[:recovery_window])
+                    drop = baseline - initial_post
+                    percent_valid = not np.isclose(baseline, 0, rtol=0, atol=1e-12)
+                    # first post trial where the trailing 50-trial reward rate reaches baseline
+                    trailing = pd.Series(post).rolling(recovery_window).mean().to_numpy()
+                    recovered = np.flatnonzero(trailing >= baseline)
+                    recovery_rows.append(meta | {'NPreBaselineTrials': len(pre),
+                                                 'NPostTrials': len(post),
+                                                 'PreBoundaryBaseline': baseline,
+                                                 'InitialPostPerformance': initial_post,
+                                                 'DropMagnitude': drop,
+                                                 'PercentDrop': 100 * drop / baseline if percent_valid else np.nan,
+                                                 'PercentDropValid': percent_valid,
+                                                 'RecoveryTrial': recovered[0] if len(recovered) else np.nan,
+                                                 'RecoveredWithin500': bool(len(recovered))})
+
+                    # 3. post-boundary bins for the exponential fit
+                    fit_post = post[:fit_trials]
+                    for start in range(0, len(fit_post), bin_trials):
+                        values = fit_post[start:start + bin_trials]
+                        end = start + len(values) - 1
+                        fit_bin_rows.append(meta | {'BinStart': start,
+                                                    'BinEnd': end,
+                                                    'BinCenter': (start + end) / 2,
+                                                    'NTrials': len(values),
+                                                    'Performance': np.mean(values)})
+
+                self._sb_plot_learning_curve(rewarded, boundaries, pid, running_window,
+                                             smooth_window, savefigpath)
+
+        session_summary = pd.DataFrame(session_rows)
+        boundary_summary = pd.DataFrame(change_rows)
+        aligned_summary = pd.DataFrame(aligned_rows)
+        recovery_metrics = pd.DataFrame(recovery_rows)
+        fit_bins = pd.DataFrame(fit_bin_rows)
+        session_summary.to_csv(os.path.join(savefigpath, 'session_performance_summary.csv'), index=False)
+        if boundary_summary.empty:
+            print('session_aware: no session boundaries found')
+            return None
+
+        boundary_group_summary = (
+            boundary_summary.groupby(['Protocol', 'Genotype'], dropna=False)
+            .agg(NBoundaries=('PerformanceChange', 'size'),
+                 MeanChange=('PerformanceChange', 'mean'),
+                 MedianChange=('PerformanceChange', 'median'),
+                 SDChange=('PerformanceChange', 'std'),
+                 MeanDrop=('PerformanceDrop', 'mean'),
+                 FractionDrops=('PerformanceChange', lambda x: np.mean(x < 0)))
+            .reset_index()
+        )
+
+        animal_fit = self._sb_fit_animals(fit_bins, recovery_metrics)
+        group_fit, group_curve = self._sb_fit_groups(fit_bins, recovery_metrics, fit_trials,
+                                                     bootstrap_replicates, bootstrap_seed)
+
+        boundary_summary.to_csv(os.path.join(savefigpath, 'session_boundary_summary.csv'), index=False)
+        boundary_group_summary.to_csv(os.path.join(savefigpath, 'session_boundary_group_summary.csv'), index=False)
+        aligned_summary.to_csv(os.path.join(savefigpath, 'boundary_aligned_summary.csv'), index=False)
+        recovery_metrics.to_csv(os.path.join(savefigpath, 'boundary_recovery_metrics.csv'), index=False)
+        group_fit.to_csv(os.path.join(fitpath, 'recovery_group_fit_summary.csv'), index=False)
+        animal_fit.to_csv(os.path.join(fitpath, 'recovery_animal_fit_summary.csv'), index=False)
+        group_curve.to_csv(os.path.join(fitpath, 'recovery_group_aligned_curve.csv'), index=False)
+
+        for protocol in ('AB', 'CD'):
+            self._sb_plot_change(boundary_summary, protocol, savefigpath)
+            self._sb_plot_aligned(aligned_summary, protocol, pre_trials, post_trials, savefigpath)
+            self._sb_plot_recovery_fit(group_fit, group_curve, protocol, fit_trials, fitpath)
+        self._sb_plot_fit_params(animal_fit, fitpath)
+        self._sb_plot_fit_vs_drop(animal_fit, fitpath)
+
+        readme = (
+            f'Session-boundary analysis (BehDataOdor.session_aware)\n\n'
+            f'session_boundary_summary.csv: PerformanceChange = rewarded fraction in the first '
+            f'{boundary_window} trials after the boundary minus the last {boundary_window} before it.\n'
+            f'Learning curves per animal: {running_window}-trial running reward rate followed by a '
+            f'{smooth_window}-trial centered rolling mean (same as find_eureka).\n\n'
+            f'boundary_aligned_summary.csv / boundary_recovery_metrics.csv: the last {pre_trials} trials '
+            f'of the previous session are aligned to -{pre_trials}..-1 and the first {post_trials} of the '
+            f'next session to 0..{post_trials - 1}, in non-overlapping {bin_trials}-trial bins; shorter '
+            f'sessions contribute only their observed trials. PreBoundaryBaseline = mean of the aligned '
+            f'pre trials. InitialPostPerformance = mean of the first {recovery_window} post trials. '
+            f'DropMagnitude = baseline - initial post. PercentDrop = 100 * DropMagnitude / baseline, per '
+            f'boundary (NaN when the baseline is 0). RecoveryTrial = first zero-based post trial at which '
+            f'the trailing {recovery_window}-trial reward rate reaches the baseline.\n\n'
+            f'recovery_fit/: P(n) = P_inf - A * exp(-n/lambda) fitted to post-boundary trials '
+            f'0..{fit_trials - 1} in {bin_trials}-trial bins (model averaged over each bin), bounded least '
+            f'squares with multiple starts, P_inf and A in [0,1], lambda in [1,300], at least 8 bins. '
+            f'P_inf is not forced to the pre-boundary baseline. Group curves are boundary-weighted (animals '
+            f'with more boundaries contribute more). 95% CIs come from {bootstrap_replicates} animal-cluster '
+            f'bootstrap replicates (seed {bootstrap_seed}): animals are resampled with replacement, each '
+            f'bringing all of its boundaries.\n'
+            f'PInfWarning / AWarning / LambdaWarning flag estimates within 1% of a bound; P0Warning flags '
+            f'P_inf - A outside [0,1]; BoundaryWarning combines them and also marks failed fits. Failed or '
+            f'warning fits should not be treated as valid estimates.\n'
+            f'Caveats: P_inf, A and lambda trade off if performance has not plateaued by trial '
+            f'{fit_trials - 1}; flat curves leave lambda unidentified; A partly extrapolates to trial 0. '
+            f'Bootstrap CIs describe uncertainty of each group curve and are not a WT/HET test.\n'
+        )
+        with open(os.path.join(savefigpath, 'README_session_boundary.txt'), 'w', encoding='utf-8') as f:
+            f.write(readme)
+
+        self.session_boundary = {
+            'session_summary': session_summary,
+            'boundary_summary': boundary_summary,
+            'boundary_group_summary': boundary_group_summary,
+            'aligned_summary': aligned_summary,
+            'recovery_metrics': recovery_metrics,
+            'fit_bins': fit_bins,
+            'animal_fit': animal_fit,
+            'group_fit': group_fit,
+            'group_curve': group_curve,
+        }
+        return self.session_boundary
+
+    @staticmethod
+    def _sb_load_sessions(animal_sessions, protocol):
+        # AB: sessions before the first AB-CD session; CD: CD trials of AB-CD days 1-3
+        if protocol == 'AB':
+            transition = animal_sessions.index[animal_sessions['Protocol'].str.contains('AB-CD')]
+            selected = animal_sessions.loc[:transition[0] - 1] if len(transition) else animal_sessions
+        else:
+            selected = animal_sessions[(animal_sessions['Protocol'] == 'AB-CD') &
+                                       (animal_sessions['ProtocolDay'] <= 3)]
+
+        sessions = []
+        for sNum, (sIdx, row) in enumerate(selected.iterrows(), start=1):
+            resultdf = pd.read_csv(row['BehCSV'])
+            resultdf = resultdf[~np.isnan(resultdf['actions'])]
+            if protocol == 'CD':
+                resultdf = resultdf[resultdf['schedule'] > 2]
+            if resultdf.empty:
+                continue
+            sessions.append({'SessionNumber': sNum,
+                             'SessionIndex': int(sIdx),
+                             'Date': str(row['Date']),
+                             'ProtocolDay': row['ProtocolDay'],
+                             'rewarded': (resultdf['reward'].fillna(0) > 0).to_numpy(dtype=float)})
+        return sessions
+
+    @staticmethod
+    def _sb_exp_recovery(n, p_inf, amplitude, recovery_lambda):
+        return p_inf - amplitude * np.exp(-np.asarray(n, dtype=float) / recovery_lambda)
+
+    def _sb_binned_prediction(self, starts, ends, params):
+        # mean of the trial-level model over each inclusive bin
+        return np.array([self._sb_exp_recovery(np.arange(int(s), int(e) + 1), *params).mean()
+                         for s, e in zip(starts, ends)])
+
+    def _sb_fit_exponential(self, curve, min_bins=8):
+        lower = np.array([0.0, 0.0, 1.0])
+        upper = np.array([1.0, 1.0, 300.0])
+        curve = curve.dropna(subset=['BinStart', 'BinEnd', 'ObservedMean'])
+        starts = curve['BinStart'].to_numpy(dtype=float)
+        ends = curve['BinEnd'].to_numpy(dtype=float)
+        observed = curve['ObservedMean'].to_numpy(dtype=float)
+
+        fit = {'P_inf': np.nan, 'A': np.nan, 'lambda': np.nan, 'P0': np.nan,
+               'RSS': np.nan, 'RMSE': np.nan, 'R2': np.nan,
+               'FitSuccess': False, 'OptimizerMessage': '', 'NFitBins': len(observed),
+               'PInfWarning': False, 'AWarning': False, 'LambdaWarning': False,
+               'P0Warning': False, 'BoundaryWarning': True}
+        if len(observed) < min_bins:
+            fit['OptimizerMessage'] = f'Fewer than {min_bins} finite bins'
+            return fit
+
+        # deterministic multi-start, keep the lowest RSS
+        late = np.mean(observed[-3:])
+        best = None
+        for p_inf in np.clip([late - 0.1, late, late + 0.1], lower[0], upper[0]):
+            for amplitude in (0.05, 0.2, 0.5):
+                for recovery_lambda in (10.0, 75.0, 200.0):
+                    try:
+                        result = least_squares(
+                            lambda p: self._sb_binned_prediction(starts, ends, p) - observed,
+                            x0=[p_inf, amplitude, recovery_lambda],
+                            bounds=(lower, upper), method='trf')
+                    except (ValueError, FloatingPointError):
+                        continue
+                    if not result.success or not np.all(np.isfinite(result.x)):
+                        continue
+                    rss = np.sum(result.fun ** 2)
+                    if np.isfinite(rss) and (best is None or rss < best[0]):
+                        best = (rss, result)
+        if best is None:
+            fit['OptimizerMessage'] = 'No successful finite optimizer result'
+            return fit
+
+        rss, result = best
+        p_inf, amplitude, recovery_lambda = result.x
+        tss = np.sum((observed - observed.mean()) ** 2)
+        lambda_margin = 0.01 * (upper[2] - lower[2])
+        fit.update({'P_inf': p_inf, 'A': amplitude, 'lambda': recovery_lambda,
+                    'P0': p_inf - amplitude,
+                    'RSS': rss, 'RMSE': np.sqrt(rss / len(observed)),
+                    'R2': 1 - rss / tss if not np.isclose(tss, 0) else np.nan,
+                    'FitSuccess': True, 'OptimizerMessage': str(result.message),
+                    'PInfWarning': bool(p_inf <= 0.01 or p_inf >= 0.99),
+                    'AWarning': bool(amplitude <= 0.01 or amplitude >= 0.99),
+                    'LambdaWarning': bool(recovery_lambda <= lower[2] + lambda_margin or
+                                          recovery_lambda >= upper[2] - lambda_margin),
+                    'P0Warning': bool(not 0 <= p_inf - amplitude <= 1)})
+        fit['BoundaryWarning'] = (fit['PInfWarning'] or fit['AWarning'] or
+                                  fit['LambdaWarning'] or fit['P0Warning'])
+        return fit
+
+    @staticmethod
+    def _sb_group_curve(fit_bins):
+        # boundary-weighted mean per bin
+        return (fit_bins.groupby(['Protocol', 'Genotype', 'BinStart'], dropna=False, sort=True)
+                .agg(BinEnd=('BinEnd', 'max'),
+                     BinCenter=('BinCenter', 'max'),
+                     ObservedMean=('Performance', 'mean'),
+                     ObservedSEM=('Performance', 'sem'),
+                     NBoundaries=('Performance', 'size'),
+                     NAnimals=('Animal', 'nunique'))
+                .reset_index())
+
+    @staticmethod
+    def _sb_drop_summary(metrics):
+        percent = metrics.loc[metrics['PercentDropValid'].astype(bool), 'PercentDrop']
+        summary = {'NPercentDropValid': int(percent.notna().sum())}
+        for name, values in (('PreBoundaryBaseline', metrics['PreBoundaryBaseline']),
+                             ('InitialPostPerformance', metrics['InitialPostPerformance']),
+                             ('DropMagnitude', metrics['DropMagnitude']),
+                             ('PercentDrop', percent)):
+            summary[f'Mean{name}'] = values.mean()
+            summary[f'Median{name}'] = values.median()
+        return summary
+
+    def _sb_fit_animals(self, fit_bins, recovery_metrics):
+        rows = []
+        for (animal, protocol), metrics in recovery_metrics.groupby(['Animal', 'Protocol'], sort=True):
+            animal_bins = fit_bins[(fit_bins['Animal'] == animal) & (fit_bins['Protocol'] == protocol)]
+            curve = (animal_bins.groupby('BinStart', sort=True)
+                     .agg(BinEnd=('BinEnd', 'max'), ObservedMean=('Performance', 'mean'))
+                     .reset_index())
+            rows.append({'Animal': animal, 'Protocol': protocol,
+                         'Genotype': metrics['Genotype'].iloc[0],
+                         'Gender': metrics['Gender'].iloc[0],
+                         'NBoundaries': len(metrics)}
+                        | self._sb_fit_exponential(curve)
+                        | self._sb_drop_summary(metrics))
+        return pd.DataFrame(rows)
+
+    def _sb_fit_groups(self, fit_bins, recovery_metrics, fit_trials, n_replicates, seed):
+        rng = np.random.default_rng(seed)
+        trial_index = np.arange(fit_trials)
+        summary_rows, curves = [], []
+        for (protocol, genotype), group_bins in fit_bins.groupby(['Protocol', 'Genotype'], sort=True):
+            group_metrics = recovery_metrics[(recovery_metrics['Protocol'] == protocol) &
+                                             (recovery_metrics['Genotype'] == genotype)]
+            curve = self._sb_group_curve(group_bins)
+            fit = self._sb_fit_exponential(curve)
+
+            # animal-cluster bootstrap: resample animals with replacement, each bringing
+            # all of its boundaries, so the estimate stays boundary-weighted
+            animals = group_bins['Animal'].unique()
+            boot_params = []
+            for _ in range(n_replicates):
+                sample = pd.concat([group_bins[group_bins['Animal'] == a]
+                                    for a in rng.choice(animals, size=len(animals), replace=True)],
+                                   ignore_index=True)
+                boot_fit = self._sb_fit_exponential(self._sb_group_curve(sample))
+                if boot_fit['FitSuccess']:
+                    boot_params.append([boot_fit['P_inf'], boot_fit['A'], boot_fit['lambda']])
+
+            boot = {'NBootstrapRequested': n_replicates,
+                    'NBootstrapSuccessful': len(boot_params),
+                    'BootstrapSuccessFraction': len(boot_params) / n_replicates if n_replicates else np.nan}
+            if boot_params:
+                boot_params = np.array(boot_params)
+                for i, name in enumerate(('P_inf', 'A', 'lambda')):
+                    boot[f'{name}_CI_low'], boot[f'{name}_CI_high'] = np.percentile(boot_params[:, i], [2.5, 97.5])
+                band = np.percentile([self._sb_exp_recovery(trial_index, *p) for p in boot_params],
+                                     [2.5, 97.5], axis=0).T
+            else:
+                for name in ('P_inf', 'A', 'lambda'):
+                    boot[f'{name}_CI_low'] = boot[f'{name}_CI_high'] = np.nan
+                band = np.full((fit_trials, 2), np.nan)
+
+            summary_rows.append({'Protocol': protocol, 'Genotype': genotype,
+                                 'NAnimals': len(animals), 'NBoundaries': len(group_metrics)}
+                                | fit | boot | self._sb_drop_summary(group_metrics))
+
+            # NaN when the fit failed
+            params = [fit['P_inf'], fit['A'], fit['lambda']]
+            curve['FittedBinMean'] = self._sb_binned_prediction(curve['BinStart'], curve['BinEnd'], params)
+            curve['FittedAtCenter'] = self._sb_exp_recovery(curve['BinCenter'], *params)
+            curve['FittedCurveCI_low'] = np.interp(curve['BinCenter'], trial_index, band[:, 0])
+            curve['FittedCurveCI_high'] = np.interp(curve['BinCenter'], trial_index, band[:, 1])
+            curves.append(curve)
+        return pd.DataFrame(summary_rows), pd.concat(curves, ignore_index=True)
+
+    @staticmethod
+    def _sb_plot_learning_curve(rewarded, boundaries, pid, running_window, smooth_window, savefigpath):
+        # same smoothing as find_eureka: forward running mean, then centered rolling mean
+        running = pd.Series(rewarded).rolling(running_window).mean().shift(-(running_window - 1))
+        smoothed = running.rolling(smooth_window, center=True, min_periods=1).mean().to_numpy()
+        x = np.arange(1, len(smoothed) + 1)
+        valid = np.isfinite(smoothed)
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.plot(x[valid], smoothed[valid], color='black', linewidth=2, label='Concatenated curve')
+        ax.axhline(0.5, color='black', linestyle='--', linewidth=1, alpha=0.6)
+        for i, boundary in enumerate(boundaries):
+            ax.axvline(boundary + 0.5, color='tab:red', linestyle='--', linewidth=1.5, alpha=0.8,
+                       label='Session boundary' if i == 0 else None)
+        ax.set_xlabel('Concatenated trial')
+        ax.set_ylabel('P(correct)')
+        ax.set_ylim(0, 1)
+        ax.set_title(f"{pid['Animal']} ({pid['Genotype']}) {pid['Protocol']}: "
+                     'learning curve with session boundaries')
+        ax.spines[['top', 'right']].set_visible(False)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+
+        animal_dir = os.path.join(savefigpath, str(pid['Animal']))
+        os.makedirs(animal_dir, exist_ok=True)
+        fig.savefig(os.path.join(animal_dir, f"{pid['Animal']}_{pid['Protocol']}_session_boundaries.png"),
+                    dpi=250, bbox_inches='tight')
+        plt.close(fig)
+
+    @staticmethod
+    def _sb_plot_change(boundary_summary, protocol, savefigpath):
+        protocol_df = boundary_summary[boundary_summary['Protocol'] == protocol]
+        if protocol_df.empty:
+            return
+        genotypes = list(protocol_df['Genotype'].dropna().unique())
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for pos, genotype in enumerate(genotypes):
+            values = protocol_df.loc[protocol_df['Genotype'] == genotype, 'PerformanceChange'].dropna().to_numpy()
+            if len(values):
+                jitter = np.linspace(-0.08, 0.08, len(values)) if len(values) > 1 else np.zeros(1)
+                ax.scatter(pos + jitter, values, alpha=0.75)
+        ax.axhline(0, color='black', linestyle='--', linewidth=1)
+        ax.set_xticks(np.arange(len(genotypes)), genotypes)
+        ax.set_ylabel('After - before performance')
+        ax.set_title(f'{protocol}: session-boundary performance change')
+        ax.spines[['top', 'right']].set_visible(False)
+        fig.tight_layout()
+        fig.savefig(os.path.join(savefigpath, f'{protocol}_boundary_performance_change.png'),
+                    dpi=250, bbox_inches='tight')
+        plt.close(fig)
+
+    @staticmethod
+    def _sb_plot_aligned(aligned_summary, protocol, pre_trials, post_trials, savefigpath):
+        protocol_df = aligned_summary[aligned_summary['Protocol'] == protocol]
+        colors = {'WT': 'tab:blue', 'HET': 'tab:orange'}
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        plotted = False
+        for genotype, color in colors.items():
+            genotype_df = protocol_df[protocol_df['Genotype'].astype(str).str.upper() == genotype]
+            if genotype_df.empty:
+                continue
+            curve = (genotype_df.groupby('AlignedTrial')['Performance']
+                     .agg(['mean', 'sem']).reset_index().sort_values('AlignedTrial'))
+            ax.plot(curve['AlignedTrial'], curve['mean'], color=color, linewidth=2, label=genotype)
+            ax.fill_between(curve['AlignedTrial'], curve['mean'] - curve['sem'],
+                            curve['mean'] + curve['sem'], color=color, alpha=0.2, linewidth=0)
+            plotted = True
+
+        ax.axvline(0, color='black', linestyle='--', linewidth=1.5, label='Session boundary')
+        ax.axhline(0.5, color='black', linestyle=':', linewidth=1, alpha=0.6)
+        ax.set_xlim(-pre_trials, post_trials)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel('Trial relative to session boundary')
+        ax.set_ylabel('Mean P(correct)')
+        ax.set_title(f'{protocol}: boundary-aligned recovery (mean +/- SEM)')
+        ax.spines[['top', 'right']].set_visible(False)
+        if plotted:
+            ax.legend(frameon=False)
+        else:
+            ax.text(0.5, 0.5, 'No valid WT/HET session boundaries', ha='center', va='center',
+                    transform=ax.transAxes)
+        fig.tight_layout()
+        fig.savefig(os.path.join(savefigpath, f'{protocol}_boundary_aligned_recovery.png'),
+                    dpi=250, bbox_inches='tight')
+        plt.close(fig)
+
+    def _sb_plot_recovery_fit(self, group_fit, group_curve, protocol, fit_trials, fitpath):
+        colors = {'WT': 'tab:blue' if protocol == 'AB' else 'tab:orange',
+                  'HET': 'tab:cyan' if protocol == 'AB' else 'tab:red'}
+        x = np.arange(fit_trials)
+
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+        annotations = []
+        for genotype, color in colors.items():
+            curve = group_curve[(group_curve['Protocol'] == protocol) &
+                                (group_curve['Genotype'].astype(str).str.upper() == genotype)].sort_values('BinStart')
+            fit_rows = group_fit[(group_fit['Protocol'] == protocol) &
+                                 (group_fit['Genotype'].astype(str).str.upper() == genotype)]
+            if curve.empty or fit_rows.empty:
+                continue
+            fit = fit_rows.iloc[0]
+            ax.errorbar(curve['BinCenter'], curve['ObservedMean'], yerr=curve['ObservedSEM'],
+                        color=color, marker='o', markersize=4, linewidth=1.2, capsize=2,
+                        linestyle='none', alpha=0.85, label=f'{genotype} observed mean +/- SEM')
+            if fit['FitSuccess']:
+                ax.plot(x, self._sb_exp_recovery(x, fit['P_inf'], fit['A'], fit['lambda']),
+                        color=color, linewidth=2.2, label=f'{genotype} exponential fit')
+                low = np.interp(x, curve['BinCenter'], curve['FittedCurveCI_low'])
+                high = np.interp(x, curve['BinCenter'], curve['FittedCurveCI_high'])
+                ax.fill_between(x, low, high, color=color, alpha=0.13, linewidth=0)
+            annotations.append(
+                f"{genotype}: A={fit['A']:.3f} [{fit['A_CI_low']:.3f}, {fit['A_CI_high']:.3f}], "
+                f"lambda={fit['lambda']:.1f} [{fit['lambda_CI_low']:.1f}, {fit['lambda_CI_high']:.1f}]\n"
+                f"N={int(fit['NAnimals'])} animals, {int(fit['NBoundaries'])} boundaries"
+                + (' WARNING' if fit['BoundaryWarning'] else ''))
+
+        ax.axvline(0, color='black', linestyle='--', linewidth=1.2)
+        ax.set_xlim(0, fit_trials)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel('Post-boundary trial (zero-based)', fontsize=11)
+        ax.set_ylabel('P(correct)', fontsize=11)
+        ax.set_title(f'{protocol}: exponential post-session recovery', fontsize=15)
+        ax.text(0.01, 0.98, 'animal-cluster bootstrap 95% CIs\n' + '\n'.join(annotations),
+                transform=ax.transAxes, ha='left', va='top', fontsize=8.5,
+                bbox={'facecolor': 'white', 'alpha': 0.78, 'edgecolor': 'none'})
+        ax.spines[['top', 'right']].set_visible(False)
+        ax.legend(frameon=False, fontsize=8.5, loc='lower right')
+        fig.tight_layout()
+        fig.savefig(os.path.join(fitpath, f'{protocol}_exponential_recovery_fit.png'),
+                    dpi=250, bbox_inches='tight')
+        plt.close(fig)
+
+    @staticmethod
+    def _sb_valid_fits(animal_fit):
+        return animal_fit[animal_fit['FitSuccess'].astype(bool) & ~animal_fit['BoundaryWarning'].astype(bool)]
+
+    def _sb_plot_fit_params(self, animal_fit, fitpath):
+        # individual valid animal fits with median and IQR
+        valid = self._sb_valid_fits(animal_fit)
+        groups = [('AB', 'WT', 'tab:blue'), ('AB', 'HET', 'tab:cyan'),
+                  ('CD', 'WT', 'tab:orange'), ('CD', 'HET', 'tab:red')]
+        rng = np.random.default_rng(7301)
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        for ax, param, ylabel in zip(axes, ('A', 'lambda', 'P_inf'),
+                                     ('Fitted reset amplitude A', 'Recovery timescale lambda (trials)', 'P_inf')):
+            for pos, (protocol, genotype, color) in enumerate(groups):
+                values = valid.loc[(valid['Protocol'] == protocol) &
+                                   (valid['Genotype'].astype(str).str.upper() == genotype), param].dropna()
+                if values.empty:
+                    continue
+                ax.scatter(pos + rng.uniform(-0.08, 0.08, len(values)), values, s=28, alpha=0.7,
+                           color=color, edgecolor='white', linewidth=0.4)
+                q1, median, q3 = values.quantile([0.25, 0.5, 0.75])
+                ax.vlines(pos, q1, q3, color='black', linewidth=3, zorder=4)
+                ax.scatter(pos, median, marker='D', s=65, color='white', edgecolor='black',
+                           linewidth=1, zorder=5)
+            ax.set_xticks(np.arange(len(groups)), [f'{p} {g}' for p, g, _ in groups], rotation=20, fontsize=9)
+            ax.set_ylabel(ylabel, fontsize=10)
+            ax.spines[['top', 'right']].set_visible(False)
+        fig.suptitle('Animal-level recovery parameters: points with median/IQR\n'
+                     f'Valid non-warning fits shown; {len(animal_fit) - len(valid)} failed or warning fits excluded',
+                     fontsize=14)
+        fig.tight_layout()
+        fig.savefig(os.path.join(fitpath, 'recovery_parameter_comparison.png'), dpi=250, bbox_inches='tight')
+        plt.close(fig)
+
+    def _sb_plot_fit_vs_drop(self, animal_fit, fitpath):
+        # fitted A against the empirical absolute and relative drop
+        valid = self._sb_valid_fits(animal_fit)
+        groups = [('AB', 'WT', 'tab:blue'), ('AB', 'HET', 'tab:cyan'),
+                  ('CD', 'WT', 'tab:orange'), ('CD', 'HET', 'tab:red')]
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        for protocol, genotype, color in groups:
+            rows = valid[(valid['Protocol'] == protocol) &
+                         (valid['Genotype'].astype(str).str.upper() == genotype)]
+            for ax, column in zip(axes, ('MeanDropMagnitude', 'MeanPercentDrop')):
+                ax.scatter(rows['A'], rows[column], color=color, s=40, alpha=0.75,
+                           label=f'{protocol} {genotype}')
+        axes[0].plot([0, 1], [0, 1], color='black', linestyle=':', linewidth=1)
+        axes[0].set_ylabel('Mean empirical DropMagnitude', fontsize=10)
+        axes[0].set_title('Same-unit comparison', fontsize=13)
+        axes[0].legend(frameon=False, fontsize=8)
+        axes[1].axhline(0, color='black', linestyle=':', linewidth=1)
+        axes[1].set_ylabel('Mean empirical PercentDrop (%)', fontsize=10)
+        axes[1].set_title('Relative empirical reset', fontsize=13)
+        for ax in axes:
+            ax.set_xlim(left=0)
+            ax.set_xlabel('Fitted A', fontsize=10)
+            ax.spines[['top', 'right']].set_visible(False)
+        fig.suptitle('Fitted recovery amplitude versus empirical boundary drop\n'
+                     'Valid non-warning animal fits', fontsize=14)
+        fig.tight_layout()
+        fig.savefig(os.path.join(fitpath, 'fitted_vs_empirical_drop.png'), dpi=250, bbox_inches='tight')
+        plt.close(fig)
+
+    def session_learning_model(self, protocol='AB', plot_window=50, running_window=60, smooth_window=200,
+                               p_low_trials=50, immediate_trials=300, gradual_trials=100,
+                               p_low_flag=0.1, min_lambda=10, dispersion_block=50, color_dict=None):
+        """Model AB or CD learning together with the performance reset at session boundaries.
+
+        For each animal, the sessions of one protocol are concatenated (miss trials
+        removed, same as find_eureka / session_aware):
+            protocol='AB': AB sessions before the first AB-CD session
+            protocol='CD': CD trials (schedule > 2) of AB-CD days 1-3; the AB trials at
+                           the start of each AB-CD session are left out
+        Models are fitted to the trial-by-trial rewarded outcome (Bernoulli
+        maximum likelihood, L-BFGS-B with multiple starts):
+            learning:    p(t) = p_low + (p_high - p_low) * expit(k * (t - tau)) - reset(t)
+            no learning: p(t) = p0 - reset(t)
+        p_low (naive performance, never above chance, so capped at 0.5): the learning
+        models are first fitted with p_low free. If the fitted tau is within the first
+        immediate_trials trials (ImmediateLearner), the pre-learning stage is too short
+        to fit p_low, so the learning models are refitted with p_low fixed at the mean
+        of the first p_low_trials trials (p_low_source = 'first_trials'), or at 0.5 if
+        that mean is above chance (p_low_source = 'chance').
+        Otherwise, if the fitted 10-90% learning window extends before the first or past
+        the last trial (GradualLearner: no stable stage at the start and/or end, so the
+        asymptotes are extrapolated), the learning models are refitted with p_low fixed
+        at the mean of the first gradual_trials trials (capped at 0.5) and p_high at the
+        mean of the last gradual_trials trials (p_low_source = 'first_trials',
+        p_high_source = 'last_trials').
+        Otherwise the fitted p_low / p_high are kept (source = 'fitted'); PLowMismatch
+        flags a fitted p_low that differs from the first-trials performance by more
+        than p_low_flag.
+            reset(t) = A_i * exp(-n / lambda) in every session after the first,
+                       n = zero-based trial within the session, A_i = amplitude at the
+                       start of session i + 1; all boundaries share the recovery time lambda,
+                       which is at least min_lambda trials so that one or two early errors
+                       cannot be fitted as a large, instantly recovered drop
+                none:     no reset (A = 0)
+                shared:   one A for all boundaries (fitted with >= 1 boundary)
+                separate: its own A_i per boundary (fitted with >= 2 boundaries)
+        t is the concatenated trial (1-based). Variants are compared by QAIC
+        (= 2 NLL / c-hat + 2 (K + 1)), where c-hat (Dispersion, at least 1) is the
+        overdispersion of the most general learning model: the variance of residuals
+        summed over dispersion_block-trial blocks relative to the Bernoulli expectation.
+        Slow fluctuations in performance raise c-hat and so demand stronger evidence.
+        LearningDetected: best learning variant beats best no-learning variant (DeltaQAIC < 0)
+        ResetDetected: within the chosen learning / no-learning model, the best reset
+                       model beats no reset (DeltaQAIC_reset_vs_none < 0)
+        ResetsDiffer: a reset is detected and separate A_i beat a shared A
+                      (DeltaQAIC_reset < 0); ResetsLRT_p is the quasi-likelihood-ratio
+                      test of separate vs shared (LR / c-hat)
+        The same comparisons by BIC are reported (DeltaBIC...) but not used for decisions.
+        The unsuffixed parameter columns (p_low, tau, A1..., lambda, ...) are those of
+        the selected model; suffixed columns hold every fitted variant.
+        Plots show the actual performance (plot_window-trial centered moving
+        average within each session), the smoothed learning curve (running_window
+        running reward rate followed by a smooth_window centered rolling mean over
+        the concatenated trials, same as find_eureka) and the fitted curves.
+        Finally tau, k and p_high of animals with learning detected are compared
+        between genotypes (Mann-Whitney U, Benjamini-Hochberg FDR within each group of
+        all animals / each gender): <protocol>_session_learning_genotype_stats.csv and
+        <protocol>_session_learning_by_genotype_<group>.png.
+        Results are saved in <summary>/session_learning_model, with file names starting
+        with the protocol, and stored in self.session_learning[protocol] and
+        self.session_learning_stats[protocol].
+        """
+        savefigpath = os.path.join(self.summary, 'session_learning_model')
+        os.makedirs(savefigpath, exist_ok=True)
+
+        rows = []
+        curves = {}
+        for animal in self.data_index['Animal'].unique():
+            animal_sessions = self.data_index[self.data_index['Animal'] == animal]
+            sessions = self._sb_load_sessions(animal_sessions, protocol)
+            if not sessions:
+                continue
+            y = np.concatenate([ses['rewarded'] for ses in sessions])
+            session_idx = np.concatenate([np.full(len(ses['rewarded']), ii) for ii, ses in enumerate(sessions)])
+            trial_in_session = np.concatenate([np.arange(len(ses['rewarded'])) for ses in sessions])
+            x = np.arange(1, len(y) + 1, dtype=float)
+            n_resets = len(sessions) - 1
+
+            row = {'Animal': animal,
+                   'Genotype': animal_sessions['Genotype'].iloc[0],
+                   'Gender': animal_sessions['Gender'].iloc[0],
+                   'Protocol': protocol,
+                   'NSessions': len(sessions),
+                   'NTrials': len(y),
+                   'Performance': np.mean(y)}
+
+            row['FirstTrialsPerformance'] = np.mean(y[:p_low_trials])
+            row['StartPerformance'] = np.mean(y[:gradual_trials])
+            row['EndPerformance'] = np.mean(y[-gradual_trials:])
+
+            # a reset needs a boundary; with a single boundary, shared and separate
+            # amplitudes are the same model
+            reset_types = ['none'] + (['shared'] if n_resets >= 1 else []) + (['separate'] if n_resets >= 2 else [])
+
+            def fit_variants(learning, p_low_fixed=None, p_high_fixed=None):
+                return {f"{'learning' if learning else 'flat'}_{reset_type}":
+                        self._slm_fit(y, x, session_idx, trial_in_session, learning=learning,
+                                      p_low_fixed=p_low_fixed, p_high_fixed=p_high_fixed,
+                                      n_resets=n_resets, reset_type=reset_type, min_lambda=min_lambda)
+                        for reset_type in reset_types}
+
+            # learning models with p_low / p_high free locate the transition, then
+            # asymptotes the data cannot pin down are fixed and the models refitted:
+            #   immediate learner: too few pre-learning trials to fit p_low
+            #   gradual learner: no stable stage at the start and/or end
+            learning_fits = fit_variants(learning=True)
+
+            # overdispersion (c-hat) from the most general learning model: slow fluctuations
+            # in performance make trials less informative than independent Bernoulli trials,
+            # so all model comparisons use QAIC = 2 NLL / c-hat + 2 (K + 1)
+            row['DispersionRaw'] = self._slm_dispersion(
+                y, learning_fits[f'learning_{reset_types[-1]}']['prediction'], dispersion_block)
+            c_hat = max(1.0, row['DispersionRaw'])
+            row['Dispersion'] = c_hat
+
+            def add_qaic(fit_dict):
+                for fit in fit_dict.values():
+                    fit['QAIC'] = 2 * fit['NLL'] / c_hat + 2 * (fit['n_params'] + 1)
+                return fit_dict
+
+            add_qaic(learning_fits)
+            free = learning_fits[min(learning_fits, key=lambda m: learning_fits[m]['QAIC'])]['params']
+            row['TauFreeFit'] = free['tau']
+            half_width = np.log(9) / free['k']
+            row['ImmediateLearner'] = bool(free['tau'] <= immediate_trials)
+            row['GradualLearner'] = bool(not row['ImmediateLearner'] and
+                                         (free['tau'] - half_width < 1 or free['tau'] + half_width > len(y)))
+            row['p_high_source'] = 'fitted'
+            if row['ImmediateLearner']:
+                if row['FirstTrialsPerformance'] > 0.5:
+                    p_low_fixed, row['p_low_source'] = 0.5, 'chance'
+                else:
+                    p_low_fixed, row['p_low_source'] = row['FirstTrialsPerformance'], 'first_trials'
+                learning_fits = fit_variants(learning=True, p_low_fixed=p_low_fixed)
+            elif row['GradualLearner'] and row['EndPerformance'] > min(row['StartPerformance'], 0.5):
+                p_low_fixed = min(row['StartPerformance'], 0.5)
+                row['p_low_source'] = 'first_trials' if row['StartPerformance'] <= 0.5 else 'chance'
+                row['p_high_source'] = 'last_trials'
+                learning_fits = fit_variants(learning=True, p_low_fixed=p_low_fixed,
+                                             p_high_fixed=row['EndPerformance'])
+            else:
+                row['p_low_source'] = 'fitted'
+            fits = add_qaic(learning_fits) | add_qaic(fit_variants(learning=False))
+            for model, fit in fits.items():
+                for key, value in fit['params'].items():
+                    row[f'{key}_{model}'] = value
+                for key in ('NLL', 'AIC', 'QAIC', 'BIC', 'success'):
+                    row[f'{key}_{model}'] = fit[key]
+
+            def best_of(base, criterion, with_reset=False):
+                models = [m for m in fits if m.startswith(base) and not (with_reset and m.endswith('_none'))]
+                return min(models, key=lambda m: fits[m][criterion])
+
+            # decisions use QAIC; the same comparisons by BIC are reported for reference.
+            # Every Delta < 0 favors the first-named alternative.
+            for crit in ('QAIC', 'BIC'):
+                row[f'Delta{crit}'] = (fits[best_of('learning', crit)][crit]
+                                       - fits[best_of('flat', crit)][crit])   # learning - no learning
+            row['LearningDetected'] = bool(row['DeltaQAIC'] < 0)
+            base = 'learning' if row['LearningDetected'] else 'flat'
+            for crit in ('QAIC', 'BIC'):
+                row[f'Delta{crit}_reset_vs_none'] = (fits[best_of(base, crit, with_reset=True)][crit]
+                                                     - fits[f'{base}_none'][crit]) if n_resets >= 1 else np.nan
+                row[f'Delta{crit}_reset'] = (fits[f'{base}_separate'][crit]
+                                             - fits[f'{base}_shared'][crit]) if n_resets >= 2 else np.nan
+            row['ResetDetected'] = bool(row['DeltaQAIC_reset_vs_none'] < 0) if n_resets >= 1 else np.nan
+            if n_resets >= 2:
+                row['ResetsDiffer'] = bool(row['ResetDetected'] and row['DeltaQAIC_reset'] < 0)
+                # quasi-likelihood-ratio test, shared A is nested in separate A (df = extra amplitudes)
+                lr_stat = max(0.0, 2 * (row[f'NLL_{base}_shared'] - row[f'NLL_{base}_separate'])) / c_hat
+                row['ResetsLRT_p'] = chi2.sf(lr_stat, df=n_resets - 1)
+            else:
+                row['ResetsDiffer'] = row['ResetsLRT_p'] = np.nan
+            selected = best_of(base, 'QAIC')
+            row['SelectedModel'] = selected
+
+            # parameters of the selected model, with the amplitude listed for every boundary
+            # (0 when no reset is selected)
+            params = fits[selected]['params']
+            for key in ('p_low', 'p_high', 'k', 'tau', 'p0', 'lambda'):
+                row[key] = params.get(key, np.nan)
+            for ii in range(1, n_resets + 1):
+                row[f'A{ii}'] = params.get('A', params.get(f'A{ii}', 0.0))
+            if row['LearningDetected']:
+                # trials over which the sigmoid rises from 10% to 90% of its range
+                half_width = np.log(9) / row['k']
+                row['LearningStart_10'] = row['tau'] - half_width
+                row['LearningEnd_90'] = row['tau'] + half_width
+            else:
+                row['LearningStart_10'] = row['LearningEnd_90'] = np.nan
+            # a fitted p_low far from the early performance points to a questionable fit
+            if row['LearningDetected'] and row['p_low_source'] == 'fitted':
+                row['PLowMismatch'] = bool(abs(row['p_low'] - row['FirstTrialsPerformance']) > p_low_flag)
+            else:
+                row['PLowMismatch'] = np.nan
+            rows.append(row)
+
+            # actual performance: moving average within each session so boundary dips stay visible
+            actual = np.concatenate([
+                pd.Series(ses['rewarded']).rolling(plot_window, center=True, min_periods=plot_window // 2)
+                .mean().to_numpy() for ses in sessions])
+            # smoothed learning curve, same smoothing as find_eureka
+            running = pd.Series(y).rolling(running_window).mean().shift(-(running_window - 1))
+            smoothed = running.rolling(smooth_window, center=True, min_periods=1).mean().to_numpy()
+            curves[animal] = {'x': x, 'actual': actual, 'smoothed': smoothed,
+                              'boundaries': np.cumsum([len(ses['rewarded']) for ses in sessions])[:-1],
+                              'fits': fits, 'row': row}
+            self._slm_plot_animal(curves[animal], plot_window, savefigpath)
+
+        fit_df = pd.DataFrame(rows)
+        if fit_df.empty:
+            print(f'session_learning_model: no {protocol} sessions found')
+            return None
+        fit_df.to_csv(os.path.join(savefigpath, f'{protocol}_session_learning_fits.csv'), index=False)
+        self._slm_plot_all(curves, plot_window, savefigpath)
+
+        # ---------------------------------------------------------------
+        # genotype comparison of the learning parameters (tau, k, p_high), for all animals
+        # and for each gender: two-sided Mann-Whitney U tests, FDR-corrected
+        # (Benjamini-Hochberg) within each group. Animals without learning detected are
+        # included as the slowest learners: tau is set above every fitted tau and trial
+        # count, k to the lower bound of the fit, and p_high to their constant
+        # performance p0. The tests use ranks, so the exact placeholder values do not matter.
+        comp_df = fit_df.copy()
+        not_learned = comp_df['LearningDetected'] != True
+        no_learning_tau = 2 * np.nanmax(np.r_[comp_df['tau'].to_numpy(dtype=float), comp_df['NTrials'].to_numpy(dtype=float)])
+        comp_df.loc[not_learned, 'tau'] = no_learning_tau
+        comp_df.loc[not_learned, 'k'] = 1e-5
+        comp_df.loc[not_learned, 'p_high'] = comp_df.loc[not_learned, 'p0']
+        # (column, label, plot on log10 scale, side of the axis break for placeholders)
+        metrics = [('tau', 'Learning midpoint tau (trial)', False, 'high'),
+                   ('k', 'Learning rate k (log10)', True, 'low'),
+                   ('p_high', 'p_high (p0 if no learning)', False, None)]
+
+        genders = sorted(comp_df['Gender'].dropna().unique())
+        groups = [('All', comp_df)]
+        if len(genders) > 1:   # a single-sex cohort would only repeat 'All'
+            groups += [(str(g), comp_df[comp_df['Gender'] == g]) for g in genders]
+
+        # genotype colors as in plot_performance: WT black, the mutant genotype in its
+        # strain's color from color_dict (master script), red otherwise
+        mut_color = None
+        if color_dict:
+            strain_base = self.strain.split('_')[0]
+            for key, color in color_dict.items():
+                if key.lower() == strain_base.lower():
+                    mut_color = color
+                    break
+        genotype_colors = {'WT': 'black', self.Mut: mut_color or 'red'}
+
+        stats_tables = []
+        for group, gdf in groups:
+            genotypes = [g for g in ['WT', 'HET', 'KO'] if g in set(gdf['Genotype'].dropna())]
+            genotypes += [g for g in gdf['Genotype'].dropna().unique() if g not in genotypes]
+            group_values = {col: {g: pd.to_numeric(gdf.loc[gdf['Genotype'] == g, col], errors='coerce')
+                                  .dropna().to_numpy() for g in genotypes}
+                            for col, *_ in metrics}
+            # learning detected per plotted value (open markers for placeholders)
+            group_learned = {col: {g: (gdf.loc[(gdf['Genotype'] == g) & gdf[col].notna(), 'LearningDetected']
+                                       == True).to_numpy() for g in genotypes}
+                             for col, *_ in metrics}
+
+            stats_rows = []
+            for col, *_ in metrics:
+                values = group_values[col]
+                for i, genotype_a in enumerate(genotypes):
+                    for genotype_b in genotypes[i + 1:]:
+                        values_a, values_b = values[genotype_a], values[genotype_b]
+                        if values_a.size and values_b.size:
+                            stat, p_value = mannwhitneyu(values_a, values_b, alternative='two-sided')
+                        else:
+                            stat, p_value = np.nan, np.nan
+                        stats_rows.append({
+                            'Group': group, 'Metric': col,
+                            'GenotypeA': genotype_a, 'GenotypeB': genotype_b,
+                            'N_A': values_a.size, 'N_B': values_b.size,
+                            'MedianA': np.median(values_a) if values_a.size else np.nan,
+                            'MedianB': np.median(values_b) if values_b.size else np.nan,
+                            'U': stat, 'PValue': p_value,
+                        })
+            group_stats = pd.DataFrame(stats_rows)
+            if not group_stats.empty:
+                group_stats['AdjustedPValue'] = np.nan
+                group_stats['Significant'] = False
+                valid_p = np.isfinite(group_stats['PValue'])
+                if valid_p.any():
+                    reject, adjusted_p, _, _ = multipletests(group_stats.loc[valid_p, 'PValue'],
+                                                             alpha=0.05, method='fdr_bh')
+                    group_stats.loc[valid_p, 'AdjustedPValue'] = adjusted_p
+                    group_stats.loc[valid_p, 'Significant'] = reject
+            stats_tables.append(group_stats)
+
+            # box + points per genotype, with FDR-corrected p value brackets
+            fig, axes = plt.subplots(1, len(metrics), figsize=(4 * len(metrics), 4), squeeze=False)
+            positions = np.arange(1, len(genotypes) + 1)
+            for ax, (col, label, log, break_side) in zip(axes[0], metrics):
+                values = group_values[col]
+                data = [np.log10(values[g]) if log else values[g] for g in genotypes]
+
+                # placeholders are drawn just beyond the real values, behind an axis break;
+                # their rank order is kept, so boxes and medians are unchanged
+                real = np.concatenate([d[group_learned[col][g]] for d, g in zip(data, genotypes)])
+                has_placeholder = any((~group_learned[col][g]).any() for g in genotypes)
+                axis_break = None
+                if break_side and has_placeholder and real.size:
+                    real_low, real_high = float(real.min()), float(real.max())
+                    real_span = real_high - real_low if real_high > real_low else 1.0
+                    sign = 1 if break_side == 'high' else -1
+                    edge = real_high if break_side == 'high' else real_low
+                    axis_break = edge + sign * 0.07 * real_span
+                    placeholder_y = edge + sign * 0.16 * real_span
+                    data = [np.where(group_learned[col][g], d, placeholder_y) for d, g in zip(data, genotypes)]
+
+                for x_pos, vals, g in zip(positions, data, genotypes):
+                    color = genotype_colors.get(g, 'gray')
+                    ax.boxplot([vals], positions=[x_pos], widths=0.6, patch_artist=True, showfliers=False,
+                               medianprops={'color': color, 'linewidth': 1.5},
+                               boxprops={'facecolor': 'white', 'edgecolor': color},
+                               whiskerprops={'color': color}, capprops={'color': color})
+                    if vals.size:
+                        jitter = np.linspace(-0.08, 0.08, vals.size) if vals.size > 1 else np.zeros(1)
+                        learned = group_learned[col][g]
+                        ax.scatter(x_pos + jitter[learned], vals[learned], color=color, s=20, alpha=0.8,
+                                   zorder=3, label='learning detected')
+                        ax.scatter(x_pos + jitter[~learned], vals[~learned], facecolors='white',
+                                   edgecolors=color, s=20, zorder=3, label='no learning (placeholder)')
+                ax.set_xticks(positions, [f'{g}\n(n={values[g].size}, '
+                                          f'{int((~group_learned[col][g]).sum())} no learning)' for g in genotypes])
+                ax.set_title(label, fontsize=10)
+                ax.spines[['top', 'right']].set_visible(False)
+
+                if axis_break is not None:
+                    # ticks for the real range only, plus one labelled tick for the placeholders
+                    ticks = matplotlib.ticker.MaxNLocator(5).tick_values(real_low, real_high)
+                    ticks = ticks[(ticks >= real_low - 0.05 * real_span) & (ticks <= real_high + 0.05 * real_span)]
+                    ax.set_yticks(list(ticks) + [placeholder_y],
+                                  [f'{t:g}' for t in ticks] + ['no\nlearning'])
+                    # break marks: two short diagonal lines across the y axis
+                    for offset in (-0.012, 0.012):
+                        y_mark = axis_break + offset * real_span
+                        ax.plot([-0.025, 0.025], [y_mark - 0.01 * real_span, y_mark + 0.01 * real_span],
+                                transform=ax.get_yaxis_transform(), color='black', linewidth=1, clip_on=False)
+                    ax.axhline(axis_break, color='0.7', linestyle=':', linewidth=0.8)
+
+                metric_stats = group_stats[group_stats['Metric'] == col] if not group_stats.empty else group_stats
+                y_values = np.concatenate([d for d in data if d.size]) if any(d.size for d in data) else np.array([])
+                if y_values.size and not metric_stats.empty:
+                    y_min, y_max = float(np.nanmin(y_values)), float(np.nanmax(y_values))
+                    y_span = y_max - y_min if y_max > y_min else max(abs(y_max), 1.0)
+                    y_base = y_max + 0.08 * y_span
+                    y_step = 0.12 * y_span
+                    for row_idx, (_, stat_row) in enumerate(metric_stats.iterrows()):
+                        x1 = genotypes.index(stat_row['GenotypeA']) + 1
+                        x2 = genotypes.index(stat_row['GenotypeB']) + 1
+                        y = y_base + row_idx * y_step
+                        y_bracket = y + 0.02 * y_span
+                        ax.plot([x1, x1, x2, x2], [y, y_bracket, y_bracket, y], color='black', linewidth=1)
+                        adj_p = stat_row['AdjustedPValue']
+                        ax.text((x1 + x2) / 2, y_bracket + 0.005 * y_span,
+                                f'FDR p={adj_p:.3g}' if np.isfinite(adj_p) else 'n/a',
+                                ha='center', va='bottom', fontsize=8)
+                    ax.set_ylim(top=y_base + len(metric_stats) * y_step + 0.08 * y_span)
+            # marker style legend in gray, since it applies to both genotypes
+            marker_legend = [
+                matplotlib.lines.Line2D([], [], marker='o', linestyle='none', color='gray', label='learning detected'),
+                matplotlib.lines.Line2D([], [], marker='o', linestyle='none', markerfacecolor='white',
+                                        markeredgecolor='gray', label='no learning (placeholder)'),
+            ]
+            fig.legend(handles=marker_legend, loc='lower center', ncol=2, frameon=False, fontsize=9)
+            fig.suptitle(f'{protocol} learning parameters by genotype ({group})')
+            fig.tight_layout(rect=(0, 0.07, 1, 1))
+            fig.savefig(os.path.join(savefigpath, f'{protocol}_session_learning_by_genotype_{group}.png'),
+                        dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+        stats_df = pd.concat(stats_tables, ignore_index=True)
+        stats_df.to_csv(os.path.join(savefigpath, f'{protocol}_session_learning_genotype_stats.csv'), index=False)
+
+        # results per protocol, so AB and CD runs do not overwrite each other
+        if not isinstance(getattr(self, 'session_learning', None), dict):
+            self.session_learning, self.session_learning_stats = {}, {}
+        self.session_learning[protocol] = fit_df
+        self.session_learning_stats[protocol] = stats_df
+        return fit_df
+
+    @staticmethod
+    def _slm_dispersion(y, p, block):
+        # variance of residuals summed over consecutive blocks of trials, relative to the
+        # Bernoulli expectation (1 = trials independent around the fitted curve)
+        n_blocks = len(y) // block
+        if n_blocks < 2:
+            return 1.0
+        p = np.clip(p, 1e-6, 1 - 1e-6)[:n_blocks * block]
+        residual = (y[:n_blocks * block] - p).reshape(n_blocks, block).sum(axis=1)
+        expected = (p * (1 - p)).reshape(n_blocks, block).sum(axis=1)
+        return float(np.sum(residual ** 2) / np.sum(expected))
+
+    @staticmethod
+    def _slm_unpack_learning(theta, p_low_fixed, p_high_fixed):
+        # learning parameters: theta = [p_low (if not fixed), span (if p_high not fixed), k, tau, ...]
+        # returns p_low, p_high, k, tau and the number of theta entries used
+        n_used = 0
+        if p_low_fixed is None:
+            p_low = theta[0]
+            n_used += 1
+        else:
+            p_low = p_low_fixed
+        if p_high_fixed is None:
+            p_high = p_low + (1 - p_low) * theta[n_used]   # keeps p_low <= p_high <= 1
+            n_used += 1
+        else:
+            p_high = p_high_fixed
+        k, tau = theta[n_used:n_used + 2]
+        return p_low, p_high, k, tau, n_used + 2
+
+    def _slm_predict(self, theta, x, session_idx, trial_in_session, learning, p_low_fixed, p_high_fixed, n_amps):
+        # returns (learning/baseline component, full prediction including the reset)
+        # learning:    theta = [learning parameters (see _slm_unpack_learning)], A1 ... A_n_amps, lambda
+        # no learning: theta = [p0], A1 ... A_n_amps, lambda
+        if learning:
+            p_low, p_high, k, tau, n_used = self._slm_unpack_learning(theta, p_low_fixed, p_high_fixed)
+            base = p_low + (p_high - p_low) * expit(k * (x - tau))
+            rest = theta[n_used:]
+        else:
+            base = np.full(len(x), theta[0])
+            rest = theta[1:]
+        if n_amps:
+            # no reset in the first session; with one shared amplitude (n_amps = 1)
+            # every later session uses A1, otherwise session i + 1 uses A_i
+            amplitudes = np.concatenate([[0.0], rest[:n_amps]])
+            base_reset = amplitudes[np.minimum(session_idx, n_amps)] * np.exp(-trial_in_session / rest[n_amps])
+        else:
+            base_reset = 0
+        return base, base - base_reset
+
+    def _slm_fit(self, y, x, session_idx, trial_in_session, learning, p_low_fixed, p_high_fixed,
+                 n_resets, reset_type, min_lambda):
+        # p_low_fixed / p_high_fixed: asymptotes of the learning sigmoid, None to fit them
+        # reset_type: 'none', 'shared' (one A) or 'separate' (one A per boundary)
+        n_trials = len(y)
+        max_session_length = float(np.bincount(session_idx).max())
+        lambda_low = min(float(min_lambda), max_session_length)
+        n_amps = {'none': 0, 'shared': min(n_resets, 1), 'separate': n_resets}[reset_type]
+        eps = 1e-6
+
+        def nll(theta):
+            _, p = self._slm_predict(theta, x, session_idx, trial_in_session, learning,
+                                     p_low_fixed, p_high_fixed, n_amps)
+            p = np.clip(p, eps, 1 - eps)
+            return -np.sum(y * np.log(p) + (1 - y) * np.log(1 - p))
+
+        # deterministic starts from the early / late performance
+        edge = max(1, min(500, n_trials // 4))
+        late = np.mean(y[-edge:])
+        if learning:
+            if p_low_fixed is None:
+                p_low0 = float(np.clip(np.mean(y[:min(100, n_trials)]), 0.01, 0.5))
+            else:
+                p_low0 = p_low_fixed
+            # tau starts include early trials so fast learners are not missed
+            tau_starts = [t for t in (50, 150, 300) if t < n_trials] + \
+                         [f * n_trials for f in (0.25, 0.5, 0.75)]
+            starts = [[k0, tau0] for k0 in (0.005, 0.05) for tau0 in tau_starts]
+            bounds = [(1e-5, 1), (1, n_trials)]
+            if p_high_fixed is None:
+                p_high0 = float(np.clip(max(late, p_low0) + 0.05, p_low0 + 0.01, 0.99))
+                starts = [[(p_high0 - p_low0) / (1 - p_low0)] + s for s in starts]
+                bounds = [(eps, 1)] + bounds
+            if p_low_fixed is None:
+                # naive performance should not be above chance
+                starts = [[p_low0] + s for s in starts]
+                bounds = [(0, 0.5)] + bounds
+        else:
+            starts = [[float(np.clip(np.mean(y), 0.01, 0.99))]]
+            bounds = [(eps, 1 - eps)]
+        if n_amps:
+            # all amplitudes start from the same value
+            starts = [s + [a0] * n_amps + [float(np.clip(l0, lambda_low, max_session_length))]
+                      for s in starts
+                      for a0 in (0.05, 0.2, 0.4)
+                      for l0 in (20.0, 100.0)]
+            bounds = bounds + [(0, 1)] * n_amps + [(lambda_low, max_session_length)]
+
+        best = None
+        for start in starts:
+            result = minimize(nll, start, method='L-BFGS-B', bounds=bounds)
+            if np.isfinite(result.fun) and (best is None or result.fun < best.fun):
+                best = result
+
+        theta = best.x
+        n_params = len(theta)   # fixed asymptotes are not counted
+        if learning:
+            p_low, p_high, k, tau, n_base = self._slm_unpack_learning(theta, p_low_fixed, p_high_fixed)
+            params = {'p_low': p_low, 'p_high': p_high, 'k': k, 'tau': tau}
+        else:
+            params = {'p0': theta[0]}
+            n_base = 1
+        if reset_type == 'shared' and n_amps:
+            params['A'] = theta[n_base]
+        else:
+            for ii in range(n_amps):
+                params[f'A{ii + 1}'] = theta[n_base + ii]
+        params['lambda'] = theta[-1] if n_amps else np.nan
+
+        base, prediction = self._slm_predict(theta, x, session_idx, trial_in_session,
+                                             learning, p_low_fixed, p_high_fixed, n_amps)
+        return {'theta': theta, 'params': params, 'success': bool(best.success),
+                'NLL': best.fun, 'n_params': n_params,
+                'AIC': 2 * n_params + 2 * best.fun,
+                'BIC': n_params * np.log(n_trials) + 2 * best.fun,
+                'base': base, 'prediction': prediction}
+
+    @staticmethod
+    def _slm_draw(ax, curve, plot_window, detailed):
+        row = curve['row']
+        selected = row['SelectedModel']
+        fit = curve['fits'][selected]
+        x = curve['x']
+        n_resets = row['NSessions'] - 1
+        reset_type = selected.split('_')[-1]   # none / shared / separate
+
+        ax.plot(x, curve['actual'], color='0.6', linewidth=1,
+                label=f'Actual ({plot_window}-trial moving avg)')
+        ax.plot(x, curve['smoothed'], color='black', linewidth=2, label='Smoothed learning curve')
+        if detailed:
+            fit_label = 'Fitted: ' + ('learning' if row['LearningDetected'] else 'no learning')
+            fit_label += {'none': ', no reset',
+                          'shared': ' + reset (shared A)',
+                          'separate': ' + reset (A per boundary)'}[reset_type]
+            base_label = 'Learning sigmoid (no reset)' if row['LearningDetected'] else 'Baseline (no reset)'
+        else:
+            fit_label = 'Fitted model (selected by BIC)'
+            base_label = 'Learning sigmoid / flat baseline, without reset'
+        ax.plot(x, fit['prediction'], color='tab:red', linewidth=1.8, label=fit_label)
+        ax.plot(x, fit['base'], color='tab:blue', linestyle='--', linewidth=1.5, label=base_label)
+        for ii, boundary in enumerate(curve['boundaries']):
+            ax.axvline(boundary + 0.5, color='black', linestyle=':', linewidth=0.8, alpha=0.6,
+                       label='Session boundary' if ii == 0 else None)
+        ax.axhline(0.5, color='black', linestyle='--', linewidth=0.8, alpha=0.4)
+        ax.set_ylim(0, 1)
+        ax.set_xlim(0, x[-1] + 1)
+        ax.spines[['top', 'right']].set_visible(False)
+
+        if detailed:
+            if row['LearningDetected']:
+                learner = 'gradual learner' if row['GradualLearner'] else 'immediate learner'
+                source = {'fitted': 'fitted',
+                          'first_trials': f'{learner}, first-trials mean',
+                          'chance': f'{learner}, fixed at chance'}[row['p_low_source']]
+                if row['PLowMismatch'] is True:
+                    source += f", first trials {row['FirstTrialsPerformance']:.2f} - check"
+                high_source = 'fitted' if row['p_high_source'] == 'fitted' else 'last-trials mean'
+                text = (f"p_low={row['p_low']:.2f} ({source}), p_high={row['p_high']:.2f} ({high_source})\n"
+                        f"tau={row['tau']:.0f}, k={row['k']:.4f}, "
+                        f"10-90% learning: trial {row['LearningStart_10']:.0f}-{row['LearningEnd_90']:.0f}\n")
+            else:
+                text = f"p0={row['p0']:.2f}\n"
+            if reset_type == 'separate':
+                amplitudes = ', '.join(f"{row[f'A{ii}']:.2f}" for ii in range(1, n_resets + 1))
+                text += f"reset A1-A{n_resets} = {amplitudes}, lambda={row['lambda']:.0f} trials\n"
+            elif reset_type == 'shared':
+                text += f"reset A = {row['A1']:.2f} (shared), lambda={row['lambda']:.0f} trials\n"
+            elif n_resets:
+                text += 'no session reset detected\n'
+            else:
+                text += 'no reset (single session)\n'
+            text += (f"QAIC (BIC), c-hat = {row['Dispersion']:.2f}:\n"
+                     f"  learning - no learning = {row['DeltaQAIC']:.1f} ({row['DeltaBIC']:.1f})")
+            if n_resets >= 1:
+                text += (f"\n  reset - no reset = {row['DeltaQAIC_reset_vs_none']:.1f} "
+                         f"({row['DeltaBIC_reset_vs_none']:.1f})")
+            if n_resets >= 2 and reset_type != 'none':
+                text += (f"\n  separate - shared A = {row['DeltaQAIC_reset']:.1f} ({row['DeltaBIC_reset']:.1f}), "
+                         f"LRT p = {row['ResetsLRT_p']:.3g}")
+            ax.text(0.01, 0.02, text, transform=ax.transAxes, ha='left', va='bottom', fontsize=9,
+                    bbox={'facecolor': 'white', 'alpha': 0.8, 'edgecolor': 'none'})
+
+    def _slm_plot_animal(self, curve, plot_window, savefigpath):
+        row = curve['row']
+        fig, ax = plt.subplots(figsize=(12, 5))
+        self._slm_draw(ax, curve, plot_window, detailed=True)
+        if row['LearningDetected']:
+            # same markers as find_eureka
+            ax.axvspan(row['LearningStart_10'], row['LearningEnd_90'], color='red', alpha=0.15,
+                       label='10-90% boundary')
+            ax.axvline(row['tau'], color='red', linestyle='--', linewidth=1.5, label='Tau')
+            ax.set_xlim(0, curve['x'][-1] + 1)   # the 10-90% window can extend past the data
+        ax.set_xlabel(f"Concatenated {row['Protocol']} trial")
+        ax.set_ylabel('P(correct)')
+        ax.set_title(f"{row['Animal']} ({row['Genotype']}) {row['Protocol']}: "
+                     f"{'learning detected' if row['LearningDetected'] else 'no learning detected'}")
+        # lower right is usually empty (performance ends high); the text box is lower left
+        ax.legend(frameon=False, fontsize=8, loc='lower right', ncol=2)
+        fig.tight_layout()
+        fig.savefig(os.path.join(savefigpath, f"{row['Animal']}_{row['Protocol']}_session_learning_fit.png"),
+                    dpi=250, bbox_inches='tight')
+        plt.close(fig)
+
+    def _slm_plot_all(self, curves, plot_window, savefigpath):
+        # one panel per animal, grouped by genotype
+        animals = sorted(curves, key=lambda a: (str(curves[a]['row']['Genotype']), str(a)))
+        protocol = curves[animals[0]]['row']['Protocol']
+        n_cols = 4
+        n_rows = int(np.ceil(len(animals) / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 3 * n_rows), squeeze=False)
+        for ii, (ax, animal) in enumerate(zip(axes.flat, animals)):
+            row = curves[animal]['row']
+            self._slm_draw(ax, curves[animal], plot_window, detailed=False)
+            ax.set_title(f"{animal} ({row['Genotype']}) - "
+                         f"{'learning' if row['LearningDetected'] else 'no learning'}", fontsize=10)
+            ax.tick_params(labelsize=8)
+            if ii % n_cols == 0:
+                ax.set_ylabel('P(correct)', fontsize=9)
+            if ii + n_cols >= len(animals):   # lowest panel in its column
+                ax.set_xlabel(f'Concatenated {protocol} trial', fontsize=9)
+        for ax in axes.flat[len(animals):]:
+            ax.axis('off')
+        handles, labels = axes.flat[0].get_legend_handles_labels()
+        fig.tight_layout(rect=(0, 0.05, 1, 1))
+        fig.legend(handles, labels, loc='lower center', ncol=4, frameon=False, fontsize=9)
+        fig.savefig(os.path.join(savefigpath, f'{protocol}_session_learning_fit_all_animals.png'),
+                    dpi=200, bbox_inches='tight')
+        plt.close(fig)
 
     def plot_response_times(self):
         """Plot distributions of response times and intertrial intervals by genotype."""
