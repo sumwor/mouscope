@@ -105,9 +105,10 @@ if run_odor:
     #Odor.plot_performance(color_dict=color_dict)
     
     #Odor.session_aware()
-    for protocol in ('AB', 'CD'):
-        Odor.session_learning_model(protocol=protocol, color_dict=color_dict)
-        
+    #for protocol in ('AB', 'CD'):
+    Odor.session_learning_model(protocol='AB', color_dict=color_dict)
+    Odor.session_learning_model(protocol='CD', color_dict=color_dict)
+
     #%% model fitting (only implemented policy gradient for now)
     Odor.model_fitting(fit_mode='session', model_name='policy_gradient', color_dict=color_dict)
 

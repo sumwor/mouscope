@@ -31,7 +31,7 @@ import statsmodels.formula.api as smf
 from scipy.optimize import least_squares, minimize
 from scipy.signal import correlate, find_peaks, hilbert, spectrogram
 from scipy.special import expit
-from scipy.stats import chi2, mannwhitneyu, pearsonr, wilcoxon
+from scipy.stats import binomtest, chi2, mannwhitneyu, pearsonr, wilcoxon
 from statsmodels.stats.multitest import multipletests
 from statsmodels.multivariate.manova import MANOVA
 
@@ -2603,9 +2603,35 @@ class BehDataOdor(BehData):
         # 3. weights of bias and stickiness pre/post learning
         pass
 
+    @staticmethod
+    def _sb_load_sessions(animal_sessions, protocol):
+        # AB: sessions before the first AB-CD session; CD: CD trials of AB-CD days 1-3
+        if protocol == 'AB':
+            transition = animal_sessions.index[animal_sessions['Protocol'].str.contains('AB-CD')]
+            selected = animal_sessions.loc[:transition[0] - 1] if len(transition) else animal_sessions
+        else:
+            selected = animal_sessions[(animal_sessions['Protocol'] == 'AB-CD') &
+                                       (animal_sessions['ProtocolDay'] <= 3)]
+
+        sessions = []
+        for sNum, (sIdx, row) in enumerate(selected.iterrows(), start=1):
+            resultdf = pd.read_csv(row['BehCSV'])
+            resultdf = resultdf[~np.isnan(resultdf['actions'])]
+            if protocol == 'CD':
+                resultdf = resultdf[resultdf['schedule'] > 2]
+            if resultdf.empty:
+                continue
+            sessions.append({'SessionNumber': sNum,
+                             'SessionIndex': int(sIdx),
+                             'Date': str(row['Date']),
+                             'ProtocolDay': row['ProtocolDay'],
+                             'rewarded': (resultdf['reward'].fillna(0) > 0).to_numpy(dtype=float)})
+        return sessions
+
     def session_learning_model(self, protocol='AB', plot_window=50, running_window=60, smooth_window=200,
                                p_low_trials=50, immediate_trials=300, gradual_trials=100,
-                               p_low_flag=0.1, min_lambda=10, dispersion_block=50, color_dict=None):
+                               p_low_flag=0.1, min_lambda=10, dispersion_block=50, fast_alpha=0.05,
+                               color_dict=None):
         """Model AB or CD learning together with the performance reset at session boundaries.
 
         For each animal, the sessions of one protocol are concatenated (miss trials
@@ -2646,6 +2672,9 @@ class BehDataOdor(BehData):
         summed over dispersion_block-trial blocks relative to the Bernoulli expectation.
         Slow fluctuations in performance raise c-hat and so demand stronger evidence.
         LearningDetected: best learning variant beats best no-learning variant (DeltaQAIC < 0)
+        FastLearner (CD only): no learning detected, but performance in the first
+                     p_low_trials trials is already above chance (one-sided binomial test,
+                     p < fast_alpha), i.e. CD was learned (almost) immediately
         ResetDetected: within the chosen learning / no-learning model, the best reset
                        model beats no reset (DeltaQAIC_reset_vs_none < 0)
         ResetsDiffer: a reset is detected and separate A_i beat a shared A
@@ -2763,6 +2792,13 @@ class BehDataOdor(BehData):
                 row[f'Delta{crit}'] = (fits[best_of('learning', crit)][crit]
                                        - fits[best_of('flat', crit)][crit])   # learning - no learning
             row['LearningDetected'] = bool(row['DeltaQAIC'] < 0)
+            # CD only: performing above chance from the first trials without further
+            # improvement means CD was learned (almost) immediately, not that it was not learned
+            first = y[:p_low_trials]
+            row['FirstTrialsBinomial_p'] = binomtest(int(first.sum()), len(first), 0.5,
+                                                     alternative='greater').pvalue
+            row['FastLearner'] = bool(protocol == 'CD' and not row['LearningDetected']
+                                      and row['FirstTrialsBinomial_p'] < fast_alpha)
             base = 'learning' if row['LearningDetected'] else 'flat'
             for crit in ('QAIC', 'BIC'):
                 row[f'Delta{crit}_reset_vs_none'] = (fits[best_of(base, crit, with_reset=True)][crit]
@@ -2823,20 +2859,33 @@ class BehDataOdor(BehData):
         # ---------------------------------------------------------------
         # genotype comparison of the learning parameters (tau, k, p_high), for all animals
         # and for each gender: two-sided Mann-Whitney U tests, FDR-corrected
-        # (Benjamini-Hochberg) within each group. Animals without learning detected are
-        # included as the slowest learners: tau is set above every fitted tau and trial
-        # count, k to the lower bound of the fit, and p_high to their constant
-        # performance p0. The tests use ranks, so the exact placeholder values do not matter.
+        # (Benjamini-Hochberg) within each group. Animals without fitted learning get
+        # placeholders that rank them beyond every fitted animal:
+        #   no learning:  slowest - tau above every fitted tau and trial count,
+        #                 k at the lower bound of the fit
+        #   fast learner: fastest - tau 0 (below every fitted tau), k 10 (above the bound of 1)
+        # p_high is their constant performance p0. The tests use ranks, so the exact
+        # placeholder values do not matter.
         comp_df = fit_df.copy()
-        not_learned = comp_df['LearningDetected'] != True
-        no_learning_tau = 2 * np.nanmax(np.r_[comp_df['tau'].to_numpy(dtype=float), comp_df['NTrials'].to_numpy(dtype=float)])
+        fast = comp_df['FastLearner'] == True
+        not_learned = (comp_df['LearningDetected'] != True) & ~fast
+        comp_df['Category'] = np.select([fast, not_learned], ['fast', 'none'], 'learned')
+        no_learning_tau = 2 * np.nanmax(np.r_[comp_df['tau'].to_numpy(dtype=float),
+                                              comp_df['NTrials'].to_numpy(dtype=float)])
         comp_df.loc[not_learned, 'tau'] = no_learning_tau
         comp_df.loc[not_learned, 'k'] = 1e-5
-        comp_df.loc[not_learned, 'p_high'] = comp_df.loc[not_learned, 'p0']
-        # (column, label, plot on log10 scale, side of the axis break for placeholders)
+        comp_df.loc[fast, 'tau'] = 0.0
+        comp_df.loc[fast, 'k'] = 10.0
+        comp_df.loc[fast | not_learned, 'p_high'] = comp_df.loc[fast | not_learned, 'p0']
+        # (column, label, plot on log10 scale, side of the axis where the slowest learners are)
         metrics = [('tau', 'Learning midpoint tau (trial)', False, 'high'),
                    ('k', 'Learning rate k (log10)', True, 'low'),
-                   ('p_high', 'p_high (p0 if no learning)', False, None)]
+                   ('p_high', 'p_high (p0 if not fitted)', False, None)]
+        # marker per category: filled circle, open circle, open triangle
+        category_style = {'learned': ('o', True, 'learning detected'),
+                          'none': ('o', False, 'no learning (placeholder)'),
+                          'fast': ('^', False, 'fast learner (placeholder)')}
+        placeholder_label = {'none': 'no\nlearning', 'fast': 'fast\nlearner'}
 
         genders = sorted(comp_df['Gender'].dropna().unique())
         groups = [('All', comp_df)]
@@ -2861,10 +2910,10 @@ class BehDataOdor(BehData):
             group_values = {col: {g: pd.to_numeric(gdf.loc[gdf['Genotype'] == g, col], errors='coerce')
                                   .dropna().to_numpy() for g in genotypes}
                             for col, *_ in metrics}
-            # learning detected per plotted value (open markers for placeholders)
-            group_learned = {col: {g: (gdf.loc[(gdf['Genotype'] == g) & gdf[col].notna(), 'LearningDetected']
-                                       == True).to_numpy() for g in genotypes}
-                             for col, *_ in metrics}
+            # category of every plotted value (learned / none / fast)
+            group_category = {col: {g: gdf.loc[(gdf['Genotype'] == g) & gdf[col].notna(), 'Category'].to_numpy()
+                                    for g in genotypes}
+                              for col, *_ in metrics}
 
             stats_rows = []
             for col, *_ in metrics:
@@ -2899,23 +2948,28 @@ class BehDataOdor(BehData):
             # box + points per genotype, with FDR-corrected p value brackets
             fig, axes = plt.subplots(1, len(metrics), figsize=(4 * len(metrics), 4), squeeze=False)
             positions = np.arange(1, len(genotypes) + 1)
-            for ax, (col, label, log, break_side) in zip(axes[0], metrics):
+            for ax, (col, label, log, slow_side) in zip(axes[0], metrics):
                 values = group_values[col]
+                categories = group_category[col]
                 data = [np.log10(values[g]) if log else values[g] for g in genotypes]
 
-                # placeholders are drawn just beyond the real values, behind an axis break;
-                # their rank order is kept, so boxes and medians are unchanged
-                real = np.concatenate([d[group_learned[col][g]] for d, g in zip(data, genotypes)])
-                has_placeholder = any((~group_learned[col][g]).any() for g in genotypes)
-                axis_break = None
-                if break_side and has_placeholder and real.size:
+                # placeholders are drawn just beyond the real values, behind an axis break
+                # (slowest learners on slow_side, fast learners on the other side); their
+                # rank order is kept, so boxes and medians are unchanged
+                real = np.concatenate([d[categories[g] == 'learned'] for d, g in zip(data, genotypes)])
+                breaks = []   # (axis break position, placeholder position, tick label)
+                if slow_side and real.size:
                     real_low, real_high = float(real.min()), float(real.max())
                     real_span = real_high - real_low if real_high > real_low else 1.0
-                    sign = 1 if break_side == 'high' else -1
-                    edge = real_high if break_side == 'high' else real_low
-                    axis_break = edge + sign * 0.07 * real_span
-                    placeholder_y = edge + sign * 0.16 * real_span
-                    data = [np.where(group_learned[col][g], d, placeholder_y) for d, g in zip(data, genotypes)]
+                    for category in ('none', 'fast'):
+                        if not any((categories[g] == category).any() for g in genotypes):
+                            continue
+                        high = (slow_side == 'high') == (category == 'none')
+                        sign, edge = (1, real_high) if high else (-1, real_low)
+                        placeholder_y = edge + sign * 0.16 * real_span
+                        breaks.append((edge + sign * 0.07 * real_span, placeholder_y, placeholder_label[category]))
+                        data = [np.where(categories[g] == category, placeholder_y, d)
+                                for d, g in zip(data, genotypes)]
 
                 for x_pos, vals, g in zip(positions, data, genotypes):
                     color = genotype_colors.get(g, 'gray')
@@ -2925,28 +2979,35 @@ class BehDataOdor(BehData):
                                whiskerprops={'color': color}, capprops={'color': color})
                     if vals.size:
                         jitter = np.linspace(-0.08, 0.08, vals.size) if vals.size > 1 else np.zeros(1)
-                        learned = group_learned[col][g]
-                        ax.scatter(x_pos + jitter[learned], vals[learned], color=color, s=20, alpha=0.8,
-                                   zorder=3, label='learning detected')
-                        ax.scatter(x_pos + jitter[~learned], vals[~learned], facecolors='white',
-                                   edgecolors=color, s=20, zorder=3, label='no learning (placeholder)')
-                ax.set_xticks(positions, [f'{g}\n(n={values[g].size}, '
-                                          f'{int((~group_learned[col][g]).sum())} no learning)' for g in genotypes])
+                        for category, (marker, filled, _) in category_style.items():
+                            mask = categories[g] == category
+                            if mask.any():
+                                ax.scatter(x_pos + jitter[mask], vals[mask], marker=marker, s=22, zorder=3,
+                                           facecolors=color if filled else 'white', edgecolors=color,
+                                           alpha=0.8 if filled else 1.0)
+                tick_labels = []
+                for g in genotypes:
+                    counts = [f"{int((categories[g] == c).sum())} {name}"
+                              for c, name in (('fast', 'fast'), ('none', 'no learning'))
+                              if (categories[g] == c).any()]
+                    tick_labels.append(f'{g}\n(n={values[g].size}' + (', ' + ', '.join(counts) if counts else '') + ')')
+                ax.set_xticks(positions, tick_labels, fontsize=8)
                 ax.set_title(label, fontsize=10)
                 ax.spines[['top', 'right']].set_visible(False)
 
-                if axis_break is not None:
-                    # ticks for the real range only, plus one labelled tick for the placeholders
+                if breaks:
+                    # ticks for the real range only, plus a labelled tick per placeholder group
                     ticks = matplotlib.ticker.MaxNLocator(5).tick_values(real_low, real_high)
                     ticks = ticks[(ticks >= real_low - 0.05 * real_span) & (ticks <= real_high + 0.05 * real_span)]
-                    ax.set_yticks(list(ticks) + [placeholder_y],
-                                  [f'{t:g}' for t in ticks] + ['no\nlearning'])
-                    # break marks: two short diagonal lines across the y axis
-                    for offset in (-0.012, 0.012):
-                        y_mark = axis_break + offset * real_span
-                        ax.plot([-0.025, 0.025], [y_mark - 0.01 * real_span, y_mark + 0.01 * real_span],
-                                transform=ax.get_yaxis_transform(), color='black', linewidth=1, clip_on=False)
-                    ax.axhline(axis_break, color='0.7', linestyle=':', linewidth=0.8)
+                    ax.set_yticks(list(ticks) + [b[1] for b in breaks],
+                                  [f'{t:g}' for t in ticks] + [b[2] for b in breaks])
+                    for axis_break, _, _ in breaks:
+                        # break marks: two short diagonal lines across the y axis
+                        for offset in (-0.012, 0.012):
+                            y_mark = axis_break + offset * real_span
+                            ax.plot([-0.025, 0.025], [y_mark - 0.01 * real_span, y_mark + 0.01 * real_span],
+                                    transform=ax.get_yaxis_transform(), color='black', linewidth=1, clip_on=False)
+                        ax.axhline(axis_break, color='0.7', linestyle=':', linewidth=0.8)
 
                 metric_stats = group_stats[group_stats['Metric'] == col] if not group_stats.empty else group_stats
                 y_values = np.concatenate([d for d in data if d.size]) if any(d.size for d in data) else np.array([])
@@ -2966,13 +3027,13 @@ class BehDataOdor(BehData):
                                 f'FDR p={adj_p:.3g}' if np.isfinite(adj_p) else 'n/a',
                                 ha='center', va='bottom', fontsize=8)
                     ax.set_ylim(top=y_base + len(metric_stats) * y_step + 0.08 * y_span)
-            # marker style legend in gray, since it applies to both genotypes
-            marker_legend = [
-                matplotlib.lines.Line2D([], [], marker='o', linestyle='none', color='gray', label='learning detected'),
-                matplotlib.lines.Line2D([], [], marker='o', linestyle='none', markerfacecolor='white',
-                                        markeredgecolor='gray', label='no learning (placeholder)'),
-            ]
-            fig.legend(handles=marker_legend, loc='lower center', ncol=2, frameon=False, fontsize=9)
+            # marker style legend in gray (applies to both genotypes), for categories present
+            present = set(gdf['Category'])
+            marker_legend = [matplotlib.lines.Line2D([], [], marker=marker, linestyle='none', label=name,
+                                                     markerfacecolor='gray' if filled else 'white',
+                                                     markeredgecolor='gray')
+                             for category, (marker, filled, name) in category_style.items() if category in present]
+            fig.legend(handles=marker_legend, loc='lower center', ncol=len(marker_legend), frameon=False, fontsize=9)
             fig.suptitle(f'{protocol} learning parameters by genotype ({group})')
             fig.tight_layout(rect=(0, 0.07, 1, 1))
             fig.savefig(os.path.join(savefigpath, f'{protocol}_session_learning_by_genotype_{group}.png'),
@@ -3193,8 +3254,13 @@ class BehDataOdor(BehData):
             ax.set_xlim(0, curve['x'][-1] + 1)   # the 10-90% window can extend past the data
         ax.set_xlabel(f"Concatenated {row['Protocol']} trial")
         ax.set_ylabel('P(correct)')
-        ax.set_title(f"{row['Animal']} ({row['Genotype']}) {row['Protocol']}: "
-                     f"{'learning detected' if row['LearningDetected'] else 'no learning detected'}")
+        if row['LearningDetected']:
+            status = 'learning detected'
+        elif row['FastLearner']:
+            status = 'fast learner (above chance from the first trials)'
+        else:
+            status = 'no learning detected'
+        ax.set_title(f"{row['Animal']} ({row['Genotype']}) {row['Protocol']}: {status}")
         # lower right is usually empty (performance ends high); the text box is lower left
         ax.legend(frameon=False, fontsize=8, loc='lower right', ncol=2)
         fig.tight_layout()
@@ -3212,8 +3278,9 @@ class BehDataOdor(BehData):
         for ii, (ax, animal) in enumerate(zip(axes.flat, animals)):
             row = curves[animal]['row']
             self._slm_draw(ax, curves[animal], plot_window, detailed=False)
-            ax.set_title(f"{animal} ({row['Genotype']}) - "
-                         f"{'learning' if row['LearningDetected'] else 'no learning'}", fontsize=10)
+            status = ('learning' if row['LearningDetected']
+                      else 'fast learner' if row['FastLearner'] else 'no learning')
+            ax.set_title(f"{animal} ({row['Genotype']}) - {status}", fontsize=10)
             ax.tick_params(labelsize=8)
             if ii % n_cols == 0:
                 ax.set_ylabel('P(correct)', fontsize=9)
